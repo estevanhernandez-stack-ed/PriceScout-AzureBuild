@@ -1,0 +1,83 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* PriceScout Brand Colors
+   Primary Red: #8b0e04 (HSL: 4 95% 28%)
+   Primary Hover: #a31004 (HSL: 4 93% 33%)
+   Dark Background: #0E1117 (HSL: 220 28% 7%)
+   Sidebar: #262730 (HSL: 233 11% 17%)
+   Light Text: #FAFAFA (HSL: 0 0% 98%)
+*/
+
+@layer base {
+  /* Light mode (fallback) */
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 220 28% 7%;
+    --card: 0 0% 100%;
+    --card-foreground: 220 28% 7%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 220 28% 7%;
+    --primary: 4 95% 28%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 210 40% 96.1%;
+    --secondary-foreground: 220 28% 7%;
+    --muted: 210 40% 96.1%;
+    --muted-foreground: 215.4 16.3% 46.9%;
+    --accent: 210 40% 96.1%;
+    --accent-foreground: 220 28% 7%;
+    --destructive: 0 84.2% 60.2%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 214.3 31.8% 91.4%;
+    --input: 214.3 31.8% 91.4%;
+    --ring: 4 95% 28%;
+    --radius: 0.5rem;
+    --chart-1: 4 95% 28%;
+    --chart-2: 173 58% 39%;
+    --chart-3: 197 37% 24%;
+    --chart-4: 43 74% 66%;
+    --chart-5: 27 87% 67%;
+  }
+
+  /* Dark mode (PriceScout default) */
+  .dark {
+    --background: 220 28% 7%;
+    --foreground: 0 0% 98%;
+    --card: 233 11% 17%;
+    --card-foreground: 0 0% 98%;
+    --popover: 233 11% 17%;
+    --popover-foreground: 0 0% 98%;
+    --primary: 4 95% 28%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 233 11% 17%;
+    --secondary-foreground: 0 0% 98%;
+    --muted: 233 11% 17%;
+    --muted-foreground: 215 20.2% 65.1%;
+    --accent: 233 11% 20%;
+    --accent-foreground: 0 0% 98%;
+    --destructive: 0 62.8% 30.6%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 233 11% 25%;
+    --input: 233 11% 17%;
+    --ring: 4 95% 28%;
+    --chart-1: 4 95% 40%;
+    --chart-2: 160 60% 45%;
+    --chart-3: 30 80% 55%;
+    --chart-4: 280 65% 60%;
+    --chart-5: 340 75% 55%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+  /* Fix input visibility in dark mode */
+  input, textarea, select {
+    @apply bg-background border border-border;
+  }
+}

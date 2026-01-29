@@ -1,0 +1,1 @@
+export { DiscountProgramsManager } from './DiscountProgramsManager';
