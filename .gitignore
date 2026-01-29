@@ -58,6 +58,10 @@ frontend/test-results/
 tmp/
 temp/
 *.tmp
+openapi_temp.json
+openapi_new.json
+openapi8001.json
+*openapi_check*
 
 # Debug
 debug/

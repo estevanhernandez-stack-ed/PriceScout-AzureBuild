@@ -446,6 +446,7 @@ async def get_current_user_info(current_user: dict = Depends(get_current_user)):
         "allowed_modes": current_user.get("allowed_modes", []),
         "home_location_type": current_user.get("home_location_type"),
         "home_location_value": current_user.get("home_location_value"),
+        "core_personnel_id": current_user.get("core_personnel_id"),
     }
 
 

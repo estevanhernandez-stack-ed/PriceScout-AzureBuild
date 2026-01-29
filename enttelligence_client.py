@@ -283,7 +283,7 @@ def main():
     # Credentials (from env or defaults)
     import os
     TOKEN_NAME = os.getenv("ENTTELLIGENCE_TOKEN_NAME", "PriceScoutAzure")
-    TOKEN_SECRET = os.getenv("ENTTELLIGENCE_TOKEN_SECRET", "9bgGO/6JThSZOMJ1lcJyPg==:ZPROExrFNScatIFa7bAemM80KQEkpXBc")
+    TOKEN_SECRET = os.getenv("ENTTELLIGENCE_TOKEN_SECRET", "")
     
     # Create client
     client = EntTelligenceClient()

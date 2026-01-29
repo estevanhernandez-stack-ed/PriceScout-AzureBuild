@@ -27,7 +27,7 @@ from decimal import Decimal
 import json
 import os
 
-# Schema prefix for unified database (default 'pricescout')
+# Schema prefix for unified database (default 'competitive' per platform standard)
 # SQLite doesn't support schemas, so we set it to None for SQLite
 def _detect_db_type_for_schema():
     """Detect database type to determine if schema should be used."""
@@ -54,7 +54,7 @@ def _detect_db_type_for_schema():
     return 'sqlite'
 
 _db_type = _detect_db_type_for_schema()
-DB_SCHEMA = None if _db_type == 'sqlite' else os.getenv('DB_SCHEMA', 'pricescout')
+DB_SCHEMA = None if _db_type == 'sqlite' else os.getenv('DB_SCHEMA', 'competitive')
 
 # Create metadata with schema (None for SQLite, schema name for PostgreSQL/MSSQL)
 metadata = MetaData(schema=DB_SCHEMA)
@@ -62,7 +62,76 @@ Base = declarative_base(metadata=metadata)
 
 
 # ============================================================================
-# CORE TABLES: Multi-tenancy and User Management
+# CORE SCHEMA REFERENCES (Read-Only)
+# These map to shared core.* tables in TheatreOperationsDB.
+# On SQLite (dev), these are not available — all core FKs will be NULL.
+# See: libs/core/Database/Scripts/003_CreatePriceScoutViews.sql
+# ============================================================================
+
+CORE_SCHEMA = None if _db_type == 'sqlite' else 'core'
+
+if CORE_SCHEMA:
+    core_metadata = MetaData(schema=CORE_SCHEMA)
+    CoreBase = declarative_base(metadata=core_metadata)
+
+    class CoreDivision(CoreBase):
+        """Read-only reference to core.Divisions (brand/division master data)."""
+        __tablename__ = 'Divisions'
+        Id = Column(Integer, primary_key=True)
+        Code = Column(String(20))
+        Name = Column(String(100))
+        IsActive = Column(Boolean)
+
+    class CoreLocation(CoreBase):
+        """Read-only reference to core.Locations (Marcus theater locations)."""
+        __tablename__ = 'Locations'
+        Id = Column(Integer, primary_key=True)
+        Code = Column(String(20))
+        Name = Column(String(200))
+        DivisionId = Column(Integer)
+        City = Column(String(100))
+        State = Column(String(50))
+        Market = Column(String(100))
+        ScreenCount = Column(Integer)
+        IsActive = Column(Boolean)
+
+    class CorePersonnel(CoreBase):
+        """Read-only reference to core.Personnel (Entra ID linked employees)."""
+        __tablename__ = 'Personnel'
+        Id = Column(Integer, primary_key=True)
+        EntraObjectId = Column(String(36))
+        Email = Column(String(256))
+        DisplayName = Column(String(200))
+        FirstName = Column(String(100))
+        LastName = Column(String(100))
+        JobTitle = Column(String(100))
+        LocationId = Column(Integer)
+        DivisionId = Column(Integer)
+        IsActive = Column(Boolean)
+
+    class CoreCompetitorLocation(CoreBase):
+        """Read-only reference to core.CompetitorLocations."""
+        __tablename__ = 'CompetitorLocations'
+        Id = Column(Integer, primary_key=True)
+        Name = Column(String(200))
+        Chain = Column(String(100))
+        City = Column(String(100))
+        State = Column(String(50))
+        ScreenCount = Column(Integer)
+        HasImax = Column(Boolean)
+        NearestLocationId = Column(Integer)
+        DistanceMiles = Column(Numeric(6, 2))
+        IsActive = Column(Boolean)
+else:
+    CoreBase = None
+    CoreDivision = None
+    CoreLocation = None
+    CorePersonnel = None
+    CoreCompetitorLocation = None
+
+
+# ============================================================================
+# PRICESCOUT TABLES: Multi-tenancy and User Management
 # ============================================================================
 
 class Company(Base):
@@ -74,7 +143,8 @@ class Company(Base):
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
     is_active = Column(Boolean, default=True)
     settings = Column(Text, default='{}')  # JSON string for SQLite, JSONB for PostgreSQL
-    
+    core_division_id = Column(Integer, nullable=True)  # FK to core.Divisions.Id (enforced at SQL level)
+
     # Relationships
     users = relationship("User", back_populates="company", foreign_keys="User.company_id")
     scrape_runs = relationship("ScrapeRun", back_populates="company", cascade="all, delete-orphan")
@@ -121,13 +191,14 @@ class User(Base):
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
     last_login = Column(DateTime(timezone=True))
     is_active = Column(Boolean, default=True)
-    
+    core_personnel_id = Column(Integer, nullable=True)  # FK to core.Personnel.Id (enforced at SQL level)
+
     # Relationships
     company = relationship("Company", back_populates="users", foreign_keys=[company_id])
     default_company = relationship("Company", foreign_keys=[default_company_id])
     scrape_runs = relationship("ScrapeRun", back_populates="user")
     audit_logs = relationship("AuditLog", back_populates="user")
-    
+
     __table_args__ = (
         CheckConstraint("role IN ('admin', 'manager', 'user')", name='valid_role'),
         CheckConstraint(
@@ -713,6 +784,9 @@ class TheaterMetadata(Base):
     # Freshness
     last_geocode_at = Column(DateTime(timezone=True))
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+
+    # Core schema reference
+    competitor_location_id = Column(Integer, nullable=True)  # FK to core.CompetitorLocations.Id
 
     # Relationships
     company = relationship("Company")

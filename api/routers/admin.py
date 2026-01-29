@@ -56,6 +56,7 @@ class UserUpdate(BaseModel):
     home_location_type: Optional[str] = Field(None, pattern="^(director|market|theater)$")
     home_location_value: Optional[str] = None
     is_active: Optional[bool] = None
+    core_personnel_id: Optional[int] = None
 
 
 class UserResponse(BaseModel):
@@ -70,6 +71,7 @@ class UserResponse(BaseModel):
     is_active: bool
     created_at: Optional[str] = None
     last_login: Optional[str] = None
+    core_personnel_id: Optional[int] = None
 
     class Config:
         from_attributes = True
@@ -207,7 +209,8 @@ async def get_user(
             is_admin=u.is_admin,
             is_active=u.is_active,
             created_at=u.created_at.isoformat() if u.created_at else None,
-            last_login=u.last_login.isoformat() if u.last_login else None
+            last_login=u.last_login.isoformat() if u.last_login else None,
+            core_personnel_id=getattr(u, 'core_personnel_id', None)
         )
 
 
@@ -275,7 +278,8 @@ async def create_user(
             is_admin=u.is_admin,
             is_active=u.is_active,
             created_at=u.created_at.isoformat() if u.created_at else None,
-            last_login=u.last_login.isoformat() if u.last_login else None
+            last_login=u.last_login.isoformat() if u.last_login else None,
+            core_personnel_id=getattr(u, 'core_personnel_id', None)
         )
 
 
@@ -312,6 +316,9 @@ async def update_user(
 
         if user_data.is_active is not None:
             u.is_active = user_data.is_active
+
+        if user_data.core_personnel_id is not None:
+            u.core_personnel_id = user_data.core_personnel_id
 
         # Handle company updates
         if user_data.company is not None:
@@ -360,7 +367,8 @@ async def update_user(
             is_admin=u.is_admin,
             is_active=u.is_active,
             created_at=u.created_at.isoformat() if u.created_at else None,
-            last_login=u.last_login.isoformat() if u.last_login else None
+            last_login=u.last_login.isoformat() if u.last_login else None,
+            core_personnel_id=getattr(u, 'core_personnel_id', None)
         )
 
 

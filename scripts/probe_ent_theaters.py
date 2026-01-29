@@ -5,7 +5,7 @@ import json
 def probe():
     client = EntTelligenceClient()
     TOKEN_NAME = os.getenv("ENTTELLIGENCE_TOKEN_NAME", "PriceScoutAzure")
-    TOKEN_SECRET = os.getenv("ENTTELLIGENCE_TOKEN_SECRET", "9bgGO/6JThSZOMJ1lcJyPg==:ZPROExrFNScatIFa7bAemM80KQEkpXBc")
+    TOKEN_SECRET = os.getenv("ENTTELLIGENCE_TOKEN_SECRET", "")
     
     if not client.login(TOKEN_NAME, TOKEN_SECRET):
         print("Auth failed")
