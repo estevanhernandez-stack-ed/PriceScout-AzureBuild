@@ -1,0 +1,444 @@
+# Azure DevOps Pipeline for PriceScout React
+# Build, Test, and Deploy Python/FastAPI Backend + React/TypeScript Frontend
+#
+# Pipeline Flow: Build → DeployDev → DeployTest (approval) → DeployProd (approval)
+#
+# Prerequisites:
+# 1. Service connection 'AzureServiceConnection' linked to Azure subscription
+# 2. Variable group 'pricescout-secrets' with: DATABASE_URL, SECRET_KEY
+# 3. Environment approvals configured for 'test' and 'prod' environments
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - 'apps/pricescout-react/**'
+    exclude:
+      - 'apps/pricescout-react/**/*.md'
+      - 'apps/pricescout-react/docs/**'
+
+pr:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - 'apps/pricescout-react/**'
+    exclude:
+      - 'apps/pricescout-react/**/*.md'
+      - 'apps/pricescout-react/docs/**'
+
+variables:
+  pythonVersion: '3.11'
+  nodeVersion: '20.x'
+  workingDirectory: 'apps/pricescout-react'
+  azureSubscription: 'AzureServiceConnection'
+  resourceGroupDev: 'rg-pricescout-dev'
+  resourceGroupTest: 'rg-pricescout-test'
+  resourceGroupProd: 'rg-pricescout-prod'
+  appServiceNameDev: 'app-pricescout-dev'
+  appServiceNameTest: 'app-pricescout-test'
+  appServiceNameProd: 'app-pricescout-prod'
+  coverageThreshold: 60
+
+stages:
+  # ============================================================================
+  # STAGE 1: BUILD & TEST
+  # Runs on every PR and push to main
+  # ============================================================================
+  - stage: Build
+    displayName: 'Build & Test'
+    jobs:
+      # ------------------------------------------
+      # Job 1: Python Backend
+      # ------------------------------------------
+      - job: BackendTest
+        displayName: 'Backend: Test & Security Scan'
+        pool:
+          vmImage: 'ubuntu-latest'
+
+        steps:
+          - checkout: self
+            fetchDepth: 0
+            displayName: 'Checkout repository'
+
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: '$(pythonVersion)'
+              addToPath: true
+            displayName: 'Setup Python $(pythonVersion)'
+
+          - task: Cache@2
+            inputs:
+              key: 'pip | "$(Agent.OS)" | $(workingDirectory)/requirements.txt'
+              restoreKeys: |
+                pip | "$(Agent.OS)"
+              path: $(PIP_CACHE_DIR)
+            displayName: 'Cache pip packages'
+
+          - script: |
+              cd $(workingDirectory)
+              python -m pip install --upgrade pip
+              pip install -r requirements.txt
+            displayName: 'Install Python dependencies'
+
+          - script: |
+              cd $(workingDirectory)
+              playwright install chromium
+              playwright install-deps chromium
+            displayName: 'Install Playwright browsers'
+
+          # Security: Dependency audit
+          - script: |
+              pip install pip-audit
+              cd $(workingDirectory)
+              pip-audit --requirement requirements.txt --desc on || true
+            displayName: 'Run pip-audit (dependency security scan)'
+
+          # Run pytest with coverage
+          - script: |
+              cd $(workingDirectory)
+              pytest tests/ \
+                --cov=app \
+                --cov=api \
+                --cov-report=xml:coverage.xml \
+                --cov-report=html:htmlcov \
+                --cov-report=term-missing \
+                --cov-fail-under=$(coverageThreshold) \
+                --junitxml=test-results.xml \
+                -v
+            displayName: 'Run pytest with coverage'
+            env:
+              TESTING: 'true'
+
+          - task: PublishTestResults@2
+            inputs:
+              testResultsFormat: 'JUnit'
+              testResultsFiles: '$(workingDirectory)/test-results.xml'
+              testRunTitle: 'PriceScout Backend Tests'
+              failTaskOnFailedTests: true
+            displayName: 'Publish backend test results'
+            condition: always()
+
+          - task: PublishCodeCoverageResults@2
+            inputs:
+              summaryFileLocation: '$(workingDirectory)/coverage.xml'
+              failIfCoverageEmpty: true
+            displayName: 'Publish code coverage'
+            condition: always()
+
+      # ------------------------------------------
+      # Job 2: React Frontend
+      # ------------------------------------------
+      - job: FrontendBuild
+        displayName: 'Frontend: Build, Lint & Test'
+        pool:
+          vmImage: 'ubuntu-latest'
+
+        steps:
+          - checkout: self
+            displayName: 'Checkout repository'
+
+          - task: NodeTool@0
+            inputs:
+              versionSpec: '$(nodeVersion)'
+            displayName: 'Setup Node.js $(nodeVersion)'
+
+          - task: Cache@2
+            inputs:
+              key: 'npm | "$(Agent.OS)" | $(workingDirectory)/frontend/package-lock.json'
+              restoreKeys: |
+                npm | "$(Agent.OS)"
+              path: '$(workingDirectory)/frontend/node_modules'
+            displayName: 'Cache npm packages'
+
+          - script: |
+              cd $(workingDirectory)/frontend
+              npm ci
+            displayName: 'Install npm dependencies'
+
+          # Security: npm audit
+          - script: |
+              cd $(workingDirectory)/frontend
+              npm audit --audit-level=high || true
+            displayName: 'Run npm audit (dependency security scan)'
+
+          # TypeScript type checking
+          - script: |
+              cd $(workingDirectory)/frontend
+              npx tsc --noEmit
+            displayName: 'TypeScript type check'
+
+          # ESLint
+          - script: |
+              cd $(workingDirectory)/frontend
+              npm run lint
+            displayName: 'Run ESLint'
+            continueOnError: true
+
+          # Vitest unit tests
+          - script: |
+              cd $(workingDirectory)/frontend
+              npm run test:coverage || true
+            displayName: 'Run Vitest unit tests'
+
+          # Build production bundle
+          - script: |
+              cd $(workingDirectory)/frontend
+              npm run build
+            displayName: 'Build React app'
+            env:
+              VITE_API_BASE_URL: '/api/v1'
+
+          # Publish frontend build artifact
+          - publish: '$(workingDirectory)/frontend/dist'
+            displayName: 'Upload frontend artifact'
+            artifact: frontend
+
+      # ------------------------------------------
+      # Job 3: Create deployment package
+      # ------------------------------------------
+      - job: Package
+        displayName: 'Create deployment artifact'
+        dependsOn:
+          - BackendTest
+          - FrontendBuild
+        pool:
+          vmImage: 'ubuntu-latest'
+
+        steps:
+          - checkout: self
+            displayName: 'Checkout repository'
+
+          - task: ArchiveFiles@2
+            inputs:
+              rootFolderOrFile: '$(workingDirectory)'
+              includeRootFolder: false
+              archiveType: 'zip'
+              archiveFile: '$(Build.ArtifactStagingDirectory)/pricescout-$(Build.BuildId).zip'
+              replaceExistingArchive: true
+              excludePatterns: |
+                .git/**
+                .venv/**
+                **/__pycache__/**
+                **/*.pyc
+                htmlcov/**
+                .pytest_cache/**
+                frontend/node_modules/**
+                frontend/dist/**
+            displayName: 'Create backend deployment artifact'
+
+          - task: PublishBuildArtifacts@1
+            inputs:
+              pathToPublish: '$(Build.ArtifactStagingDirectory)'
+              artifactName: 'drop'
+            displayName: 'Publish backend artifact'
+
+  # ============================================================================
+  # STAGE 2: DEPLOY TO DEV
+  # Auto-deploys after successful build on main branch
+  # ============================================================================
+  - stage: DeployDev
+    displayName: 'Deploy to Dev'
+    dependsOn: Build
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+
+    jobs:
+      - deployment: DeployToDev
+        displayName: 'Deploy to Dev Environment'
+        pool:
+          vmImage: 'ubuntu-latest'
+        environment: 'pricescout-dev'
+
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: drop
+                  displayName: 'Download backend artifact'
+
+                - download: current
+                  artifact: frontend
+                  displayName: 'Download frontend artifact'
+
+                - task: AzureWebApp@1
+                  inputs:
+                    azureSubscription: '$(azureSubscription)'
+                    appType: 'webAppLinux'
+                    appName: '$(appServiceNameDev)'
+                    resourceGroupName: '$(resourceGroupDev)'
+                    package: '$(Pipeline.Workspace)/drop/pricescout-$(Build.BuildId).zip'
+                    runtimeStack: 'PYTHON|3.11'
+                    startUpCommand: 'gunicorn -w 4 -k uvicorn.workers.UvicornWorker api.main:app'
+                  displayName: 'Deploy API to App Service (Dev)'
+
+                # Smoke tests
+                - task: AzureCLI@2
+                  inputs:
+                    azureSubscription: '$(azureSubscription)'
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      APP_URL=$(az webapp show \
+                        --name $(appServiceNameDev) \
+                        --resource-group $(resourceGroupDev) \
+                        --query defaultHostName -o tsv)
+
+                      echo "Testing https://$APP_URL/api/v1/health"
+                      sleep 30
+
+                      HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "https://$APP_URL/api/v1/health")
+
+                      if [ "$HTTP_STATUS" -eq 200 ]; then
+                        echo "Health check passed (HTTP $HTTP_STATUS)"
+                      else
+                        echo "Health check failed (HTTP $HTTP_STATUS)"
+                        exit 1
+                      fi
+                  displayName: 'Run smoke tests'
+
+  # ============================================================================
+  # STAGE 3: DEPLOY TO TEST
+  # Requires manual approval before deployment
+  # ============================================================================
+  - stage: DeployTest
+    displayName: 'Deploy to Test'
+    dependsOn: DeployDev
+    condition: succeeded()
+
+    jobs:
+      - deployment: DeployToTest
+        displayName: 'Deploy to Test Environment'
+        pool:
+          vmImage: 'ubuntu-latest'
+        environment: 'pricescout-test'  # Approval configured in Azure DevOps
+
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: drop
+                  displayName: 'Download backend artifact'
+
+                - task: AzureWebApp@1
+                  inputs:
+                    azureSubscription: '$(azureSubscription)'
+                    appType: 'webAppLinux'
+                    appName: '$(appServiceNameTest)'
+                    resourceGroupName: '$(resourceGroupTest)'
+                    package: '$(Pipeline.Workspace)/drop/pricescout-$(Build.BuildId).zip'
+                    runtimeStack: 'PYTHON|3.11'
+                    startUpCommand: 'gunicorn -w 4 -k uvicorn.workers.UvicornWorker api.main:app'
+                  displayName: 'Deploy API to App Service (Test)'
+
+                - task: AzureCLI@2
+                  inputs:
+                    azureSubscription: '$(azureSubscription)'
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      APP_URL=$(az webapp show \
+                        --name $(appServiceNameTest) \
+                        --resource-group $(resourceGroupTest) \
+                        --query defaultHostName -o tsv)
+
+                      echo "Running integration tests against https://$APP_URL"
+                      sleep 30
+
+                      curl -f "https://$APP_URL/api/v1/health" || exit 1
+                      echo "Health check passed"
+
+                      curl -f "https://$APP_URL/api/v1/openapi.json" || exit 1
+                      echo "OpenAPI spec accessible"
+                  displayName: 'Run integration tests'
+
+  # ============================================================================
+  # STAGE 4: DEPLOY TO PRODUCTION
+  # Requires manual approval, uses staging slot swap for zero-downtime
+  # ============================================================================
+  - stage: DeployProd
+    displayName: 'Deploy to Production'
+    dependsOn: DeployTest
+    condition: succeeded()
+
+    jobs:
+      - deployment: DeployToProd
+        displayName: 'Deploy to Production Environment'
+        pool:
+          vmImage: 'ubuntu-latest'
+        environment: 'pricescout-prod'  # Approval configured in Azure DevOps
+
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: drop
+                  displayName: 'Download backend artifact'
+
+                # Deploy to staging slot
+                - task: AzureWebApp@1
+                  inputs:
+                    azureSubscription: '$(azureSubscription)'
+                    appType: 'webAppLinux'
+                    appName: '$(appServiceNameProd)'
+                    resourceGroupName: '$(resourceGroupProd)'
+                    package: '$(Pipeline.Workspace)/drop/pricescout-$(Build.BuildId).zip'
+                    runtimeStack: 'PYTHON|3.11'
+                    startUpCommand: 'gunicorn -w 4 -k uvicorn.workers.UvicornWorker api.main:app'
+                    deployToSlotOrASE: true
+                    slotName: 'staging'
+                  displayName: 'Deploy to staging slot'
+
+                # Verify staging slot
+                - task: AzureCLI@2
+                  inputs:
+                    azureSubscription: '$(azureSubscription)'
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      SLOT_URL=$(az webapp deployment slot list \
+                        --name $(appServiceNameProd) \
+                        --resource-group $(resourceGroupProd) \
+                        --query "[?name=='staging'].defaultHostName" -o tsv)
+
+                      echo "Verifying staging slot: https://$SLOT_URL"
+                      sleep 30
+
+                      curl -f "https://$SLOT_URL/api/v1/health" || exit 1
+                      echo "Staging slot healthy"
+                  displayName: 'Verify staging slot'
+
+                # Swap staging to production
+                - task: AzureAppServiceManage@0
+                  inputs:
+                    azureSubscription: '$(azureSubscription)'
+                    action: 'Swap Slots'
+                    webAppName: '$(appServiceNameProd)'
+                    resourceGroupName: '$(resourceGroupProd)'
+                    sourceSlot: 'staging'
+                    targetSlot: 'production'
+                  displayName: 'Swap to production'
+
+                # Final verification
+                - task: AzureCLI@2
+                  inputs:
+                    azureSubscription: '$(azureSubscription)'
+                    scriptType: 'bash'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      APP_URL=$(az webapp show \
+                        --name $(appServiceNameProd) \
+                        --resource-group $(resourceGroupProd) \
+                        --query defaultHostName -o tsv)
+
+                      echo "Final verification: https://$APP_URL"
+                      sleep 10
+
+                      curl -f "https://$APP_URL/api/v1/health" || exit 1
+                      echo "Production deployment verified"
+                  displayName: 'Verify production deployment'
