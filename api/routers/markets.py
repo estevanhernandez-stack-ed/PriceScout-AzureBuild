@@ -1,3 +1,12 @@
+"""
+Markets API Router
+
+Endpoints for loading market data (theater groupings by geographic region).
+
+Endpoints:
+    GET    /api/v1/markets                       - List all markets across companies
+"""
+
 from fastapi import APIRouter, Security
 from api.routers.auth import get_current_user, User
 import json

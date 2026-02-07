@@ -705,42 +705,61 @@ class TestDayTypeDetection:
 
 
 class TestDaypartDetection:
-    """Test daypart (matinee/evening/late) detection from showtimes."""
+    """Test daypart detection from showtimes.
 
-    def test_matinee_before_5pm(self):
-        """Showtimes before 5 PM should be matinee."""
+    Uses Fandango-aligned daypart conventions:
+    - Matinee: Before 4:00 PM
+    - Twilight: 4:00 PM - 6:00 PM
+    - Prime: 6:00 PM - 9:00 PM
+    - Late Night: After 9:00 PM
+    """
+
+    def test_matinee_before_4pm(self):
+        """Showtimes before 4 PM should be Matinee."""
         from app.enttelligence_baseline_discovery import EntTelligenceBaselineDiscoveryService
 
         service = EntTelligenceBaselineDiscoveryService(company_id=1)
 
-        assert service._get_daypart("10:30 AM") == 'matinee'
-        assert service._get_daypart("12:00 PM") == 'matinee'
-        assert service._get_daypart("2:15 PM") == 'matinee'
-        assert service._get_daypart("4:45 PM") == 'matinee'
-        assert service._get_daypart("4:59 PM") == 'matinee'
+        assert service._get_daypart("10:30 AM") == 'Matinee'
+        assert service._get_daypart("12:00 PM") == 'Matinee'
+        assert service._get_daypart("2:15 PM") == 'Matinee'
+        assert service._get_daypart("3:45 PM") == 'Matinee'
+        assert service._get_daypart("3:59 PM") == 'Matinee'
 
-    def test_evening_5pm_to_9pm(self):
-        """Showtimes 5 PM to 9 PM should be evening."""
+    def test_twilight_4pm_to_6pm(self):
+        """Showtimes 4 PM to 6 PM should be Twilight."""
         from app.enttelligence_baseline_discovery import EntTelligenceBaselineDiscoveryService
 
         service = EntTelligenceBaselineDiscoveryService(company_id=1)
 
-        assert service._get_daypart("5:00 PM") == 'evening'
-        assert service._get_daypart("6:30 PM") == 'evening'
-        assert service._get_daypart("7:15 PM") == 'evening'
-        assert service._get_daypart("8:45 PM") == 'evening'
-        assert service._get_daypart("8:59 PM") == 'evening'
+        assert service._get_daypart("4:00 PM") == 'Twilight'
+        assert service._get_daypart("4:30 PM") == 'Twilight'
+        assert service._get_daypart("5:00 PM") == 'Twilight'
+        assert service._get_daypart("5:45 PM") == 'Twilight'
+        assert service._get_daypart("5:59 PM") == 'Twilight'
 
-    def test_late_after_9pm(self):
-        """Showtimes after 9 PM should be late."""
+    def test_prime_6pm_to_9pm(self):
+        """Showtimes 6 PM to 9 PM should be Prime."""
         from app.enttelligence_baseline_discovery import EntTelligenceBaselineDiscoveryService
 
         service = EntTelligenceBaselineDiscoveryService(company_id=1)
 
-        assert service._get_daypart("9:00 PM") == 'late'
-        assert service._get_daypart("9:30 PM") == 'late'
-        assert service._get_daypart("10:15 PM") == 'late'
-        assert service._get_daypart("11:00 PM") == 'late'
+        assert service._get_daypart("6:00 PM") == 'Prime'
+        assert service._get_daypart("6:30 PM") == 'Prime'
+        assert service._get_daypart("7:15 PM") == 'Prime'
+        assert service._get_daypart("8:45 PM") == 'Prime'
+        assert service._get_daypart("8:59 PM") == 'Prime'
+
+    def test_late_night_after_9pm(self):
+        """Showtimes after 9 PM should be Late Night."""
+        from app.enttelligence_baseline_discovery import EntTelligenceBaselineDiscoveryService
+
+        service = EntTelligenceBaselineDiscoveryService(company_id=1)
+
+        assert service._get_daypart("9:00 PM") == 'Late Night'
+        assert service._get_daypart("9:30 PM") == 'Late Night'
+        assert service._get_daypart("10:15 PM") == 'Late Night'
+        assert service._get_daypart("11:00 PM") == 'Late Night'
 
     def test_handles_various_time_formats(self):
         """Should handle various time string formats."""
@@ -749,10 +768,11 @@ class TestDaypartDetection:
         service = EntTelligenceBaselineDiscoveryService(company_id=1)
 
         # Various formats that might appear in data
-        assert service._get_daypart("4:15p") == 'matinee'
-        assert service._get_daypart("7:30P") == 'evening'
-        assert service._get_daypart("10:00PM") == 'late'
-        assert service._get_daypart("2:30pm") == 'matinee'
+        assert service._get_daypart("3:15p") == 'Matinee'      # Before 4pm
+        assert service._get_daypart("4:15p") == 'Twilight'     # 4-6pm
+        assert service._get_daypart("7:30P") == 'Prime'        # 6-9pm
+        assert service._get_daypart("10:00PM") == 'Late Night' # After 9pm
+        assert service._get_daypart("2:30pm") == 'Matinee'     # Before 4pm
 
     def test_handles_empty_and_invalid(self):
         """Should return None for empty or invalid showtimes."""

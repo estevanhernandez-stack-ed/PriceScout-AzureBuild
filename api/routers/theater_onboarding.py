@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field
 from typing import Optional, List, Any, Dict
 from datetime import datetime
 
-from api.routers.auth import get_current_user, User
+from api.routers.auth import get_current_user
 from app.db_session import get_session
 from app.theater_onboarding_service import TheaterOnboardingService
 
@@ -117,11 +117,11 @@ class DiscoveryResultResponse(BaseModel):
 @router.get("/status/{theater_name}", response_model=OnboardingStatusResponse)
 async def get_onboarding_status(
     theater_name: str,
-    current_user: User = Security(get_current_user, scopes=["read:baselines"])
+    current_user: dict = Security(get_current_user, scopes=["read:baselines"])
 ):
     """Get detailed onboarding status for a theater."""
     with get_session() as session:
-        service = TheaterOnboardingService(session, current_user.company_id)
+        service = TheaterOnboardingService(session, current_user["company_id"])
         status = service.get_onboarding_status(theater_name)
 
         if not status:
@@ -132,22 +132,22 @@ async def get_onboarding_status(
 
 @router.get("/pending", response_model=List[PendingTheaterResponse])
 async def list_pending_theaters(
-    current_user: User = Security(get_current_user, scopes=["read:baselines"])
+    current_user: dict = Security(get_current_user, scopes=["read:baselines"])
 ):
     """List all theaters with incomplete onboarding."""
     with get_session() as session:
-        service = TheaterOnboardingService(session, current_user.company_id)
+        service = TheaterOnboardingService(session, current_user["company_id"])
         return service.list_pending_theaters()
 
 
 @router.post("/start", response_model=OnboardingStatusResponse)
 async def start_onboarding(
     request: StartOnboardingRequest,
-    current_user: User = Security(get_current_user, scopes=["write:baselines"])
+    current_user: dict = Security(get_current_user, scopes=["write:baselines"])
 ):
     """Start the onboarding process for a new theater."""
     with get_session() as session:
-        service = TheaterOnboardingService(session, current_user.company_id)
+        service = TheaterOnboardingService(session, current_user["company_id"])
         status = service.start_onboarding(
             theater_name=request.theater_name,
             circuit_name=request.circuit_name,
@@ -159,11 +159,11 @@ async def start_onboarding(
 @router.post("/bulk-start", response_model=List[PendingTheaterResponse])
 async def bulk_start_onboarding(
     request: BulkStartRequest,
-    current_user: User = Security(get_current_user, scopes=["write:baselines"])
+    current_user: dict = Security(get_current_user, scopes=["write:baselines"])
 ):
     """Start onboarding for multiple theaters at once."""
     with get_session() as session:
-        service = TheaterOnboardingService(session, current_user.company_id)
+        service = TheaterOnboardingService(session, current_user["company_id"])
         service.bulk_start_onboarding(
             theaters=request.theaters,
             market=request.market
@@ -175,11 +175,11 @@ async def bulk_start_onboarding(
 async def record_initial_scrape(
     theater_name: str,
     request: RecordScrapeRequest,
-    current_user: User = Security(get_current_user, scopes=["write:baselines"])
+    current_user: dict = Security(get_current_user, scopes=["write:baselines"])
 ):
     """Record that initial price collection has been completed."""
     with get_session() as session:
-        service = TheaterOnboardingService(session, current_user.company_id)
+        service = TheaterOnboardingService(session, current_user["company_id"])
         service.record_initial_scrape(
             theater_name=theater_name,
             source=request.source,
@@ -192,14 +192,14 @@ async def record_initial_scrape(
 async def discover_theater_baselines(
     theater_name: str,
     request: DiscoverBaselinesRequest = None,
-    current_user: User = Security(get_current_user, scopes=["write:baselines"])
+    current_user: dict = Security(get_current_user, scopes=["write:baselines"])
 ):
     """Discover baselines from collected price data."""
     if request is None:
         request = DiscoverBaselinesRequest()
 
     with get_session() as session:
-        service = TheaterOnboardingService(session, current_user.company_id)
+        service = TheaterOnboardingService(session, current_user["company_id"])
         return service.discover_baselines(
             theater_name=theater_name,
             lookback_days=request.lookback_days,
@@ -211,14 +211,14 @@ async def discover_theater_baselines(
 async def link_to_profile(
     theater_name: str,
     request: LinkProfileRequest = None,
-    current_user: User = Security(get_current_user, scopes=["write:baselines"])
+    current_user: dict = Security(get_current_user, scopes=["write:baselines"])
 ):
     """Link theater to a company profile."""
     if request is None:
         request = LinkProfileRequest()
 
     with get_session() as session:
-        service = TheaterOnboardingService(session, current_user.company_id)
+        service = TheaterOnboardingService(session, current_user["company_id"])
         try:
             service.link_to_profile(
                 theater_name=theater_name,
@@ -233,17 +233,17 @@ async def link_to_profile(
 async def confirm_baselines(
     theater_name: str,
     request: ConfirmBaselinesRequest = None,
-    current_user: User = Security(get_current_user, scopes=["write:baselines"])
+    current_user: dict = Security(get_current_user, scopes=["write:baselines"])
 ):
     """Confirm baselines after user review."""
     if request is None:
         request = ConfirmBaselinesRequest()
 
     with get_session() as session:
-        service = TheaterOnboardingService(session, current_user.company_id)
+        service = TheaterOnboardingService(session, current_user["company_id"])
         service.confirm_baselines(
             theater_name=theater_name,
-            user_id=current_user.user_id,
+            user_id=current_user["user_id"],
             notes=request.notes
         )
         return service.get_onboarding_status(theater_name)
@@ -252,22 +252,22 @@ async def confirm_baselines(
 @router.get("/{theater_name}/coverage", response_model=CoverageResponse)
 async def get_coverage_indicators(
     theater_name: str,
-    current_user: User = Security(get_current_user, scopes=["read:baselines"])
+    current_user: dict = Security(get_current_user, scopes=["read:baselines"])
 ):
     """Get detailed coverage indicators showing what's discovered vs missing."""
     with get_session() as session:
-        service = TheaterOnboardingService(session, current_user.company_id)
+        service = TheaterOnboardingService(session, current_user["company_id"])
         return service.get_coverage_indicators(theater_name)
 
 
 @router.get("/market/{market}", response_model=List[Dict[str, Any]])
 async def list_theaters_by_market(
     market: str,
-    current_user: User = Security(get_current_user, scopes=["read:baselines"])
+    current_user: dict = Security(get_current_user, scopes=["read:baselines"])
 ):
     """List all theaters in a market with their onboarding status."""
     with get_session() as session:
-        service = TheaterOnboardingService(session, current_user.company_id)
+        service = TheaterOnboardingService(session, current_user["company_id"])
         return service.list_theaters_by_market(market)
 
 
@@ -314,7 +314,7 @@ class BackfillResult(BaseModel):
 @router.get("/amenities/missing", response_model=List[TheaterMissingAmenities])
 async def get_theaters_missing_amenities(
     circuit_name: Optional[str] = Query(None, description="Filter by circuit"),
-    current_user: User = Security(get_current_user, scopes=["read:baselines"])
+    current_user: dict = Security(get_current_user, scopes=["read:baselines"])
 ):
     """
     List theaters that have showings data but no amenities record.
@@ -322,7 +322,7 @@ async def get_theaters_missing_amenities(
     Use this to identify which theaters need amenity discovery.
     """
     with get_session() as session:
-        service = TheaterOnboardingService(session, current_user.company_id)
+        service = TheaterOnboardingService(session, current_user["company_id"])
         return service.get_theaters_missing_amenities(circuit_name)
 
 
@@ -330,7 +330,7 @@ async def get_theaters_missing_amenities(
 async def discover_theater_amenities(
     theater_name: str,
     request: AmenityDiscoveryRequest = None,
-    current_user: User = Security(get_current_user, scopes=["write:baselines"])
+    current_user: dict = Security(get_current_user, scopes=["write:baselines"])
 ):
     """
     Discover amenities for a specific theater from showings data.
@@ -343,7 +343,7 @@ async def discover_theater_amenities(
         request = AmenityDiscoveryRequest()
 
     with get_session() as session:
-        service = TheaterOnboardingService(session, current_user.company_id)
+        service = TheaterOnboardingService(session, current_user["company_id"])
         return service.discover_theater_amenities(
             theater_name=theater_name,
             lookback_days=request.lookback_days
@@ -353,7 +353,7 @@ async def discover_theater_amenities(
 @router.post("/amenities/backfill", response_model=BackfillResult)
 async def backfill_amenities(
     request: BackfillAmenitiesRequest = None,
-    current_user: User = Security(get_current_user, scopes=["write:baselines"])
+    current_user: dict = Security(get_current_user, scopes=["write:baselines"])
 ):
     """
     Backfill amenities for all existing theaters with showings data.
@@ -366,7 +366,7 @@ async def backfill_amenities(
         request = BackfillAmenitiesRequest()
 
     with get_session() as session:
-        service = TheaterOnboardingService(session, current_user.company_id)
+        service = TheaterOnboardingService(session, current_user["company_id"])
         return service.backfill_amenities_for_existing_theaters(
             circuit_name=request.circuit_name,
             market=request.market,

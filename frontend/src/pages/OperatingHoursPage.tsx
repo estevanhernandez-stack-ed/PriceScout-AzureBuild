@@ -7,10 +7,12 @@ import {
 } from '@/hooks/api/useReports';
 import { useTheaterOperatingHours, useUpdateTheaterOperatingHours, type DailyOperatingHours } from '@/hooks/api/useOperatingHoursConfig';
 import { useEstimateScrapeTime } from '@/hooks/api/useScrapes';
+import { useMarkTheaterStatus } from '@/hooks/api/useZeroShowtimes';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
-import { Progress } from '@/components/ui/progress';
+import { Input } from '@/components/ui/input';
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import {
   MapPin,
@@ -30,13 +32,13 @@ import {
   Save,
   Timer,
   Printer,
-  ChevronsUpDown,
   Minimize2,
   Maximize2,
 } from 'lucide-react';
 import { format, addDays, nextThursday, startOfDay } from 'date-fns';
 import { cn } from '@/lib/utils';
 import { useAuthStore } from '@/stores/authStore';
+import { useToast } from '@/hooks/use-toast';
 
 type WorkflowStep = 'select-director' | 'select-market' | 'select-theaters' | 'select-dates' | 'running' | 'results';
 
@@ -91,6 +93,12 @@ export function OperatingHoursPage() {
   });
   const [scrapeDuration, setScrapeDuration] = useState<number>(0);
 
+  // Mark theater dialog state
+  const [markDialogOpen, setMarkDialogOpen] = useState(false);
+  const [markDialogTheater, setMarkDialogTheater] = useState<string>('');
+  const [markDialogAction, setMarkDialogAction] = useState<'not_on_fandango' | 'closed'>('not_on_fandango');
+  const [markDialogUrl, setMarkDialogUrl] = useState<string>('');
+
   // Time estimation state
   const [timeEstimate, setTimeEstimate] = useState<{ seconds: number; formatted: string; hasData: boolean } | null>(null);
   const [showConfirmDialog, setShowConfirmDialog] = useState(false);
@@ -120,6 +128,8 @@ export function OperatingHoursPage() {
   const { data: cacheData } = useTheaterCache();
   const fetchOperatingHours = useFetchOperatingHours();
   const estimateTime = useEstimateScrapeTime();
+  const markTheaterStatus = useMarkTheaterStatus();
+  const { toast } = useToast();
 
   // Get company data
   const companyData = useMemo(() => {
@@ -365,6 +375,25 @@ export function OperatingHoursPage() {
     }
   };
 
+  // Bulk selection: Select all Marcus + Movie Tavern theaters in director
+  const handleSelectAllMarcusAndMovieTavern = () => {
+    const ownedTheaters = allTheatersInDirector
+      .filter((t) => {
+        const company = extractCompany(t.name);
+        return (company === 'Marcus' || company === 'Movie Tavern') && isScrapeable(t);
+      })
+      .map((t) => t.name);
+
+    const allSelected = ownedTheaters.every((t) => selectedTheaters.includes(t));
+
+    if (allSelected) {
+      setSelectedTheaters((prev) => prev.filter((t) => !ownedTheaters.includes(t)));
+    } else {
+      setSelectedTheaters((prev) => [...new Set([...prev, ...ownedTheaters])]);
+      setStep('select-dates');
+    }
+  };
+
   // Bulk selection: Select all theaters in market
   const handleSelectAllInMarket = () => {
     const marketTheaters = getScrapeable(theatersInMarket).map((t) => t.name);
@@ -440,6 +469,57 @@ export function OperatingHoursPage() {
     return grouped;
   }, [operatingHours]);
 
+  // Detect theaters with 0 showtimes across ALL scraped dates
+  const zeroShowtimeTheaters = useMemo(() => {
+    if (operatingHours.length === 0) return [];
+    const theaters: string[] = [];
+    Object.entries(hoursByTheater).forEach(([theater, hours]) => {
+      const allZero = hours.every(h => h.showtime_count === 0);
+      if (allZero && hours.length > 0) {
+        theaters.push(theater);
+      }
+    });
+    return theaters;
+  }, [hoursByTheater, operatingHours.length]);
+
+  // Open mark-theater dialog
+  const openMarkDialog = (theaterName: string) => {
+    setMarkDialogTheater(theaterName);
+    setMarkDialogAction('not_on_fandango');
+    setMarkDialogUrl('');
+    setMarkDialogOpen(true);
+  };
+
+  // Submit mark-theater action
+  const handleSubmitMarkTheater = () => {
+    markTheaterStatus.mutate(
+      {
+        theater_name: markDialogTheater,
+        market: selectedMarket,
+        status: markDialogAction,
+        external_url: markDialogAction === 'not_on_fandango' && markDialogUrl ? markDialogUrl : undefined,
+        reason: 'zero_showtimes',
+      },
+      {
+        onSuccess: () => {
+          const label = markDialogAction === 'closed' ? 'Permanently Closed' : 'Not on Fandango';
+          toast({
+            title: 'Theater marked',
+            description: `${markDialogTheater} has been marked as ${label}. It will be excluded from future scrapes.`,
+          });
+          setMarkDialogOpen(false);
+        },
+        onError: (error) => {
+          toast({
+            title: 'Error',
+            description: `Failed to mark theater: ${error.message}`,
+            variant: 'destructive',
+          });
+        },
+      }
+    );
+  };
+
   // Show confirmation before starting
   const handleRequestScrape = () => {
     if (selectedTheaters.length === 0) return;
@@ -453,7 +533,7 @@ export function OperatingHoursPage() {
 
     const theaters = allTheatersInDirector
       .filter((t) => selectedTheaters.includes(t.name) && t.url)
-      .map((t) => ({ name: t.name, url: t.url! }));
+      .map((t) => ({ name: t.name, url: t.url ?? '' }));
 
     console.log('[OperatingHours] Starting scrape:', {
       theaterCount: theaters.length,
@@ -750,6 +830,18 @@ export function OperatingHoursPage() {
   const allMarcusSelected = marcusTheatersInDirector.length > 0 &&
     marcusTheatersInDirector.every((t) => selectedTheaters.includes(t.name));
 
+  const marcusAndMovieTavernInDirector = allTheatersInDirector.filter(
+    (t) => {
+      const company = extractCompany(t.name);
+      return (company === 'Marcus' || company === 'Movie Tavern') && isScrapeable(t);
+    }
+  );
+  const allMarcusAndMovieTavernSelected = marcusAndMovieTavernInDirector.length > 0 &&
+    marcusAndMovieTavernInDirector.every((t) => selectedTheaters.includes(t.name));
+  const hasMovieTaverns = allTheatersInDirector.some(
+    (t) => extractCompany(t.name) === 'Movie Tavern' && isScrapeable(t)
+  );
+
   const scrapeableInMarket = getScrapeable(theatersInMarket);
   const allInMarketSelected = scrapeableInMarket.length > 0 &&
     scrapeableInMarket.every((t) => selectedTheaters.includes(t.name));
@@ -772,7 +864,7 @@ export function OperatingHoursPage() {
           </p>
         </div>
         <div className="flex gap-2">
-          <Tabs value={topTab} onValueChange={(v) => setTopTab(v as any)} className="w-[400px]">
+          <Tabs value={topTab} onValueChange={(v) => setTopTab(v as 'analyze' | 'configure')} className="w-[400px]">
             <TabsList className="grid w-full grid-cols-2">
               <TabsTrigger value="analyze" className="flex items-center gap-2">
                 <RefreshCw className="h-4 w-4" />
@@ -973,6 +1065,15 @@ export function OperatingHoursPage() {
           >
             {allMarcusSelected ? 'Deselect' : 'Select'} All Marcus in {selectedDirector}
           </Button>
+          {hasMovieTaverns && (
+            <Button
+              variant={allMarcusAndMovieTavernSelected ? 'toggleActive' : 'toggle'}
+              size="sm"
+              onClick={handleSelectAllMarcusAndMovieTavern}
+            >
+              {allMarcusAndMovieTavernSelected ? 'Deselect' : 'Select'} All Marcus & Movie Tavern
+            </Button>
+          )}
           <Button
             variant={allInDirectorSelected ? 'toggleActive' : 'toggle'}
             size="sm"
@@ -1311,6 +1412,38 @@ export function OperatingHoursPage() {
             </CardContent>
           </Card>
 
+          {/* Zero Showtime Warning */}
+          {zeroShowtimeTheaters.length > 0 && (
+            <Card className="border-orange-300 bg-orange-50 dark:bg-orange-950/20">
+              <CardHeader className="pb-2">
+                <CardTitle className="text-sm flex items-center gap-2">
+                  <AlertCircle className="h-4 w-4 text-orange-500" />
+                  Theaters with 0 Showtimes ({zeroShowtimeTheaters.length})
+                </CardTitle>
+              </CardHeader>
+              <CardContent>
+                <div className="space-y-2">
+                  {zeroShowtimeTheaters.map(theater => (
+                    <div key={theater} className="flex items-center justify-between text-sm">
+                      <span>{theater}</span>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => openMarkDialog(theater)}
+                      >
+                        Update Status
+                      </Button>
+                    </div>
+                  ))}
+                </div>
+                <p className="text-xs text-muted-foreground mt-3">
+                  These theaters returned 0 showtimes for all scraped dates. They may have moved to their own ticketing sites
+                  or permanently closed. Click "Update Status" to mark them.
+                </p>
+              </CardContent>
+            </Card>
+          )}
+
           {/* Export & Print Actions */}
           <div className="flex flex-wrap gap-2">
             <Button variant="outline" onClick={handleExportCsv}>
@@ -1548,6 +1681,63 @@ export function OperatingHoursPage() {
       )}
         </>
       )}
+
+      {/* Mark Theater Status Dialog */}
+      <Dialog open={markDialogOpen} onOpenChange={setMarkDialogOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Update Theater Status</DialogTitle>
+            <DialogDescription>
+              {markDialogTheater} returned 0 showtimes. Choose how to mark it.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4 py-2">
+            {/* Action selection */}
+            <div className="space-y-2">
+              <Button
+                variant={markDialogAction === 'not_on_fandango' ? 'default' : 'outline'}
+                className="w-full justify-start"
+                onClick={() => setMarkDialogAction('not_on_fandango')}
+              >
+                Not on Fandango — Theater uses its own ticketing site
+              </Button>
+              <Button
+                variant={markDialogAction === 'closed' ? 'default' : 'outline'}
+                className="w-full justify-start"
+                onClick={() => setMarkDialogAction('closed')}
+              >
+                Permanently Closed — Theater is no longer operating
+              </Button>
+            </div>
+
+            {/* URL input for not_on_fandango */}
+            {markDialogAction === 'not_on_fandango' && (
+              <div className="space-y-1">
+                <label className="text-sm font-medium">Theater's own website (optional)</label>
+                <Input
+                  placeholder="https://www.example.com/showtimes"
+                  value={markDialogUrl}
+                  onChange={(e) => setMarkDialogUrl(e.target.value)}
+                />
+                <p className="text-xs text-muted-foreground">
+                  If you know the theater's direct ticketing URL, paste it here. The theater button in Market Mode will open this URL.
+                </p>
+              </div>
+            )}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setMarkDialogOpen(false)}>
+              Cancel
+            </Button>
+            <Button
+              onClick={handleSubmitMarkTheater}
+              disabled={markTheaterStatus.isPending}
+            >
+              {markTheaterStatus.isPending ? 'Saving...' : 'Confirm'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

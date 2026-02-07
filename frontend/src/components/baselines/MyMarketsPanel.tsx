@@ -23,6 +23,7 @@ import {
   Target,
   CheckCircle2,
   AlertCircle,
+  Clock,
 } from 'lucide-react';
 import {
   useMarketsHierarchy,
@@ -111,7 +112,7 @@ export function MyMarketsPanel() {
     return map;
   }, [marketCoverageData]);
 
-  // Calculate stats for a set of theaters
+  // Calculate stats for a set of theaters (including freshness)
   const getTheaterStats = (theaters: TheaterInfo[]) => {
     const theaterNames = theaters.map((t) => t.name);
     const baselines = savedBaselines?.filter((bl) => theaterNames.includes(bl.theater_name)) || [];
@@ -120,6 +121,18 @@ export function MyMarketsPanel() {
       (t) => t.name.startsWith('Marcus') || t.name.startsWith('Movie Tavern')
     ).length;
 
+    // Calculate freshness from last_discovery_at
+    let oldestDaysAgo: number | null = null;
+    let newestDaysAgo: number | null = null;
+    const now = Date.now();
+    for (const bl of baselines) {
+      if (bl.last_discovery_at) {
+        const daysAgo = Math.floor((now - new Date(bl.last_discovery_at).getTime()) / (1000 * 60 * 60 * 24));
+        if (oldestDaysAgo === null || daysAgo > oldestDaysAgo) oldestDaysAgo = daysAgo;
+        if (newestDaysAgo === null || daysAgo < newestDaysAgo) newestDaysAgo = daysAgo;
+      }
+    }
+
     return {
       total: theaters.length,
       yourTheaters,
@@ -127,6 +140,8 @@ export function MyMarketsPanel() {
       withBaselines: theatersWithBaselines,
       baselineCount: baselines.length,
       coveragePercent: theaters.length > 0 ? Math.round((theatersWithBaselines / theaters.length) * 100) : 0,
+      oldestDaysAgo,
+      newestDaysAgo,
     };
   };
 
@@ -318,7 +333,7 @@ export function MyMarketsPanel() {
                               {isMarketExpanded && (
                                 <div className="border-t p-4 space-y-4 bg-muted/10">
                                   {/* Quick Stats */}
-                                  <div className="grid gap-4 md:grid-cols-3">
+                                  <div className="grid gap-4 md:grid-cols-4">
                                     <div className="border rounded-md p-3">
                                       <div className="text-sm text-muted-foreground">Your Theaters</div>
                                       <div className="text-2xl font-bold text-purple-600">{marketStats.yourTheaters}</div>
@@ -330,6 +345,30 @@ export function MyMarketsPanel() {
                                     <div className="border rounded-md p-3">
                                       <div className="text-sm text-muted-foreground">Baselines Set</div>
                                       <div className="text-2xl font-bold text-green-600">{marketStats.baselineCount}</div>
+                                    </div>
+                                    <div className="border rounded-md p-3">
+                                      <div className="text-sm text-muted-foreground flex items-center gap-1">
+                                        <Clock className="h-3 w-3" />
+                                        Data Freshness
+                                      </div>
+                                      {marketStats.oldestDaysAgo === null ? (
+                                        <div className="text-sm text-muted-foreground mt-1">No data</div>
+                                      ) : marketStats.oldestDaysAgo > 14 ? (
+                                        <div className="text-lg font-bold text-red-600">
+                                          {marketStats.oldestDaysAgo}d ago
+                                          <span className="text-xs font-normal block text-red-500">Stale - refresh needed</span>
+                                        </div>
+                                      ) : marketStats.oldestDaysAgo > 7 ? (
+                                        <div className="text-lg font-bold text-yellow-600">
+                                          {marketStats.oldestDaysAgo}d ago
+                                          <span className="text-xs font-normal block text-yellow-500">Aging</span>
+                                        </div>
+                                      ) : (
+                                        <div className="text-lg font-bold text-green-600">
+                                          {marketStats.oldestDaysAgo === 0 ? 'Today' : `${marketStats.oldestDaysAgo}d ago`}
+                                          <span className="text-xs font-normal block text-green-500">Fresh</span>
+                                        </div>
+                                      )}
                                     </div>
                                   </div>
 

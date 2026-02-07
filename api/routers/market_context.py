@@ -8,6 +8,7 @@ from pydantic import BaseModel
 
 from api.routers.auth import require_read_admin, require_operator
 from api.services.market_context_service import get_market_context_service
+from app.config import DEFAULT_COMPANY_ID
 
 router = APIRouter(prefix="/market-context", tags=["Market Context"])
 
@@ -60,7 +61,7 @@ class TheaterOperatingHoursUpdate(BaseModel):
 @router.get("/theaters", response_model=List[TheaterMetadataResponse])
 async def get_theaters(current_user: dict = Depends(require_read_admin)):
     """Get all theater metadata for the user's company"""
-    company_id = 1 # Default for now
+    company_id = DEFAULT_COMPANY_ID
     service = get_market_context_service()
     return service.get_theaters_metadata(company_id)
 
@@ -72,7 +73,7 @@ async def get_events(
     current_user: dict = Depends(require_read_admin)
 ):
     """Get market events for a date range and optional market filter"""
-    company_id = 1
+    company_id = DEFAULT_COMPANY_ID
     service = get_market_context_service()
     return service.get_market_events(company_id, start_date, end_date, market)
 
@@ -82,7 +83,7 @@ async def get_theater_operating_hours(
     current_user: dict = Depends(require_read_admin)
 ):
     """Get configured operating hours for a specific theater"""
-    company_id = 1
+    company_id = DEFAULT_COMPANY_ID
     service = get_market_context_service()
     return service.get_theater_operating_hours(company_id, theater_name)
 
@@ -92,7 +93,7 @@ async def update_theater_operating_hours(
     current_user: dict = Depends(require_operator)
 ):
     """Update configured operating hours for a theater"""
-    company_id = 1
+    company_id = DEFAULT_COMPANY_ID
     service = get_market_context_service()
     success = service.update_theater_operating_hours(
         company_id, 
@@ -107,7 +108,7 @@ async def sync_theaters(
     current_user: dict = Depends(require_operator)
 ):
     """Trigger a sync of theater metadata from EntTelligence"""
-    company_id = 1
+    company_id = DEFAULT_COMPANY_ID
     service = get_market_context_service()
 
     theater_names = request.theater_names if request else None

@@ -30,5 +30,25 @@ export default defineConfig({
     setupFiles: './src/test/setup.ts',
     css: true,
     exclude: ['**/node_modules/**', '**/e2e/**', '**/*.spec.ts'],
+    coverage: {
+      provider: 'v8',
+      reporter: ['text', 'html', 'lcov'],
+      reportsDirectory: './coverage',
+      thresholds: {
+        lines: 70,
+        functions: 68,           // v8 counts bundled dependency functions (radix-ui, date-fns)
+        branches: 70,
+        statements: 70,
+      },
+      exclude: [
+        'node_modules/',
+        'src/test/',
+        '**/*.d.ts',
+        'src/main.tsx',
+        '**/*.config.*',
+        'src/pages/**',       // Page components tested via E2E, not unit
+        'src/types/**',       // Pure type definitions — no runtime code
+      ],
+    },
   },
 });

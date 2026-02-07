@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
+import axios from 'axios';
 import type { UserResponse, Token } from '@/types';
 import { api } from '@/lib/api';
 
@@ -48,27 +49,23 @@ export const useAuthStore = create<AuthState>()(
           formData.append('username', username);
           formData.append('password', password);
 
-          const response = await fetch('/api/v1/auth/token', {
-            method: 'POST',
+          const response = await api.post<Token>('/auth/token', formData, {
             headers: {
               'Content-Type': 'application/x-www-form-urlencoded',
             },
-            body: formData,
           });
 
-          if (!response.ok) {
-            const error = await response.json();
-            throw new Error(error.detail || 'Login failed');
-          }
-
-          const data: Token = await response.json();
-          set({ token: data.access_token, isAuthenticated: true });
+          set({ token: response.data.access_token, isAuthenticated: true });
 
           // Fetch user profile
           await get().fetchUser();
         } catch (error) {
+          const message = axios.isAxiosError(error) && error.response?.data?.detail 
+            ? error.response.data.detail 
+            : (error instanceof Error ? error.message : 'Login failed');
+            
           set({
-            error: error instanceof Error ? error.message : 'Login failed',
+            error: message,
             isAuthenticated: false,
             token: null,
           });
@@ -176,6 +173,7 @@ export const useAuthStore = create<AuthState>()(
       name: 'pricescout-auth',
       partialize: (state) => ({
         token: state.token,
+        user: state.user,
         isAuthenticated: state.isAuthenticated,
       }),
     }

@@ -150,7 +150,7 @@ export function CircuitBenchmarksPage() {
   }, [refetch]);
 
   const isLoading = weeksLoading || benchmarksLoading;
-  const benchmarks: CircuitBenchmark[] = benchmarksData?.benchmarks || [];
+  const benchmarks: CircuitBenchmark[] = useMemo(() => benchmarksData?.benchmarks || [], [benchmarksData]);
 
   // Sort benchmarks by total showtimes (largest first)
   const sortedBenchmarks = useMemo(() => {

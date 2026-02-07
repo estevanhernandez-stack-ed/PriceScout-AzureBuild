@@ -67,8 +67,9 @@ def sync_circuit_benchmarks_task():
     Background task to sync circuit benchmarks.
     """
     try:
-        from sync_engine import run_nationwide_sync
-        run_nationwide_sync()
+        import asyncio
+        from api.routers.circuit_benchmarks import run_circuit_sync
+        asyncio.run(run_circuit_sync())
         return {'status': 'success', 'message': 'Circuit benchmarks synced successfully'}
     except Exception as e:
         logger.exception(f"Circuit benchmark sync task failed: {e}")

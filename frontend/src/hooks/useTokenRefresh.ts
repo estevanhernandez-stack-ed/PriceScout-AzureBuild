@@ -8,8 +8,15 @@ interface JWTPayload {
 }
 
 export function useTokenRefresh() {
-  const { token, refreshToken, logout, suppressAutoLogout } = useAuthStore();
+  const { token, fetchUser, refreshToken, logout, suppressAutoLogout } = useAuthStore();
   const timeoutRef = useRef<ReturnType<typeof setTimeout>>();
+
+  // Re-fetch user profile on mount when we have a token (keeps role/company fresh after refresh)
+  useEffect(() => {
+    if (token) {
+      fetchUser();
+    }
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps -- run once on mount
 
   useEffect(() => {
     if (!token) {

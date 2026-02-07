@@ -47,6 +47,57 @@
 
 ---
 
+## 🟢 OAuth/SSO Security (February 2026)
+
+- [x] **JWKS token signature verification**
+  - Location: `api/entra_auth.py`
+  - Implementation: PyJWKClient validates tokens against Microsoft JWKS endpoint
+  - Reference: `SECURITY_REMEDIATION_PLAN.md` - SEC-001
+
+- [x] **CSRF protection in OAuth flow**
+  - Location: `api/entra_auth.py`
+  - Implementation: Cryptographic state parameter with 5-minute expiry
+  - Reference: `SECURITY_REMEDIATION_PLAN.md` - SEC-002
+
+- [x] **Open redirect prevention**
+  - Location: `api/entra_auth.py`
+  - Implementation: `ALLOWED_REDIRECT_DOMAINS` environment variable
+  - Reference: `SECURITY_REMEDIATION_PLAN.md` - SEC-003
+
+- [x] **Token not in URL**
+  - Location: `api/entra_auth.py`
+  - Implementation: Auth code exchange pattern (60-second single-use codes)
+  - Reference: `SECURITY_REMEDIATION_PLAN.md` - SEC-004
+
+- [x] **Tenant and audience validation**
+  - Location: `api/entra_auth.py`
+  - Implementation: `tid` and `aud` claims validated against config
+  - Reference: `SECURITY_REMEDIATION_PLAN.md` - SEC-005, SEC-006
+
+- [ ] **PKCE implementation** (Deferred - P2)
+  - Status: Not yet implemented
+  - Reference: `SECURITY_REMEDIATION_PLAN.md` - SEC-009
+
+- [ ] **Nonce for ID token replay protection** (Deferred - P2)
+  - Status: Not yet implemented
+  - Reference: `SECURITY_REMEDIATION_PLAN.md` - SEC-010
+
+---
+
+## 🟢 Distributed Tracing Security (February 2026)
+
+- [x] **Request ID validation**
+  - Location: `api/telemetry.py`
+  - Implementation: UUID format validation prevents log injection
+  - Reference: `SECURITY_REMEDIATION_PLAN.md` - SEC-008
+
+- [x] **Thread-safe initialization**
+  - Location: `api/entra_auth.py`, `api/telemetry.py`
+  - Implementation: Double-checked locking for global state
+  - Reference: `SECURITY_REMEDIATION_PLAN.md` - SEC-007
+
+---
+
 ## 🟡 Medium Priority (Should Fix Before Deploy)
 
 - [ ] **Add file upload validation**

@@ -153,7 +153,7 @@ interface DailyLineupParams {
 /**
  * Fetch daily lineup for a specific theater and date
  */
-export function useDailyLineup(params: DailyLineupParams, options?: any) {
+export function useDailyLineup(params: DailyLineupParams, options?: Record<string, unknown>) {
   return useQuery({
     queryKey: ['reports', 'daily-lineup', params.theater, params.date],
     queryFn: async () => {

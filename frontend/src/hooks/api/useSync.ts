@@ -24,9 +24,9 @@ export interface TaskStatusResponse {
   task_id: string;
   status: string;
   ready: boolean;
-  result?: any;
+  result?: { message?: string; records_cached?: number; [key: string]: unknown };
   error?: string;
-  progress?: any;
+  progress?: Record<string, unknown>;
 }
 
 /**

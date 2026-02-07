@@ -42,11 +42,13 @@ import {
   useFandangoAnalyze,
   usePendingTheaters,
   useACFilms,
+  useAdvanceSurgeScan,
   getContentTypeColor,
   type CoverageHierarchy,
   type CompanyProfile,
   type SavedBaseline,
 } from '@/hooks/api';
+import { format, addDays } from 'date-fns';
 
 // Helper to extract circuit name from user's company
 function getCircuitFromCompany(company: string | null | undefined): string {
@@ -131,15 +133,20 @@ function checkDiscountCompliance(
   const issues: DiscountDayIssue[] = [];
   const dayNames = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
 
+  // PLF/premium formats to exclude — discount programs apply to standard screens only
+  const premiumFormats = ['premium format', 'imax', 'dolby', 'ultrascreen', 'superscreen', 'screenx', '4dx'];
+
   profile.discount_days.forEach((discountDay) => {
     myTheaters.forEach((theater) => {
       // Find baseline for this theater on the discount day
+      // Only match Standard/2D format — PLF screens have separate pricing even on discount days
       const baseline = baselines.find(
         (b) =>
           b.theater_name === theater &&
           b.day_of_week === discountDay.day_of_week &&
           (b.ticket_type.toLowerCase().includes('adult') ||
-            b.ticket_type.toLowerCase().includes('general'))
+            b.ticket_type.toLowerCase().includes('general')) &&
+          !premiumFormats.some((pf) => (b.format || '').toLowerCase().includes(pf))
       );
 
       if (baseline && Math.abs(baseline.baseline_price - discountDay.price) > 0.5) {
@@ -179,6 +186,19 @@ export function UserCentricOverview({ onNavigateToTab }: UserCentricOverviewProp
   const { data: fandangoAnalysis } = useFandangoAnalyze({ lookbackDays: 30, enabled: true });
   const { data: pendingTheaters } = usePendingTheaters();
   const { data: acFilmsData } = useACFilms({ isActive: true, limit: 100 });
+
+  // Auto-run surge scan for discount day compliance (today + 7 days, own circuit)
+  const surgeDateFrom = useMemo(() => format(new Date(), 'yyyy-MM-dd'), []);
+  const surgeDateTo = useMemo(() => format(addDays(new Date(), 7), 'yyyy-MM-dd'), []);
+  const { data: surgeScanData } = useAdvanceSurgeScan(
+    {
+      dateFrom: surgeDateFrom,
+      dateTo: surgeDateTo,
+      circuit: circuitName || undefined,
+      surgeThreshold: 20,
+    },
+    { enabled: !!circuitName }
+  );
 
   // Derive my theaters
   const myTheaters = useMemo(
@@ -242,11 +262,39 @@ export function UserCentricOverview({ onNavigateToTab }: UserCentricOverviewProp
       .reduce((sum, [, count]) => sum + count, 0);
   }, [alertSummary, myTheaters]);
 
-  // Check discount day compliance
+  // Filter to own-circuit theaters only (exclude competitor theaters like AMC)
+  const myOwnTheaters = useMemo(() => {
+    if (!circuitName) return myTheaters;
+    const circuitLower = circuitName.toLowerCase();
+    return myTheaters.filter((t) => {
+      const lower = t.toLowerCase();
+      return lower.includes(circuitLower) || lower.includes('movie tavern');
+    });
+  }, [myTheaters, circuitName]);
+
+  // Check discount day compliance (baseline-level, used as fallback)
+  // Uses own-circuit theaters only (not competitors)
   const discountIssues = useMemo(
-    () => checkDiscountCompliance(myProfile, baselines, myTheaters),
-    [myProfile, baselines, myTheaters]
+    () => checkDiscountCompliance(myProfile, baselines, myOwnTheaters),
+    [myProfile, baselines, myOwnTheaters]
   );
+
+  // Film-level discount day violations from surge scanner (preferred data source)
+  const discountDayCompliance = useMemo(() => {
+    if (!surgeScanData?.discount_day_compliance) return [];
+    // Filter to own-circuit theaters (Marcus, Movie Tavern) and non-compliant items
+    const circuitLower = circuitName.toLowerCase();
+    return surgeScanData.discount_day_compliance.filter((item) => {
+      // Only show own-circuit theaters
+      const isOwnCircuit = item.circuit_name?.toLowerCase().includes(circuitLower) ||
+        item.theater_name.toLowerCase().includes(circuitLower) ||
+        item.theater_name.toLowerCase().includes('movie tavern');
+      return isOwnCircuit && !item.is_compliant && !item.is_plf;
+    });
+  }, [surgeScanData, circuitName]);
+
+  // Use film-level data when available, otherwise fallback to baseline issues count
+  const hasFilmLevelData = surgeScanData && surgeScanData.discount_day_compliance.length > 0;
 
   const isLoading = hierarchyLoading || alertsLoading || profilesLoading || baselinesLoading;
 
@@ -475,55 +523,46 @@ export function UserCentricOverview({ onNavigateToTab }: UserCentricOverviewProp
 
       {/* Data Sources & System Status */}
       <div className="grid gap-4 md:grid-cols-2">
-        {/* Data Freshness */}
+        {/* Data Coverage */}
         <Card>
           <CardHeader className="pb-2">
             <CardTitle className="flex items-center gap-2 text-base">
               <Database className="h-4 w-4 text-blue-500" />
-              Data Sources
+              Data Coverage
             </CardTitle>
           </CardHeader>
           <CardContent>
             <div className="space-y-3">
-              {/* EntTelligence */}
               <div className="flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  <div className="h-2 w-2 rounded-full bg-blue-500" />
-                  <span className="text-sm">EntTelligence</span>
-                </div>
-                <div className="text-right">
-                  <div className="text-sm font-medium">
-                    {entAnalysis?.overall_stats?.total_records?.toLocaleString() ?? 0} records
-                  </div>
-                  <div className="text-xs text-muted-foreground">
-                    {entAnalysis?.overall_stats?.total_theaters ?? 0} theaters
-                  </div>
-                </div>
+                <span className="text-sm">Price Records</span>
+                <span className="text-sm font-medium">
+                  {((entAnalysis?.overall_stats?.total_records ?? 0) +
+                    (fandangoAnalysis?.overall_stats?.total_records ?? 0)).toLocaleString()}
+                </span>
               </div>
 
-              {/* Fandango */}
               <div className="flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  <div className="h-2 w-2 rounded-full bg-orange-500" />
-                  <span className="text-sm">Fandango Scrapes</span>
-                </div>
-                <div className="text-right">
-                  <div className="text-sm font-medium">
-                    {fandangoAnalysis?.overall_stats?.total_records?.toLocaleString() ?? 0} records
-                  </div>
-                  <div className="text-xs text-muted-foreground">
-                    {fandangoAnalysis?.overall_stats?.total_theaters ?? 0} theaters
-                  </div>
-                </div>
+                <span className="text-sm">Theaters Monitored</span>
+                <span className="text-sm font-medium">
+                  {Math.max(
+                    entAnalysis?.overall_stats?.total_theaters ?? 0,
+                    fandangoAnalysis?.overall_stats?.total_theaters ?? 0
+                  ).toLocaleString()}
+                </span>
+              </div>
+
+              <div className="flex items-center justify-between">
+                <span className="text-sm">Data Window</span>
+                <span className="text-sm font-medium">Last 30 days</span>
               </div>
 
               <Button
                 variant="ghost"
                 size="sm"
                 className="w-full justify-between mt-2"
-                onClick={() => onNavigateToTab('data-comparison')}
+                onClick={() => onNavigateToTab('baseline-details')}
               >
-                Compare Data Sources
+                View Baseline Details
                 <ArrowRight className="h-4 w-4" />
               </Button>
             </div>
@@ -608,101 +647,172 @@ export function UserCentricOverview({ onNavigateToTab }: UserCentricOverviewProp
             </CardTitle>
             <CardDescription>
               {myProfile.discount_days[0]?.program || 'Discount day'} compliance check
+              <span className="ml-1 text-xs">
+                ({circuitName} theaters only)
+              </span>
             </CardDescription>
           </CardHeader>
           <CardContent>
-            {discountIssues.length === 0 ? (
-              <div className="flex items-center gap-2 text-green-600 bg-green-50 dark:bg-green-950/20 rounded-md p-3">
-                <CheckCircle2 className="h-5 w-5" />
-                <span className="text-sm font-medium">
-                  All theaters compliant with discount day pricing
-                </span>
-              </div>
-            ) : (
-              <div className="space-y-3">
-                {/* Alternative Content Notice */}
-                {acFilmsData && acFilmsData.total > 0 && (
-                  <div className="flex items-start gap-2 text-blue-600 bg-blue-50 dark:bg-blue-950/20 rounded-md p-3">
-                    <Film className="h-5 w-5 mt-0.5 flex-shrink-0" />
-                    <div className="text-sm">
-                      <span className="font-medium">
-                        {acFilmsData.total} Alternative Content film{acFilmsData.total !== 1 ? 's' : ''} detected
-                      </span>
-                      <p className="text-blue-600/80 dark:text-blue-400/80 mt-0.5">
-                        Some variances below may be special events (Fathom, Opera, etc.) that are intentionally priced differently.
-                      </p>
-                    </div>
-                  </div>
-                )}
-
-                <div className="text-sm text-muted-foreground">
-                  {discountIssues.length} theater{discountIssues.length !== 1 ? 's' : ''} with
-                  pricing variance
+            {/* Film-Level Compliance (preferred: from surge scanner) */}
+            {hasFilmLevelData ? (
+              discountDayCompliance.length === 0 ? (
+                <div className="flex items-center gap-2 text-green-600 bg-green-50 dark:bg-green-950/20 rounded-md p-3">
+                  <CheckCircle2 className="h-5 w-5" />
+                  <span className="text-sm font-medium">
+                    All {circuitName} theaters compliant with discount day pricing
+                  </span>
                 </div>
-                <div className="rounded-md border overflow-hidden">
-                  <table className="w-full text-sm">
-                    <thead className="bg-muted/50">
-                      <tr>
-                        <th className="text-left p-2 font-medium">Theater</th>
-                        <th className="text-right p-2 font-medium">Expected</th>
-                        <th className="text-right p-2 font-medium">Actual</th>
-                        <th className="text-center p-2 font-medium">Status</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {discountIssues.slice(0, 5).map((issue, idx) => (
-                        <tr key={idx} className="border-t">
-                          <td className="p-2 truncate max-w-[200px]">{issue.theater}</td>
-                          <td className="p-2 text-right font-mono">
-                            ${issue.expectedPrice.toFixed(2)}
-                          </td>
-                          <td className="p-2 text-right font-mono text-orange-600">
-                            ${issue.actualPrice.toFixed(2)}
-                          </td>
-                          <td className="p-2 text-center">
-                            <Badge variant="outline" className="bg-yellow-50 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-300">
-                              +${(issue.actualPrice - issue.expectedPrice).toFixed(2)}
-                            </Badge>
-                          </td>
+              ) : (
+                <div className="space-y-3">
+                  <div className="text-sm text-muted-foreground">
+                    {discountDayCompliance.length} film/theater price{discountDayCompliance.length !== 1 ? 's' : ''} with
+                    pricing variance
+                  </div>
+                  <div className="rounded-md border overflow-hidden">
+                    <table className="w-full text-sm">
+                      <thead className="bg-muted/50">
+                        <tr>
+                          <th className="text-left p-2 font-medium">Theater</th>
+                          <th className="text-left p-2 font-medium">Film</th>
+                          <th className="text-right p-2 font-medium">Expected</th>
+                          <th className="text-right p-2 font-medium">Actual</th>
+                          <th className="text-center p-2 font-medium">Status</th>
                         </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-                {discountIssues.length > 5 && (
-                  <p className="text-xs text-muted-foreground">
-                    Showing first 5 of {discountIssues.length} issues
-                  </p>
-                )}
-
-                {/* Quick AC Films List */}
-                {acFilmsData && acFilmsData.films.length > 0 && (
-                  <div className="mt-4 pt-4 border-t">
-                    <div className="text-sm font-medium mb-2 flex items-center gap-2">
-                      <Film className="h-4 w-4 text-purple-500" />
-                      Active Alternative Content
-                    </div>
-                    <div className="flex flex-wrap gap-1.5">
-                      {acFilmsData.films.slice(0, 6).map((film) => (
-                        <Badge
-                          key={film.id}
-                          variant="secondary"
-                          className={`text-xs ${getContentTypeColor(film.content_type)}`}
-                        >
-                          {film.film_title.length > 25
-                            ? film.film_title.substring(0, 25) + '...'
-                            : film.film_title}
-                        </Badge>
-                      ))}
-                      {acFilmsData.total > 6 && (
-                        <Badge variant="outline" className="text-xs">
-                          +{acFilmsData.total - 6} more
-                        </Badge>
-                      )}
-                    </div>
+                      </thead>
+                      <tbody>
+                        {discountDayCompliance.slice(0, 10).map((item, idx) => (
+                          <tr key={idx} className="border-t">
+                            <td className="p-2 truncate max-w-[180px]">{item.theater_name}</td>
+                            <td className="p-2 truncate max-w-[200px]">
+                              {item.film_title}
+                              {item.is_special_event && (
+                                <Badge variant="outline" className="ml-1 text-xs bg-purple-50 text-purple-700 dark:bg-purple-900/30 dark:text-purple-300">
+                                  Event
+                                </Badge>
+                              )}
+                            </td>
+                            <td className="p-2 text-right font-mono">
+                              ${item.expected_discount_price.toFixed(2)}
+                            </td>
+                            <td className="p-2 text-right font-mono text-orange-600">
+                              ${item.current_price.toFixed(2)}
+                            </td>
+                            <td className="p-2 text-center">
+                              <Badge variant="outline" className="bg-yellow-50 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-300">
+                                +${(item.current_price - item.expected_discount_price).toFixed(2)}
+                              </Badge>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
                   </div>
-                )}
-              </div>
+                  {discountDayCompliance.length > 10 && (
+                    <p className="text-xs text-muted-foreground">
+                      Showing first 10 of {discountDayCompliance.length} issues
+                    </p>
+                  )}
+
+                  {/* Quick AC Films List */}
+                  {acFilmsData && acFilmsData.films.length > 0 && (
+                    <div className="mt-4 pt-4 border-t">
+                      <div className="text-sm font-medium mb-2 flex items-center gap-2">
+                        <Film className="h-4 w-4 text-purple-500" />
+                        Active Alternative Content
+                      </div>
+                      <div className="flex flex-wrap gap-1.5">
+                        {acFilmsData.films.slice(0, 6).map((film) => (
+                          <Badge
+                            key={film.id}
+                            variant="secondary"
+                            className={`text-xs ${getContentTypeColor(film.content_type)}`}
+                          >
+                            {film.film_title.length > 25
+                              ? film.film_title.substring(0, 25) + '...'
+                              : film.film_title}
+                          </Badge>
+                        ))}
+                        {acFilmsData.total > 6 && (
+                          <Badge variant="outline" className="text-xs">
+                            +{acFilmsData.total - 6} more
+                          </Badge>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )
+            ) : (
+              /* Fallback: Baseline-level compliance (no film titles) */
+              discountIssues.length === 0 ? (
+                <div className="flex items-center gap-2 text-green-600 bg-green-50 dark:bg-green-950/20 rounded-md p-3">
+                  <CheckCircle2 className="h-5 w-5" />
+                  <span className="text-sm font-medium">
+                    All {circuitName} theaters compliant with discount day pricing
+                  </span>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  {acFilmsData && acFilmsData.total > 0 && (
+                    <div className="flex items-start gap-2 text-blue-600 bg-blue-50 dark:bg-blue-950/20 rounded-md p-3">
+                      <Film className="h-5 w-5 mt-0.5 flex-shrink-0" />
+                      <div className="text-sm">
+                        <span className="font-medium">
+                          {acFilmsData.total} Alternative Content film{acFilmsData.total !== 1 ? 's' : ''} detected
+                        </span>
+                        <p className="text-blue-600/80 dark:text-blue-400/80 mt-0.5">
+                          Some variances below may be special events (Fathom, Opera, etc.) that are intentionally priced differently.
+                          Sync EntTelligence data for film-level detail to identify false positives.
+                        </p>
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="text-sm text-muted-foreground">
+                    {discountIssues.length} {circuitName} theater{discountIssues.length !== 1 ? 's' : ''} with
+                    pricing variance (baseline-level)
+                  </div>
+                  <div className="rounded-md border overflow-hidden">
+                    <table className="w-full text-sm">
+                      <thead className="bg-muted/50">
+                        <tr>
+                          <th className="text-left p-2 font-medium">Theater</th>
+                          <th className="text-left p-2 font-medium">Program</th>
+                          <th className="text-right p-2 font-medium">Expected</th>
+                          <th className="text-right p-2 font-medium">Actual</th>
+                          <th className="text-center p-2 font-medium">Status</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {discountIssues.slice(0, 8).map((issue, idx) => (
+                          <tr key={idx} className="border-t">
+                            <td className="p-2 truncate max-w-[180px]">{issue.theater}</td>
+                            <td className="p-2 truncate max-w-[140px] text-muted-foreground text-xs">
+                              {issue.program}
+                            </td>
+                            <td className="p-2 text-right font-mono">
+                              ${issue.expectedPrice.toFixed(2)}
+                            </td>
+                            <td className="p-2 text-right font-mono text-orange-600">
+                              ${issue.actualPrice.toFixed(2)}
+                            </td>
+                            <td className="p-2 text-center">
+                              <Badge variant="outline" className="bg-yellow-50 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-300">
+                                +${(issue.actualPrice - issue.expectedPrice).toFixed(2)}
+                              </Badge>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  {discountIssues.length > 8 && (
+                    <p className="text-xs text-muted-foreground">
+                      Showing first 8 of {discountIssues.length} issues
+                    </p>
+                  )}
+                </div>
+              )
             )}
           </CardContent>
         </Card>

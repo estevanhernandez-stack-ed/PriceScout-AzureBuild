@@ -26,41 +26,42 @@ def add_circuit_benchmarks_table():
             benchmark_id INTEGER PRIMARY KEY AUTOINCREMENT,
             circuit_name VARCHAR(255) NOT NULL,
             week_ending_date DATE NOT NULL,
-            
+            period_start_date DATE,
+
             -- Volume metrics
             total_showtimes INTEGER DEFAULT 0,
             total_capacity INTEGER DEFAULT 0,
             total_theaters INTEGER DEFAULT 0,
             total_films INTEGER DEFAULT 0,
-            
+
             -- Programming metrics
             avg_screens_per_film REAL DEFAULT 0.0,
             avg_showtimes_per_theater REAL DEFAULT 0.0,
-            
+
             -- Format breakdown (percentages)
             format_standard_pct REAL DEFAULT 0.0,
             format_imax_pct REAL DEFAULT 0.0,
             format_dolby_pct REAL DEFAULT 0.0,
             format_3d_pct REAL DEFAULT 0.0,
             format_other_premium_pct REAL DEFAULT 0.0,
-            
+
             -- PLF aggregate
             plf_total_pct REAL DEFAULT 0.0,
-            
+
             -- Daypart breakdown (percentages)
             daypart_matinee_pct REAL DEFAULT 0.0,
             daypart_evening_pct REAL DEFAULT 0.0,
             daypart_late_pct REAL DEFAULT 0.0,
-            
+
             -- Pricing (if available)
             avg_price_general REAL,
             avg_price_child REAL,
             avg_price_senior REAL,
-            
+
             -- Metadata
             data_source VARCHAR(50) DEFAULT 'enttelligence',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            
+
             UNIQUE(circuit_name, week_ending_date)
         )
     """)

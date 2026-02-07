@@ -307,7 +307,7 @@ export function useCheckFilm(filmTitle: string | null) {
     queryKey: ['alternativeContent', 'check', filmTitle],
     queryFn: async () => {
       const response = await api.get<FilmCheckResult>(
-        `/alternative-content/check/${encodeURIComponent(filmTitle!)}`
+        `/alternative-content/check/${encodeURIComponent(filmTitle ?? '')}`
       );
       return response.data;
     },
@@ -341,7 +341,7 @@ export function useCircuitACPricingByName(circuitName: string | null) {
     queryKey: ['alternativeContent', 'circuitPricing', circuitName],
     queryFn: async () => {
       const response = await api.get<CircuitACPricing>(
-        `/alternative-content/circuit-pricing/${encodeURIComponent(circuitName!)}`
+        `/alternative-content/circuit-pricing/${encodeURIComponent(circuitName ?? '')}`
       );
       return response.data;
     },

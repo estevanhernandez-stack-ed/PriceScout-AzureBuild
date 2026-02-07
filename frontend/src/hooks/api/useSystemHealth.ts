@@ -146,7 +146,7 @@ export function useResetCircuits() {
       });
       queryClient.invalidateQueries({ queryKey: systemHealthKeys.all });
     },
-    onError: (error: any) => {
+    onError: (error: Error & { response?: { data?: { detail?: string } } }) => {
       useToast.getState().toast({
         title: 'Error',
         description: error.response?.data?.detail || 'Failed to reset circuits',
@@ -174,7 +174,7 @@ export function useTripCircuit() {
       });
       queryClient.invalidateQueries({ queryKey: systemHealthKeys.all });
     },
-    onError: (error: any) => {
+    onError: (error: Error & { response?: { data?: { detail?: string } } }) => {
       useToast.getState().toast({
         title: 'Error',
         description: error.response?.data?.detail || 'Failed to trip circuit',

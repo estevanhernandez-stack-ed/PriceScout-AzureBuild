@@ -131,6 +131,7 @@ POSTGRES_PASSWORD = os.getenv('POSTGRES_PASSWORD', '')
 
 # Current company context (for multi-tenancy)
 CURRENT_COMPANY_ID = None  # Set by application after user login
+DEFAULT_COMPANY_ID = int(os.getenv('DEFAULT_COMPANY_ID', '1'))  # Marcus Theatres
 
 
 # ============================================================================

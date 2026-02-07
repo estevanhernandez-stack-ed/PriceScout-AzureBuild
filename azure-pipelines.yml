@@ -41,7 +41,7 @@ variables:
   appServiceNameDev: 'app-pricescout-dev'
   appServiceNameTest: 'app-pricescout-test'
   appServiceNameProd: 'app-pricescout-prod'
-  coverageThreshold: 60
+  coverageThreshold: 70
 
 stages:
   # ============================================================================
@@ -96,6 +96,13 @@ stages:
               cd $(workingDirectory)
               pip-audit --requirement requirements.txt --desc on || true
             displayName: 'Run pip-audit (dependency security scan)'
+
+          # Static Analysis: Mypy
+          - script: |
+              pip install mypy types-requests types-python-dateutil
+              cd $(workingDirectory)
+              mypy app api --ignore-missing-imports
+            displayName: 'Run Mypy type check'
 
           # Run pytest with coverage
           - script: |

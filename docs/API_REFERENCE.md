@@ -1,1836 +1,637 @@
-# 📚 Price Scout API Reference
+# PriceScout API Reference
 
-**Version:** 1.0.0  
-**Last Updated:** October 26, 2025  
-**Target Audience:** Developers and Contributors
-
----
-
-## Table of Contents
-
-1. [Overview](#overview)
-2. [Core Modules](#core-modules)
-3. [Scraper Module](#scraper-module)
-4. [Database Module](#database-module)
-5. [OMDb Client Module](#omdb-client-module)
-6. [Users Module](#users-module)
-7. [Utils Module](#utils-module)
-8. [UI Components Module](#ui-components-module)
-9. [Mode Modules](#mode-modules)
-10. [Configuration](#configuration)
-11. [Data Structures](#data-structures)
-12. [Testing Utilities](#testing-utilities)
+**Version:** 2.3.0
+**Last Updated:** February 5, 2026
+**Base URL:** `/api/v1`
+**Spec Format:** OpenAPI 3.0 (auto-generated)
+**Total Endpoints:** 200+
 
 ---
 
-## Overview
+## Interactive Documentation
 
-Price Scout is built on a modular architecture with clear separation of concerns:
-
-- **Scraping Layer** - `scraper.py` handles web scraping via Playwright
-- **Data Layer** - `database.py` manages SQLite persistence
-- **API Layer** - `omdb_client.py` integrates external film metadata
-- **Auth Layer** - `users.py` handles authentication and authorization
-- **UI Layer** - Streamlit-based interface with mode-specific modules
-- **Utilities** - `utils.py` provides shared helper functions
-
-### Import Patterns
-
-```python
-# Core modules
-from app.scraper import Scraper
-from app import database
-from app.omdb_client import OMDbClient
-from app import users
-from app import utils
-from app import config
-
-# Mode modules
-from app.modes import market_mode
-from app.modes import analysis_mode
-from app.modes import poster_mode
-from app.modes import operating_hours_mode
-from app.modes import compsnipe_mode
-
-# UI components
-from app import ui_components
-from app import theming
-```
+| Tool | URL | Description |
+|------|-----|-------------|
+| **Swagger UI** | `/api/v1/docs` | Interactive API explorer with "Try It" |
+| **ReDoc** | `/api/v1/redoc` | Clean read-only documentation |
+| **OpenAPI JSON** | `/api/v1/openapi.json` | Machine-readable specification |
 
 ---
 
-## Core Modules
+## Authentication
 
-### Module Hierarchy
+All endpoints (except `/health` and `/token`) require authentication via one of:
 
-```
-app/
-├── __init__.py
-├── scraper.py          # Web scraping engine
-├── database.py         # Data persistence
-├── omdb_client.py      # Film metadata API
-├── users.py            # User management
-├── utils.py            # Utility functions
-├── config.py           # Configuration constants
-├── state.py            # Streamlit session state
-├── theming.py          # UI theme management
-├── ui_components.py    # Reusable UI widgets
-├── price_scout_app.py  # Main application
-└── modes/              # Feature modules
-    ├── __init__.py
-    ├── market_mode.py
-    ├── analysis_mode.py
-    ├── poster_mode.py
-    ├── operating_hours_mode.py
-    └── compsnipe_mode.py
-```
+| Method | Header | Example |
+|--------|--------|---------|
+| **JWT Bearer** | `Authorization: Bearer <token>` | `POST /api/v1/auth/token` to obtain |
+| **API Key** | `X-API-Key: <key>` | Managed via admin panel |
 
-### Dependencies
-
-**External Packages:**
-- `streamlit` - Web UI framework
-- `playwright` - Browser automation
-- `pandas` - Data manipulation
-- `bcrypt` - Password hashing
-- `beautifulsoup4` - HTML parsing
-- `thefuzz` - Fuzzy string matching
-- `httpx` - HTTP client
-- `openpyxl` - Excel file generation
-
-**Python Standard Library:**
-- `sqlite3` - Database
-- `asyncio` - Async operations
-- `logging` - Logging framework
-- `datetime` - Date/time handling
-- `json` - JSON parsing
-- `re` - Regular expressions
+**RBAC Roles:** `admin`, `manager`, `operator`, `viewer`
 
 ---
 
-## Scraper Module
+## Error Format
 
-**File:** `app/scraper.py`  
-**Purpose:** Web scraping engine using Playwright to extract showtime and pricing data from Fandango.
-
-### Class: `Scraper`
-
-Main class for web scraping operations.
-
-#### Constructor
-
-```python
-def __init__(self, headless=True, devtools=False):
-    """
-    Initializes the Scraper with browser configuration.
-    
-    Args:
-        headless (bool): Run browser in headless mode (no visible window)
-        devtools (bool): Open browser DevTools for debugging
-        
-    Attributes:
-        ticket_types_data (dict): Loaded from ticket_types.json
-        headless (bool): Browser visibility setting
-        devtools (bool): DevTools enabled flag
-        capture_html (bool): Save HTML on failures
-        amenity_map_re (dict): Precompiled regex for amenity detection
-        base_type_map_re (dict): Precompiled regex for ticket types
-        plf_formats (set): Premium Large Format identifiers
-        ignored_amenities (set): Amenity terms to skip
-    """
-```
-
-**Example Usage:**
-
-```python
-from app.scraper import Scraper
-
-# Production mode (headless)
-scout = Scraper(headless=True, devtools=False)
-
-# Debug mode (visible browser with DevTools)
-scout = Scraper(headless=False, devtools=True)
-
-# Enable HTML capture for failures
-scout.capture_html = True
-```
-
-#### Key Methods
-
-##### `get_all_showings_for_theaters`
-
-```python
-async def get_all_showings_for_theaters(
-    self, 
-    theaters: dict, 
-    date_str: str, 
-    page=None
-) -> tuple[str, dict | str, str, dict | None]:
-    """
-    Scrapes showtimes for multiple theaters on a specific date.
-    
-    Args:
-        theaters (dict): Theater data {name: {name, url}}
-        date_str (str): Date in 'YYYY-MM-DD' format
-        page (Page, optional): Existing Playwright page object
-        
-    Returns:
-        tuple: (status, result, log, metadata)
-            status (str): 'success' or 'error'
-            result (dict | str): Showings data or error message
-            log (str): Detailed execution log
-            metadata (dict | None): Scrape metrics
-            
-    Data Structure (on success):
-        {
-            'YYYY-MM-DD': {
-                'Theater Name': {
-                    'Film Title': {
-                        'HH:MM AM/PM': [
-                            {
-                                'url': 'https://...',
-                                'format': 'IMAX',
-                                'ticket_info': {...},
-                                'theater_name': 'Theater Name',
-                                'play_date': 'YYYY-MM-DD'
-                            }
-                        ]
-                    }
-                }
-            }
-        }
-    """
-```
-
-**Example:**
-
-```python
-import asyncio
-from app.scraper import Scraper
-
-async def main():
-    scout = Scraper()
-    
-    theaters = {
-        "AMC Mesquite 30": {
-            "name": "AMC Mesquite 30",
-            "url": "https://www.fandango.com/amc-mesquite-30-aabcd"
-        }
-    }
-    
-    status, result, log, metadata = await scout.get_all_showings_for_theaters(
-        theaters, 
-        "2025-12-25"
-    )
-    
-    if status == 'success':
-        for date, theaters in result.items():
-            for theater, films in theaters.items():
-                for film, showtimes in films.items():
-                    print(f"{theater} - {film}: {len(showtimes)} showtimes")
-    else:
-        print(f"Error: {result}")
-
-asyncio.run(main())
-```
-
-##### `get_prices`
-
-```python
-async def get_prices(
-    self, 
-    showing_urls: list[dict], 
-    page=None
-) -> tuple[str, list[dict] | str, str]:
-    """
-    Scrapes pricing information for specific showtimes.
-    
-    Args:
-        showing_urls (list[dict]): List of showing objects with URLs
-        page (Page, optional): Existing Playwright page
-        
-    Returns:
-        tuple: (status, result, log)
-            status (str): 'success' or 'error'
-            result (list[dict] | str): Price data or error message
-            log (str): Execution log
-            
-    Price Data Structure:
-        [
-            {
-                'theater_name': 'Theater Name',
-                'play_date': 'YYYY-MM-DD',
-                'film_title': 'Film Title',
-                'showtime': 'HH:MM AM/PM',
-                'format': 'IMAX',
-                'daypart': 'Evening',
-                'ticket_url': 'https://...',
-                'prices': [
-                    {
-                        'ticket_type': 'Adult',
-                        'price': 16.99,
-                        'capacity': '50/150'
-                    }
-                ]
-            }
-        ]
-    """
-```
-
-**Example:**
-
-```python
-showings_to_price = [
-    {
-        'url': 'https://www.fandango.com/...',
-        'theater_name': 'AMC Mesquite 30',
-        'play_date': '2025-12-25',
-        'film_title': 'Wicked',
-        'showtime': '7:00 PM',
-        'format': 'IMAX'
-    }
-]
-
-status, prices, log = await scout.get_prices(showings_to_price)
-
-if status == 'success':
-    for showing in prices:
-        for price_entry in showing['prices']:
-            print(f"{price_entry['ticket_type']}: ${price_entry['price']}")
-```
-
-##### `live_search_by_zip`
-
-```python
-async def live_search_by_zip(
-    self, 
-    zip_code: str, 
-    date_str: str, 
-    page=None
-) -> tuple[str, dict | str, str, None]:
-    """
-    Searches for theaters near a ZIP code with showtimes on a date.
-    
-    Args:
-        zip_code (str): 5-digit US ZIP code
-        date_str (str): Date in 'YYYY-MM-DD' format
-        page (Page, optional): Existing Playwright page
-        
-    Returns:
-        tuple: (status, result, log, None)
-            status (str): 'success' or 'error'
-            result (dict | str): Theater data or error message
-            log (str): Execution log
-            
-    Theater Data Structure:
-        {
-            'Theater Name': {
-                'name': 'Theater Name',
-                'url': 'https://www.fandango.com/...'
-            }
-        }
-    """
-```
-
-**Example:**
-
-```python
-# Find theaters near ZIP code 75001 on Christmas
-status, theaters, log, _ = await scout.live_search_by_zip(
-    "75001", 
-    "2025-12-25"
-)
-
-if status == 'success':
-    print(f"Found {len(theaters)} theaters:")
-    for name, data in theaters.items():
-        print(f"  - {name}: {data['url']}")
-```
-
-##### `get_operating_hours`
-
-```python
-async def get_operating_hours(
-    self, 
-    theaters: dict, 
-    date_str: str, 
-    page=None
-) -> tuple[str, dict | str, str, dict | None]:
-    """
-    Scrapes theater operating hours for a specific date.
-    
-    Args:
-        theaters (dict): Theater data {name: {name, url}}
-        date_str (str): Date in 'YYYY-MM-DD' format
-        page (Page, optional): Existing Playwright page
-        
-    Returns:
-        tuple: (status, result, log, metadata)
-            status (str): 'success' or 'error'
-            result (dict | str): Hours data or error message
-            log (str): Execution log
-            metadata (dict | None): Scrape metrics
-            
-    Hours Data Structure:
-        {
-            'YYYY-MM-DD': {
-                'Theater Name': {
-                    'name': 'Theater Name',
-                    'hours': '10:00 AM - 11:00 PM'
-                }
-            }
-        }
-    """
-```
-
-**Example:**
-
-```python
-status, hours, log, _ = await scout.get_operating_hours(
-    theaters, 
-    "2025-12-25"
-)
-
-if status == 'success':
-    for date, theater_hours in hours.items():
-        for theater, data in theater_hours.items():
-            print(f"{theater}: {data['hours']}")
-```
-
-#### Helper Methods
-
-##### `_parse_ticket_description`
-
-```python
-def _parse_ticket_description(
-    self, 
-    description: str, 
-    showing_details: dict | None = None
-) -> dict:
-    """
-    Parses ticket description to extract type and amenities.
-    
-    Args:
-        description (str): Raw ticket description from website
-        showing_details (dict, optional): Context (format, theater, etc.)
-        
-    Returns:
-        dict: {
-            'base_type': 'Adult' | 'Senior' | 'Child' | etc.,
-            'amenities': ['Recliner', 'Reserved Seating', ...]
-        }
-    """
-```
-
-##### `_find_amenities_in_string`
-
-```python
-def _find_amenities_in_string(self, text: str) -> list[str]:
-    """
-    Extracts amenities from text using regex patterns.
-    
-    Args:
-        text (str): Text to analyze
-        
-    Returns:
-        list[str]: Unique amenities found
-    """
-```
-
-##### `_strip_common_terms`
-
-```python
-def _strip_common_terms(self, name: str) -> str:
-    """
-    Removes common cinema brand names for fuzzy matching.
-    
-    Args:
-        name (str): Theater name
-        
-    Returns:
-        str: Cleaned name
-    """
-```
-
----
-
-## Database Module
-
-**File:** `app/database.py`  
-**Purpose:** SQLite database operations for persistent data storage.
-
-### Database Schema
-
-#### Table: `scrape_runs`
-
-Tracks scraping sessions.
-
-```sql
-CREATE TABLE scrape_runs (
-    run_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_timestamp DATETIME NOT NULL,
-    mode TEXT NOT NULL
-);
-```
-
-#### Table: `showings`
-
-Stores individual showtimes.
-
-```sql
-CREATE TABLE showings (
-    showing_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    play_date DATE NOT NULL,
-    theater_name TEXT NOT NULL,
-    film_title TEXT NOT NULL,
-    showtime TEXT NOT NULL,
-    format TEXT,
-    daypart TEXT,
-    is_plf BOOLEAN DEFAULT 0,
-    ticket_url TEXT,
-    UNIQUE(play_date, theater_name, film_title, showtime, format)
-);
-```
-
-#### Table: `prices`
-
-Stores ticket pricing data.
-
-```sql
-CREATE TABLE prices (
-    price_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id INTEGER,
-    showing_id INTEGER,
-    ticket_type TEXT NOT NULL,
-    price REAL NOT NULL,
-    capacity TEXT,
-    play_date DATE,
-    FOREIGN KEY (run_id) REFERENCES scrape_runs (run_id),
-    FOREIGN KEY (showing_id) REFERENCES showings (showing_id)
-);
-```
-
-#### Table: `films`
-
-Stores film metadata from OMDb.
-
-```sql
-CREATE TABLE films (
-    film_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    film_title TEXT NOT NULL UNIQUE,
-    imdb_id TEXT,
-    genre TEXT,
-    mpaa_rating TEXT,
-    director TEXT,
-    actors TEXT,
-    plot TEXT,
-    poster_url TEXT,
-    metascore INTEGER,
-    imdb_rating REAL,
-    release_date TEXT,
-    domestic_gross INTEGER,
-    runtime TEXT,
-    opening_weekend_domestic INTEGER,
-    last_omdb_update DATETIME NOT NULL
-);
-```
-
-#### Table: `operating_hours`
-
-Stores theater operating hours.
-
-```sql
-CREATE TABLE operating_hours (
-    operating_hours_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id INTEGER,
-    market TEXT,
-    theater_name TEXT NOT NULL,
-    date DATE NOT NULL,
-    opening_time TEXT,
-    closing_time TEXT,
-    FOREIGN KEY (run_id) REFERENCES scrape_runs (run_id)
-);
-```
-
-### Key Functions
-
-#### `init_database`
-
-```python
-def init_database() -> None:
-    """
-    Initializes the SQLite database and creates tables if they don't exist.
-    Must be called before any database operations.
-    
-    Raises:
-        AssertionError: If config.DB_FILE is not set
-    """
-```
-
-**Example:**
-
-```python
-from app import database, config
-
-# Set database path
-config.DB_FILE = "data/Marcus/price_scout.db"
-
-# Initialize database
-database.init_database()
-```
-
-#### `save_scrape_run`
-
-```python
-def save_scrape_run(
-    data: list[dict], 
-    mode: str, 
-    timestamp: datetime.datetime | None = None
-) -> int:
-    """
-    Saves a scraping session to the database.
-    
-    Args:
-        data (list[dict]): Price data from scraper
-        mode (str): Mode name ('Market Mode', 'CompSnipe', etc.)
-        timestamp (datetime, optional): Run timestamp (defaults to now)
-        
-    Returns:
-        int: run_id of created scrape run
-        
-    Data Format:
-        [
-            {
-                'theater_name': 'Theater',
-                'play_date': 'YYYY-MM-DD',
-                'film_title': 'Film',
-                'showtime': 'HH:MM AM/PM',
-                'format': 'IMAX',
-                'daypart': 'Evening',
-                'ticket_url': 'https://...',
-                'prices': [
-                    {'ticket_type': 'Adult', 'price': 16.99, 'capacity': '50/150'}
-                ]
-            }
-        ]
-    """
-```
-
-**Example:**
-
-```python
-import datetime
-from app import database
-
-price_data = [
-    {
-        'theater_name': 'AMC Mesquite 30',
-        'play_date': '2025-12-25',
-        'film_title': 'Wicked',
-        'showtime': '7:00 PM',
-        'format': 'IMAX',
-        'daypart': 'Evening',
-        'ticket_url': 'https://...',
-        'prices': [
-            {'ticket_type': 'Adult', 'price': 16.99, 'capacity': '100/150'},
-            {'ticket_type': 'Senior', 'price': 14.99, 'capacity': '100/150'}
-        ]
-    }
-]
-
-run_id = database.save_scrape_run(price_data, 'Market Mode')
-print(f"Saved run_id: {run_id}")
-```
-
-#### `get_all_showings_df`
-
-```python
-def get_all_showings_df(
-    start_date: str | None = None, 
-    end_date: str | None = None
-) -> pd.DataFrame:
-    """
-    Retrieves all showings within a date range as a DataFrame.
-    
-    Args:
-        start_date (str, optional): Start date 'YYYY-MM-DD'
-        end_date (str, optional): End date 'YYYY-MM-DD'
-        
-    Returns:
-        pd.DataFrame: Showing data with columns:
-            - showing_id
-            - play_date
-            - theater_name
-            - film_title
-            - showtime
-            - format
-            - daypart
-            - is_plf
-            - ticket_url
-    """
-```
-
-**Example:**
-
-```python
-from app import database
-
-# Get all showings in December
-df = database.get_all_showings_df('2025-12-01', '2025-12-31')
-
-# Analyze by film
-film_counts = df.groupby('film_title').size().sort_values(ascending=False)
-print(film_counts.head(10))
-```
-
-#### `get_prices_for_showings`
-
-```python
-def get_prices_for_showings(
-    showing_ids: list[int]
-) -> pd.DataFrame:
-    """
-    Retrieves pricing data for specific showings.
-    
-    Args:
-        showing_ids (list[int]): List of showing_id values
-        
-    Returns:
-        pd.DataFrame: Price data with columns:
-            - price_id
-            - run_id
-            - showing_id
-            - ticket_type
-            - price
-            - capacity
-            - play_date
-    """
-```
-
-#### `get_all_films`
-
-```python
-def get_all_films() -> list[dict]:
-    """
-    Retrieves all films from the database.
-    
-    Returns:
-        list[dict]: Film records with all metadata fields
-    """
-```
-
-#### `save_or_update_film`
-
-```python
-def save_or_update_film(film_data: dict) -> None:
-    """
-    Inserts or updates film metadata in the database.
-    
-    Args:
-        film_data (dict): Film metadata from OMDb client
-            Required: 'film_title'
-            Optional: All other OMDb fields
-    """
-```
-
-**Example:**
-
-```python
-from app import database
-from app.omdb_client import OMDbClient
-
-# Fetch and save film metadata
-omdb = OMDbClient()
-film_data = omdb.get_film_by_title("Wicked", year="2024")
-
-if film_data:
-    database.save_or_update_film(film_data)
-    print(f"Saved: {film_data['film_title']}")
-```
-
-#### `save_operating_hours`
-
-```python
-def save_operating_hours(
-    hours_data: list[dict], 
-    run_id: int, 
-    market: str
-) -> None:
-    """
-    Saves theater operating hours to database.
-    
-    Args:
-        hours_data (list[dict]): Operating hours records
-        run_id (int): Associated scrape run ID
-        market (str): Market name
-        
-    Data Format:
-        [
-            {
-                'theater_name': 'Theater',
-                'date': 'YYYY-MM-DD',
-                'opening_time': '10:00 AM',
-                'closing_time': '11:00 PM'
-            }
-        ]
-    """
-```
-
-#### `merge_external_database`
-
-```python
-def merge_external_database(external_db_path: str) -> dict:
-    """
-    Merges data from an external Price Scout database.
-    
-    Args:
-        external_db_path (str): Path to external .db file
-        
-    Returns:
-        dict: Merge statistics
-            {
-                'runs_added': int,
-                'showings_added': int,
-                'prices_added': int,
-                'films_added': int
-            }
-            
-    Raises:
-        sqlite3.Error: On database errors
-    """
-```
-
-**Example:**
-
-```python
-from app import database, config
-
-config.DB_FILE = "data/Marcus/price_scout.db"
-database.init_database()
-
-stats = database.merge_external_database("backup_2025_10_25.db")
-print(f"Merged {stats['runs_added']} runs, {stats['showings_added']} showings")
-```
-
----
-
-## OMDb Client Module
-
-**File:** `app/omdb_client.py`  
-**Purpose:** Integration with Open Movie Database API for film metadata.
-
-### Class: `OMDbClient`
-
-Handles OMDb API requests and data parsing.
-
-#### Constructor
-
-```python
-def __init__(self):
-    """
-    Initializes OMDb client with API key from Streamlit secrets.
-    
-    Raises:
-        ValueError: If API key not found in st.secrets['omdb_api_key']
-        
-    Attributes:
-        api_key (str): OMDb API key
-        API_URL (str): 'http://www.omdbapi.com/'
-    """
-```
-
-**Configuration:**
-
-```toml
-# .streamlit/secrets.toml
-omdb_api_key = "your_api_key_here"
-```
-
-**Example:**
-
-```python
-from app.omdb_client import OMDbClient
-
-# Initialize (requires secrets.toml)
-omdb = OMDbClient()
-```
-
-#### `get_film_by_title`
-
-```python
-def get_film_by_title(
-    self, 
-    title: str, 
-    year: str | None = None
-) -> dict | None:
-    """
-    Fetches film metadata from OMDb by title.
-    
-    Args:
-        title (str): Film title (can include year in parentheses)
-        year (str, optional): Release year for disambiguation
-        
-    Returns:
-        dict | None: Film metadata or None if not found
-        
-    Return Structure:
-        {
-            'film_title': str,
-            'imdb_id': str,
-            'genre': str,
-            'mpaa_rating': str,
-            'runtime': str,
-            'director': str,
-            'actors': str,
-            'plot': str,
-            'poster_url': str,
-            'metascore': int | None,
-            'imdb_rating': float | None,
-            'release_date': str,  # 'YYYY-MM-DD'
-            'domestic_gross': int | None,
-            'opening_weekend_domestic': None,
-            'last_omdb_update': datetime
-        }
-    """
-```
-
-**Example:**
-
-```python
-from app.omdb_client import OMDbClient
-
-omdb = OMDbClient()
-
-# Simple title search
-film = omdb.get_film_by_title("Wicked")
-
-# With year for disambiguation
-film = omdb.get_film_by_title("Dune", year="2021")
-
-# Title with year in parentheses
-film = omdb.get_film_by_title("Dune (2021)")
-
-if film:
-    print(f"{film['film_title']} ({film['mpaa_rating']})")
-    print(f"Genre: {film['genre']}")
-    print(f"Rating: {film['imdb_rating']}/10")
-else:
-    print("Film not found")
-```
-
-#### `search_films`
-
-```python
-def search_films(
-    self, 
-    query: str, 
-    year: str | None = None
-) -> list[dict]:
-    """
-    Searches for films matching a query.
-    
-    Args:
-        query (str): Search term
-        year (str, optional): Filter by release year
-        
-    Returns:
-        list[dict]: List of film results (simplified data)
-        
-    Result Structure:
-        [
-            {
-                'Title': str,
-                'Year': str,
-                'imdbID': str,
-                'Type': 'movie' | 'series',
-                'Poster': str
-            }
-        ]
-    """
-```
-
-**Example:**
-
-```python
-results = omdb.search_films("Star Wars")
-
-for film in results:
-    print(f"{film['Title']} ({film['Year']}) - {film['imdbID']}")
-```
-
-#### Helper Methods
-
-##### `_parse_title_and_year`
-
-```python
-def _parse_title_and_year(
-    self, 
-    full_title: str
-) -> tuple[str, str | None]:
-    """
-    Extracts title and year from string.
-    
-    Args:
-        full_title (str): 'Movie Title (2025)' or 'Movie Title'
-        
-    Returns:
-        tuple: (title, year) where year may be None
-    """
-```
-
-##### `_parse_film_data`
-
-```python
-def _parse_film_data(self, api_response: dict) -> dict:
-    """
-    Transforms OMDb API response to internal format.
-    
-    Args:
-        api_response (dict): Raw API response
-        
-    Returns:
-        dict: Standardized film data
-    """
-```
-
----
-
-## Users Module
-
-**File:** `app/users.py`  
-**Purpose:** User authentication and authorization.
-
-### Database
-
-Separate SQLite database: `users.db`
-
-**Schema:**
-
-```sql
-CREATE TABLE users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT UNIQUE NOT NULL,
-    password_hash TEXT NOT NULL,
-    is_admin BOOLEAN NOT NULL DEFAULT 0,
-    company TEXT,
-    default_company TEXT
-);
-```
-
-### Functions
-
-#### `init_database`
-
-```python
-def init_database() -> None:
-    """
-    Initializes user database and creates default admin account.
-    
-    Default Admin:
-        Username: 'admin'
-        Password: 'admin'
-        
-    ⚠️ Change default password immediately in production!
-    """
-```
-
-#### `create_user`
-
-```python
-def create_user(
-    username: str, 
-    password: str, 
-    is_admin: bool = False, 
-    company: str | None = None, 
-    default_company: str | None = None
-) -> tuple[bool, str]:
-    """
-    Creates a new user account.
-    
-    Args:
-        username (str): Unique username
-        password (str): Plain text password (will be hashed)
-        is_admin (bool): Grant admin privileges
-        company (str, optional): Assigned company
-        default_company (str, optional): Default company selection
-        
-    Returns:
-        tuple: (success, message)
-            success (bool): True if created
-            message (str): Success or error message
-    """
-```
-
-**Example:**
-
-```python
-from app import users
-
-users.init_database()
-
-# Create standard user
-success, msg = users.create_user(
-    "john.smith", 
-    "SecurePass123!", 
-    is_admin=False, 
-    company="Marcus Theatres"
-)
-
-if success:
-    print(f"User created: {msg}")
-else:
-    print(f"Error: {msg}")
-
-# Create admin user
-success, msg = users.create_user(
-    "admin2", 
-    "AdminPass456!", 
-    is_admin=True
-)
-```
-
-#### `verify_user`
-
-```python
-def verify_user(
-    username: str, 
-    password: str
-) -> sqlite3.Row | None:
-    """
-    Authenticates a user.
-    
-    Args:
-        username (str): Username
-        password (str): Plain text password
-        
-    Returns:
-        Row | None: User record if valid, None if invalid
-        
-    User Record Fields:
-        - id
-        - username
-        - password_hash
-        - is_admin
-        - company
-        - default_company
-    """
-```
-
-**Example:**
-
-```python
-from app import users
-
-user = users.verify_user("john.smith", "SecurePass123!")
-
-if user:
-    print(f"Welcome {user['username']}")
-    print(f"Admin: {user['is_admin']}")
-    print(f"Company: {user['company']}")
-else:
-    print("Invalid credentials")
-```
-
-#### `get_user`
-
-```python
-def get_user(username: str) -> sqlite3.Row | None:
-    """
-    Retrieves user by username.
-    
-    Args:
-        username (str): Username to lookup
-        
-    Returns:
-        Row | None: User record or None
-    """
-```
-
-#### `get_all_users`
-
-```python
-def get_all_users() -> list[sqlite3.Row]:
-    """
-    Retrieves all users (for admin user management).
-    
-    Returns:
-        list[Row]: All user records (password_hash excluded)
-    """
-```
-
-#### `update_user`
-
-```python
-def update_user(
-    user_id: int, 
-    username: str, 
-    is_admin: bool, 
-    company: str, 
-    default_company: str
-) -> None:
-    """
-    Updates user account details.
-    
-    Args:
-        user_id (int): User ID to update
-        username (str): New username
-        is_admin (bool): Admin status
-        company (str): Assigned company
-        default_company (str): Default company
-        
-    Note: Does not update password (use separate function)
-    """
-```
-
-#### `delete_user`
-
-```python
-def delete_user(user_id: int) -> None:
-    """
-    Deletes a user account.
-    
-    Args:
-        user_id (int): User ID to delete
-        
-    ⚠️ Permanent action - cannot be undone!
-    """
-```
-
-### Password Security
-
-**Hashing:**
-- Uses BCrypt with automatic salt generation
-- Configurable work factor (default: 12 rounds)
-- Passwords never stored in plain text
-
-**Best Practices:**
-```python
-import bcrypt
-
-# Hash password
-password = b"user_password"
-hashed = bcrypt.hashpw(password, bcrypt.gensalt())
-
-# Verify password
-is_valid = bcrypt.checkpw(password, hashed)
-```
-
----
-
-## Utils Module
-
-**File:** `app/utils.py`  
-**Purpose:** Shared utility functions used across the application.
-
-### Async Utilities
-
-#### `run_async_in_thread`
-
-```python
-def run_async_in_thread(coro, *args, **kwargs):
-    """
-    Runs an async coroutine in a background thread.
-    
-    Args:
-        coro: Async coroutine function
-        *args: Positional arguments for coroutine
-        **kwargs: Keyword arguments for coroutine
-        
-    Returns:
-        tuple: (thread, result_func)
-            thread: Thread object (call .join() to wait)
-            result_func: Callable that returns (status, result, log, metadata)
-            
-    Used for running Playwright scraping in Streamlit.
-    """
-```
-
-**Example:**
-
-```python
-from app.scraper import Scraper
-from app.utils import run_async_in_thread
-
-scout = Scraper()
-theaters = {...}
-
-# Start async operation in thread
-thread, result_func = run_async_in_thread(
-    scout.get_all_showings_for_theaters,
-    theaters,
-    "2025-12-25"
-)
-
-# Wait for completion
-thread.join()
-
-# Get results
-status, showings, log, metadata = result_func()
-```
-
-### Data Formatting
-
-#### `format_price_change`
-
-```python
-def format_price_change(
-    old_price: float, 
-    new_price: float
-) -> str:
-    """
-    Formats price change with arrow and amount.
-    
-    Args:
-        old_price (float): Previous price
-        new_price (float): Current price
-        
-    Returns:
-        str: '▲ +$2.00' or '▼ -$1.50' or '―'
-    """
-```
-
-**Example:**
-
-```python
-from app.utils import format_price_change
-
-change = format_price_change(14.99, 16.99)
-print(change)  # '▲ +$2.00'
-
-change = format_price_change(16.99, 14.99)
-print(change)  # '▼ -$2.00'
-
-change = format_price_change(14.99, 14.99)
-print(change)  # '―'
-```
-
-#### `format_time_to_human_readable`
-
-```python
-def format_time_to_human_readable(seconds: float) -> str:
-    """
-    Converts seconds to human-readable duration.
-    
-    Args:
-        seconds (float): Duration in seconds
-        
-    Returns:
-        str: '2 minutes 30 seconds' or '1 hour 15 minutes'
-    """
-```
-
-**Example:**
-
-```python
-from app.utils import format_time_to_human_readable
-
-print(format_time_to_human_readable(125))  # '2 minutes 5 seconds'
-print(format_time_to_human_readable(3665))  # '1 hour 1 minute 5 seconds'
-```
-
-### Data Conversion
-
-#### `to_excel`
-
-```python
-def to_excel(df: pd.DataFrame) -> bytes:
-    """
-    Converts DataFrame to Excel bytes for download.
-    
-    Args:
-        df (pd.DataFrame): Data to export
-        
-    Returns:
-        bytes: Excel file content
-    """
-```
-
-**Example:**
-
-```python
-import streamlit as st
-from app.utils import to_excel
-
-df = get_report_data()
-excel_bytes = to_excel(df)
-
-st.download_button(
-    "Download Excel",
-    data=excel_bytes,
-    file_name="report.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-)
-```
-
-#### `to_csv`
-
-```python
-def to_csv(df: pd.DataFrame) -> str:
-    """
-    Converts DataFrame to CSV string.
-    
-    Args:
-        df (pd.DataFrame): Data to export
-        
-    Returns:
-        str: CSV content
-    """
-```
-
-#### `to_excel_multi_sheet`
-
-```python
-def to_excel_multi_sheet(report_data: list[dict]) -> bytes:
-    """
-    Creates multi-sheet Excel workbook.
-    
-    Args:
-        report_data (list[dict]): List of sheet definitions
-            [
-                {
-                    'sheet_name': 'Sheet 1',
-                    'data': pd.DataFrame
-                }
-            ]
-            
-    Returns:
-        bytes: Excel file with multiple sheets
-    """
-```
-
-### String Utilities
-
-#### `clean_film_title`
-
-```python
-def clean_film_title(title: str) -> str:
-    """
-    Normalizes film title for matching.
-    
-    Args:
-        title (str): Raw film title
-        
-    Returns:
-        str: Cleaned title
-        
-    Transformations:
-        - Removes year in parentheses
-        - Converts to title case
-        - Strips extra whitespace
-        - Removes special characters
-    """
-```
-
-**Example:**
-
-```python
-from app.utils import clean_film_title
-
-print(clean_film_title("the batman (2022)"))  # "The Batman"
-print(clean_film_title("DUNE: PART TWO"))     # "Dune Part Two"
-```
-
-#### `normalize_time_string`
-
-```python
-def normalize_time_string(time_str: str) -> str:
-    """
-    Normalizes time format to 'HH:MM AM/PM'.
-    
-    Args:
-        time_str (str): Time in various formats
-        
-    Returns:
-        str: Standardized time string
-    """
-```
-
-**Example:**
-
-```python
-from app.utils import normalize_time_string
-
-print(normalize_time_string("7:00pm"))      # "7:00 PM"
-print(normalize_time_string("12:30 p.m.")) # "12:30 PM"
-```
-
-### Cache Management
-
-#### `check_cache_status`
-
-```python
-def check_cache_status() -> tuple[bool, str, str | None]:
-    """
-    Checks theater cache file status.
-    
-    Returns:
-        tuple: (exists, status, last_updated)
-            exists (bool): Cache file exists
-            status (str): 'fresh' | 'stale' | 'missing'
-            last_updated (str | None): Last modified date
-    """
-```
-
-**Example:**
-
-```python
-from app.utils import check_cache_status
-
-exists, status, updated = check_cache_status()
-
-if status == 'stale':
-    print(f"Cache is old (last updated: {updated})")
-    print("Recommend rebuilding cache")
-```
-
-### Logging
-
-#### `log_runtime`
-
-```python
-def log_runtime(
-    mode: str, 
-    num_theaters: int, 
-    num_showings: int, 
-    duration: float
-) -> None:
-    """
-    Logs scrape runtime metrics to CSV.
-    
-    Args:
-        mode (str): Mode name
-        num_theaters (int): Number of theaters scraped
-        num_showings (int): Number of showings found
-        duration (float): Time in seconds
-        
-    Log File: data/[Company]/reports/runtime_log.csv
-    """
-```
-
-### Session State
-
-#### `clear_workflow_state`
-
-```python
-def clear_workflow_state() -> None:
-    """
-    Clears workflow-specific session state variables.
-    
-    Preserves: logged_in, user_name, is_admin, company, search_mode
-    Clears: all_showings, selected_films, selected_showtimes, etc.
-    """
-```
-
-#### `reset_session`
-
-```python
-def reset_session() -> None:
-    """
-    Resets entire session state and reruns app.
-    
-    ⚠️ User remains logged in, mode preserved
-    """
-```
-
----
-
-## UI Components Module
-
-**File:** `app/ui_components.py`  
-**Purpose:** Reusable Streamlit UI components.
-
-### Functions
-
-#### `render_theater_buttons`
-
-```python
-def render_theater_buttons(
-    theaters: list[str],
-    selected_theaters: list[str],
-    columns: int = 4
-) -> list[str]:
-    """
-    Renders clickable theater buttons in a grid.
-    
-    Args:
-        theaters (list[str]): Theater names
-        selected_theaters (list[str]): Currently selected
-        columns (int): Number of columns
-        
-    Returns:
-        list[str]: Updated selected theaters
-    """
-```
-
-#### `render_film_selector`
-
-```python
-def render_film_selector(
-    films: list[dict],
-    multi: bool = True
-) -> list[str]:
-    """
-    Renders film selection interface.
-    
-    Args:
-        films (list[dict]): Film data
-        multi (bool): Allow multiple selection
-        
-    Returns:
-        list[str]: Selected film titles
-    """
-```
-
----
-
-## Mode Modules
-
-Mode modules handle specific features. Each follows similar patterns:
-
-### Standard Mode Structure
-
-```python
-# app/modes/example_mode.py
-
-def render(scout, markets_data, cache_data, all_theaters, is_disabled):
-    """
-    Main entry point for mode.
-    
-    Args:
-        scout (Scraper): Scraper instance
-        markets_data (dict): Market configuration
-        cache_data (dict): Theater cache
-        all_theaters (list): All available theaters
-        is_disabled (bool): UI disabled flag
-    """
-    # Mode-specific UI and logic
-    pass
-```
-
-### Available Modes
-
-- **market_mode.py** - Market comparisons
-- **analysis_mode.py** - Historical data analysis
-- **poster_mode.py** - Poster/schedule generation
-- **operating_hours_mode.py** - Operating hours tracking
-- **compsnipe_mode.py** - Competitive intelligence
-
----
-
-## Configuration
-
-**File:** `app/config.py`
-
-```python
-import os
-
-# Paths
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-CACHE_FILE = os.path.join(SCRIPT_DIR, 'theater_cache.json')
-DEBUG_DIR = os.path.join(SCRIPT_DIR, 'debug')
-
-# Database
-DB_FILE = None  # Set by main app based on company
-
-# Cache settings
-CACHE_EXPIRATION_DAYS = 7
-
-# Scraping settings
-DEFAULT_TIMEOUT = 30000  # milliseconds
-MAX_RETRIES = 3
-```
-
----
-
-## Data Structures
-
-### Showings Data Structure
-
-```python
-{
-    'YYYY-MM-DD': {
-        'Theater Name': {
-            'Film Title': {
-                'HH:MM AM/PM': [
-                    {
-                        'url': 'https://...',
-                        'format': 'IMAX',
-                        'ticket_info': {...},
-                        'theater_name': 'Theater Name',
-                        'play_date': 'YYYY-MM-DD'
-                    }
-                ]
-            }
-        }
-    }
-}
-```
-
-### Price Data Structure
-
-```python
-[
-    {
-        'theater_name': 'Theater',
-        'play_date': 'YYYY-MM-DD',
-        'film_title': 'Film',
-        'showtime': 'HH:MM AM/PM',
-        'format': 'IMAX',
-        'daypart': 'Evening',
-        'ticket_url': 'https://...',
-        'prices': [
-            {
-                'ticket_type': 'Adult',
-                'price': 16.99,
-                'capacity': '50/150'
-            }
-        ]
-    }
-]
-```
-
-### Markets JSON Structure
+All errors follow [RFC 7807 Problem Details](https://www.rfc-editor.org/rfc/rfc7807):
 
 ```json
 {
-  "Company Name": {
-    "Region": {
-      "Market": {
-        "Theater Name": {
-          "name": "Theater Name",
-          "url": "https://www.fandango.com/..."
-        }
-      }
-    }
-  }
+  "type": "https://pricescout.marcus.com/errors/not-found",
+  "title": "Resource Not Found",
+  "status": 404,
+  "detail": "Theater 'Example Theater' not found",
+  "instance": "/api/v1/resources/theaters/999",
+  "trace_id": "abc-123-def"
 }
 ```
 
 ---
 
-## Testing Utilities
+## Request Correlation Headers (February 2026)
 
-### Fixtures
+All API responses include correlation headers for distributed tracing:
 
-Located in `tests/conftest.py`:
+| Header | Direction | Description |
+|--------|-----------|-------------|
+| `X-Request-ID` | Request (optional) | Client-provided correlation ID (must be valid UUID) |
+| `X-Request-ID` | Response | Request correlation ID (client-provided or auto-generated) |
+| `X-Trace-ID` | Response | OpenTelemetry trace ID (when tracing enabled) |
 
-```python
-@pytest.fixture
-def mock_scraper():
-    """Returns a mock Scraper instance."""
-    
-@pytest.fixture
-def sample_showings_data():
-    """Returns sample showings structure."""
-    
-@pytest.fixture
-def sample_price_data():
-    """Returns sample price data."""
-```
+**Security:** Request IDs are validated against UUID format to prevent log injection attacks. Invalid or missing IDs are replaced with server-generated UUIDs.
 
-### Running Tests
-
+**Usage:**
 ```bash
-# Run all tests
-pytest
+# Send request with custom correlation ID
+curl -H "X-Request-ID: 550e8400-e29b-41d4-a716-446655440000" \
+  https://api.pricescout.io/api/v1/theaters
 
-# Run specific module
-pytest tests/test_database.py
+# Response headers include:
+# X-Request-ID: 550e8400-e29b-41d4-a716-446655440000
+# X-Trace-ID: 4bf92f3577b34da6a3ce929d0e0e4736
+```
 
-# Run with coverage
-pytest --cov=app --cov-report=html
-
-# Run specific test
-pytest tests/test_scraper.py::test_parse_ticket_description -v
+**Finding logs in Application Insights:**
+```kusto
+traces
+| where customDimensions["request_id"] == "550e8400-e29b-41d4-a716-446655440000"
+| order by timestamp asc
 ```
 
 ---
 
-## Best Practices
+## Endpoint Reference
 
-### Error Handling
+### Root & Health (main.py)
 
-```python
-try:
-    status, result, log, meta = await scout.get_all_showings_for_theaters(...)
-    if status == 'success':
-        # Process result
-        pass
-    else:
-        # Handle error
-        st.error(f"Scraping failed: {result}")
-except Exception as e:
-    logger.error(f"Unexpected error: {e}")
-    st.error("An unexpected error occurred")
-```
-
-### Database Connections
-
-```python
-# Always use context manager
-from app import database
-
-with database._get_db_connection() as conn:
-    cursor = conn.cursor()
-    # Perform operations
-    conn.commit()
-# Connection automatically closed
-```
-
-### Logging
-
-```python
-import logging
-
-logger = logging.getLogger(__name__)
-
-logger.debug("Detailed debug information")
-logger.info("Informational message")
-logger.warning("Warning message")
-logger.error("Error occurred")
-```
+| Method | Path | Description | Auth |
+|--------|------|-------------|------|
+| `GET` | `/` | API root information | None |
+| `GET` | `/health` | Basic health check | None |
+| `GET` | `/health/full` | Comprehensive health check with component status | None |
+| `GET` | `/info` | Detailed API info and endpoint listing | None |
 
 ---
 
-## API Versioning
+### Authentication & Users
 
-**Current Version:** 28.0
+**Router:** `auth.py` | **Tag:** Auth | **Prefix:** `/auth`
 
-### Version History
+| Method | Path | Description | Auth |
+|--------|------|-------------|------|
+| `POST` | `/auth/token` | Get JWT token (username/password) | None |
+| `POST` | `/auth/logout` | Logout current user | Bearer |
+| `GET` | `/auth/me` | Get current user info | Bearer |
+| `POST` | `/auth/refresh` | Refresh JWT token | Bearer |
+| `GET` | `/auth/health` | Auth service health check (DB, API key, Entra ID status) | None |
 
-- **v28.0** (October 2025)
-  - Fixed duplicate showing bug
-  - Removed dev mode
-  - Improved CompSnipe UX
-  - Standardized error messages
-  - Enhanced documentation
+**Entra ID SSO (February 2026)**
 
-- **v27.0** (January 2025)
-  - Initial comprehensive testing
-  - 244 tests, 40% coverage
-  - Production-ready baseline
+| Method | Path | Description | Auth |
+|--------|------|-------------|------|
+| `GET` | `/auth/entra/login` | Initiate Entra ID SSO flow | None |
+| `GET` | `/auth/entra/callback` | Handle OAuth callback from Microsoft | None |
+| `POST` | `/auth/entra/exchange` | Exchange auth code for session JWT | None |
+| `GET` | `/auth/entra/status` | Get Entra ID configuration status | None |
+
+**Entra ID Flow:**
+1. Client calls `GET /auth/entra/login?redirect_url=https://app.example.com/dashboard`
+2. Client redirects user to returned `auth_url`
+3. User authenticates with Microsoft
+4. Microsoft redirects to callback with authorization code
+5. Callback redirects to `redirect_url` with `auth_code` parameter
+6. Client calls `POST /auth/entra/exchange?auth_code=<code>` to get JWT
+
+**Router:** `users.py` | **Tag:** Users
+
+| Method | Path | Description | Auth |
+|--------|------|-------------|------|
+| `POST` | `/users/change-password` | Change own password | Bearer |
+| `POST` | `/users/reset-password-request` | Request password reset | None |
+| `POST` | `/users/reset-password-with-code` | Reset with verification code | None |
+
+**Router:** `admin.py` | **Tag:** Admin
+
+| Method | Path | Description | Auth |
+|--------|------|-------------|------|
+| `GET` | `/admin/users` | List all users | Admin |
+| `GET` | `/admin/users/{user_id}` | Get specific user | Admin |
+| `POST` | `/admin/users` | Create user | Admin |
+| `PUT` | `/admin/users/{user_id}` | Update user | Admin |
+| `DELETE` | `/admin/users/{user_id}` | Delete user | Admin |
+| `POST` | `/admin/users/{user_id}/reset-password` | Reset user password | Admin |
+| `GET` | `/admin/audit-log` | Get audit log entries | Admin |
+| `GET` | `/admin/audit-log/event-types` | List audit event types | Admin |
+| `GET` | `/admin/audit-log/categories` | List audit categories | Admin |
 
 ---
 
-## Support
+### Price Data & Analytics
 
-**Documentation:**
-- README.md - Installation and quick start
-- USER_GUIDE.md - End-user instructions
-- ADMIN_GUIDE.md - Administrator guide
-- API_REFERENCE.md - This document
+**Router:** `price_checks.py` | **Tag:** Price Data
 
-**Testing:**
-- Test suite: `tests/`
-- Coverage: `htmlcov/index.html`
+| Method | Path | Description | Auth |
+|--------|------|-------------|------|
+| `GET` | `/price-checks` | Query price checks with filters | Read |
+| `GET` | `/price-checks/latest/{theater_name}` | Latest prices for a theater | Read |
+| `GET` | `/price-history/{theater_name}` | Price history for a theater | Read |
+| `GET` | `/price-comparison` | Cross-theater price comparison | Read |
 
-**Contributing:**
-- Follow existing patterns
-- Write tests for new features
-- Update documentation
-- Run linter before committing
+**Router:** `analytics.py` | **Tag:** Analytics
+
+| Method | Path | Description | Auth |
+|--------|------|-------------|------|
+| `GET` | `/analytics/dashboard-stats` | Dashboard statistics | Read |
+| `GET` | `/analytics/scrape-activity` | Scrape activity timeline | Read |
+| `GET` | `/analytics/plf-distribution` | PLF format distribution | Read |
+| `GET` | `/analytics/price-trends` | Price trend analysis | Read |
+
+**Router:** `price_tiers.py` | **Tag:** Price Tiers
+
+| Method | Path | Description | Auth |
+|--------|------|-------------|------|
+| `GET` | `/price-tiers/discover/{theater_name}` | Discover pricing tiers | Read |
+| `GET` | `/price-tiers/discover-all` | Discover tiers for all theaters | Read |
+| `GET` | `/price-tiers/discount-days/{theater_name}` | Detect discount day patterns | Read |
+| `GET` | `/price-tiers/recommendations` | Scrape schedule recommendations | Read |
+| `GET` | `/price-tiers/analyze/{theater_name}` | Full pricing analysis | Read |
+| `POST` | `/price-tiers/save-baselines` | Save discovered tiers as baselines | Operator |
+| `GET` | `/price-tiers/compare-discount-programs` | Compare discount programs | Read |
 
 ---
 
-**API Reference Version:** 28.0  
-**Last Updated:** October 2025  
-**Status:** Production Ready
+### Price Alerts & Surge Detection
+
+**Router:** `price_alerts.py` | **Tag:** Price Alerts
+
+| Method | Path | Description | Auth |
+|--------|------|-------------|------|
+| `GET` | `/price-alerts` | List alerts (filterable) | Read |
+| `GET` | `/price-alerts/summary` | Alert summary statistics | Read |
+| `GET` | `/price-alerts/config` | Get alert configuration | Read |
+| `PUT` | `/price-alerts/acknowledge-bulk` | Acknowledge selected alerts | Operator |
+| `PUT` | `/price-alerts/acknowledge-all` | Acknowledge ALL pending alerts | Operator |
+| `GET` | `/price-alerts/{alert_id}` | Get specific alert | Read |
+| `PUT` | `/price-alerts/{alert_id}/acknowledge` | Acknowledge single alert | Operator |
+| `PUT` | `/price-alerts/config` | Update alert configuration | Admin |
+| `POST` | `/price-alerts/test-webhook` | Test webhook delivery | Admin |
+
+Alert types: `price_increase`, `price_decrease`, `surge_detected`, `new_offering`, `discontinued`
+
+**Price Baselines** (same router)
+
+| Method | Path | Description | Auth |
+|--------|------|-------------|------|
+| `GET` | `/price-baselines` | List price baselines | Read |
+| `POST` | `/price-baselines` | Create baseline | Operator |
+| `GET` | `/price-baselines/coverage` | Baseline coverage analysis | Read |
+| `PUT` | `/price-baselines/{baseline_id}` | Update baseline | Operator |
+| `DELETE` | `/price-baselines/{baseline_id}` | Delete baseline | Admin |
+| `GET` | `/price-baselines/discover` | Discover baselines from data | Read |
+| `POST` | `/price-baselines/refresh` | Refresh all baselines with latest price data | Operator |
+| `POST` | `/price-baselines/guarded-refresh` | Guarded refresh with drift protection (flags >15% changes) | Operator |
+| `GET` | `/price-baselines/health` | Data health dashboard (freshness, staleness, normalization, metadata) | Read |
+| `POST` | `/price-baselines/plf-calibration` | Refresh PLF calibration thresholds from Fandango data | Operator |
+| `GET` | `/price-baselines/analyze` | Analyze baseline data | Read |
+| `GET` | `/price-baselines/premium-formats` | Premium format baselines | Read |
+
+**Surge Scanner** (same router)
+
+| Method | Path | Description | Auth |
+|--------|------|-------------|------|
+| `GET` | `/surge-scanner/advance` | Scan advance dates for surge pricing | Read |
+| `GET` | `/surge-scanner/new-films` | Monitor new films for surge pricing | Read |
+
+---
+
+### Baselines & Coverage
+
+**Router:** `price_alerts.py` (continued) | **Tags:** Baseline Browser, Coverage Gaps
+
+| Method | Path | Description | Auth |
+|--------|------|-------------|------|
+| `GET` | `/baselines/markets` | Market-level baseline summary | Read |
+| `GET` | `/baselines/market-detail` | Detailed market baselines | Read |
+| `GET` | `/baselines/theaters/{theater_name}` | Theater baselines | Read |
+| `GET` | `/baselines/coverage-gaps` | All coverage gaps | Read |
+| `GET` | `/baselines/coverage-gaps/{theater_name}` | Theater coverage gaps | Read |
+| `GET` | `/baselines/coverage-hierarchy` | Full coverage hierarchy | Read |
+| `GET` | `/baselines/coverage-market/{director}/{market}` | Market coverage detail | Read |
+| `GET` | `/baselines/gap-fill/{theater_name}` | Propose gap fills from available data | Admin |
+| `POST` | `/baselines/gap-fill/{theater_name}/apply` | Apply gap fill proposals as baselines | Admin |
+| `GET` | `/baselines/compare-sources` | Compare Fandango vs EntTelligence | Read |
+| `POST` | `/baselines/deduplicate` | Remove duplicate baselines | Operator |
+
+---
+
+### EntTelligence Baselines
+
+**Router:** `price_alerts.py` (continued) | **Tag:** EntTelligence Baselines
+
+| Method | Path | Description | Auth |
+|--------|------|-------------|------|
+| `GET` | `/enttelligence-baselines/discover` | Discover baselines from EntTelligence data | Read |
+| `POST` | `/enttelligence-baselines/refresh` | Refresh EntTelligence baselines | Operator |
+| `GET` | `/enttelligence-baselines/analyze` | Analyze EntTelligence prices | Read |
+| `GET` | `/enttelligence-baselines/circuits` | List EntTelligence circuits | Read |
+| `GET` | `/enttelligence-baselines/circuit/{circuit_name}` | Get baselines for specific circuit | Read |
+| `GET` | `/enttelligence-baselines/event-cinema` | Analyze event cinema pricing | Read |
+| `GET` | `/enttelligence-baselines/event-cinema/keywords` | Get event cinema keywords | Read |
+
+---
+
+### Fandango Baselines
+
+**Router:** `price_alerts.py` (continued) | **Tag:** Fandango Baselines
+
+| Method | Path | Description | Auth |
+|--------|------|-------------|------|
+| `GET` | `/fandango-baselines/discover` | Discover baselines from Fandango data | Read |
+| `GET` | `/fandango-baselines/theater/{theater_name}` | Analyze pricing for a theater | Read |
+| `GET` | `/fandango-baselines/discount-days` | Detect discount day patterns | Read |
+| `GET` | `/fandango-baselines/theaters` | List theaters with Fandango data | Read |
+
+---
+
+### Market Baselines
+
+**Router:** `price_alerts.py` (continued) | **Tag:** Market Baselines
+
+| Method | Path | Description | Auth |
+|--------|------|-------------|------|
+| `GET` | `/market-baselines/stats` | Market baseline statistics | Read |
+| `GET` | `/market-baselines/plan` | Get market scrape plan | Read |
+| `POST` | `/market-baselines/scrape` | Trigger market baseline scrape | Operator |
+| `GET` | `/market-baselines/scrape/{job_id}` | Get market scrape job status | Read |
+| `POST` | `/market-baselines/scrape/{job_id}/cancel` | Cancel market baseline scrape | Operator |
+
+---
+
+### Discount Programs
+
+**Router:** `price_alerts.py` (continued) | **Tag:** Discount Programs
+
+| Method | Path | Description | Auth |
+|--------|------|-------------|------|
+| `GET` | `/discount-programs` | List all discount programs | Read |
+| `POST` | `/discount-programs` | Create a new discount program | Operator |
+| `PUT` | `/discount-programs/{program_id}` | Update a discount program | Operator |
+| `DELETE` | `/discount-programs/{program_id}` | Delete a discount program | Admin |
+
+---
+
+### Data Sources
+
+**Router:** `enttelligence.py` | **Tag:** EntTelligence | **Prefix:** `/enttelligence`
+
+| Method | Path | Description | Auth |
+|--------|------|-------------|------|
+| `POST` | `/enttelligence/sync` | Sync EntTelligence pricing data | Operator |
+| `GET` | `/enttelligence/cache/stats` | Cache statistics | Read |
+| `POST` | `/enttelligence/cache/lookup` | Lookup specific cache entries | Read |
+| `POST` | `/enttelligence/cache/cleanup` | Clean stale cache entries | Admin |
+| `GET` | `/enttelligence/status` | Sync status | Read |
+
+**Router:** `scrapes.py` | **Tag:** Scrapes
+
+| Method | Path | Description | Auth |
+|--------|------|-------------|------|
+| `GET` | `/scrapes/active-theaters` | Currently active scrape targets | Read |
+| `POST` | `/scrapes/check-collision` | Check for scrape conflicts | Read |
+| `GET` | `/scrapes/jobs` | List recent scrape jobs | Read |
+| `POST` | `/scrapes/trigger` | Trigger a full scrape job | Operator |
+| `GET` | `/scrapes/{job_id}/status` | Get job status | Read |
+| `POST` | `/scrapes/{job_id}/cancel` | Cancel a running job | Operator |
+| `GET` | `/scrapes/search-theaters/fandango` | Search Fandango for theaters | Read |
+| `GET` | `/scrapes/search-theaters/cache` | Search local theater cache | Read |
+| `POST` | `/scrapes/fetch-showtimes` | Fetch showtimes for a theater | Operator |
+| `POST` | `/scrapes/estimate-time` | Estimate scrape duration | Read |
+| `POST` | `/scrapes/operating-hours` | Scrape operating hours | Operator |
+| `POST` | `/scrapes/save` | Save scraped data to database | Operator |
+| `POST` | `/scrape_runs` | Create a scrape run record | Operator |
+| `POST` | `/scrapes/verify-prices` | Verify scraped prices against EntTelligence cache | Operator |
+| `GET` | `/scrapes/{job_id}/verification` | Get price verification results for a scrape | Read |
+| `POST` | `/scrapes/compare-counts` | Compare showtime counts across sources | Read |
+| `POST` | `/scrapes/compare-showtimes` | Verify Fandango showtimes against EntTelligence | Read |
+| `POST` | `/scrapes/zero-showtime-analysis` | Detect theaters with zero showtimes | Read |
+| `POST` | `/scrapes/mark-theater-status` | Mark theater Fandango availability | Operator |
+
+**Router:** `scrape_sources.py` | **Tag:** Scrape Sources
+
+| Method | Path | Description | Auth |
+|--------|------|-------------|------|
+| `GET` | `/scrape-sources` | List configured scrape sources | Read |
+| `POST` | `/scrape-sources` | Create new scrape source | Admin |
+| `GET` | `/scrape-sources/{source_id}` | Get specific source | Read |
+| `PUT` | `/scrape-sources/{source_id}` | Update scrape source | Admin |
+| `DELETE` | `/scrape-sources/{source_id}` | Delete scrape source | Admin |
+| `POST` | `/scrape-jobs/trigger/{source_id}` | Trigger job from source | Operator |
+| `GET` | `/scrape-jobs/{run_id}/status` | Get job run status | Read |
+| `GET` | `/scrape-jobs` | List scrape job runs | Read |
+
+---
+
+### Circuit Intelligence
+
+**Router:** `circuit_benchmarks.py` | **Tag:** Circuit Benchmarks
+
+| Method | Path | Description | Auth |
+|--------|------|-------------|------|
+| `GET` | `/circuit-benchmarks` | List circuit benchmarks | Read |
+| `GET` | `/circuit-benchmarks/weeks` | Weekly benchmark summaries | Read |
+| `GET` | `/circuit-benchmarks/{week_ending_date}` | Specific week benchmarks | Read |
+| `POST` | `/circuit-benchmarks/sync` | Sync from EntTelligence | Operator |
+| `GET` | `/circuit-benchmarks/compare` | Compare circuits | Read |
+
+**Router:** `company_profiles.py` | **Tag:** Company Profiles | **Prefix:** `/company-profiles`
+
+| Method | Path | Description | Auth |
+|--------|------|-------------|------|
+| `GET` | `/company-profiles` | List all circuit profiles | Read |
+| `GET` | `/company-profiles/{circuit_name}` | Get circuit profile | Read |
+| `POST` | `/company-profiles/discover` | Discover pricing profile | Operator |
+| `POST` | `/company-profiles/discover-all` | Discover all profiles | Operator |
+| `DELETE` | `/company-profiles/{circuit_name}` | Delete profile | Admin |
+| `POST` | `/company-profiles/cleanup-duplicates` | Remove duplicates | Admin |
+| `GET` | `/company-profiles/{circuit_name}/discount-day-diagnostic` | Discount day analysis | Read |
+| `GET` | `/company-profiles/{circuit_name}/discount-programs` | List circuit discount programs | Read |
+| `POST` | `/company-profiles/{circuit_name}/discount-programs` | Create circuit discount program | Operator |
+| `DELETE` | `/company-profiles/{circuit_name}/discount-programs/{program_id}` | Delete circuit discount program | Admin |
+| `GET` | `/company-profiles/{circuit_name}/gaps` | List data coverage gaps | Read |
+| `POST` | `/company-profiles/{circuit_name}/gaps/{gap_id}/resolve` | Resolve a profile data gap | Operator |
+| `GET` | `/company-profiles/{circuit_name}/versions` | List profile version history | Read |
+| `GET` | `/company-profiles/{circuit_name}/data-coverage` | Data coverage report | Read |
+
+**Router:** `presales.py` | **Tag:** Presales
+
+| Method | Path | Description | Auth |
+|--------|------|-------------|------|
+| `GET` | `/presales` | Get presale snapshots | Read |
+| `GET` | `/presales/circuits` | List circuits with presale data and aggregate statistics | Read |
+| `GET` | `/presales/films` | List films with presale data | Read |
+| `GET` | `/presales/{film_title}` | Presale trajectory for film | Read |
+| `GET` | `/presales/velocity/{film_title}` | Velocity metrics | Read |
+| `GET` | `/presales/compare` | Compare film presales | Read |
+| `GET` | `/presales/compliance` | Presale posting compliance analysis (advance posting by circuit) | Read |
+| `GET` | `/presales/heatmap-data` | Per-theater presale data with coordinates for heatmap visualization | Read |
+| `GET` | `/presales/demand-lookup` | Per-showtime demand data (capacity, tickets sold, fill rate) | Read |
+| `POST` | `/presales/sync` | Sync presale data | Operator |
+
+**Demand Lookup** query params: `theaters` (comma-separated, required), `date_from` (YYYY-MM-DD, required), `date_to` (optional), `films` (comma-separated, optional). Returns `DemandMetric[]` with `theater_name`, `film_title`, `play_date`, `showtime`, `format`, `capacity`, `available`, `tickets_sold`, `fill_rate_pct`, `price`.
+
+**Presale Watches** (same router)
+
+| Method | Path | Description | Auth |
+|--------|------|-------------|------|
+| `GET` | `/presales/watches` | List all presale watch configurations | Read |
+| `POST` | `/presales/watches` | Create a new presale watch | Operator |
+| `PUT` | `/presales/watches/{watch_id}` | Update a presale watch (toggle enabled, change threshold) | Operator |
+| `DELETE` | `/presales/watches/{watch_id}` | Delete a presale watch and its notifications | Operator |
+| `GET` | `/presales/watches/notifications` | List watch notifications (optional `unread_only` param) | Read |
+| `PUT` | `/presales/watches/notifications/{notification_id}/read` | Mark a notification as read | Operator |
+
+Watch alert types: `velocity_drop`, `velocity_spike`, `milestone`, `days_out`, `market_share`
+
+---
+
+### Theater Management
+
+**Router:** `resources.py` | **Tag:** Resources
+
+| Method | Path | Description | Auth |
+|--------|------|-------------|------|
+| `GET` | `/theaters` | List all theaters with metadata and showtime counts | Read |
+| `GET` | `/films` | List films with showtime information | Read |
+| `POST` | `/films/enrich` | Enrich all films missing metadata from OMDb | Operator |
+| `POST` | `/films/enrich-single` | Enrich a single film from OMDb | Operator |
+| `GET` | `/scrape-runs` | Get recent scrape run history with status and metrics | Read |
+| `GET` | `/showtimes/search` | Flexible showtime search with multiple filter options | Read |
+| `GET` | `/pricing` | Get ticket pricing data with optional filters | Read |
+
+**Router:** `markets.py` | **Tag:** Markets
+
+| Method | Path | Description | Auth |
+|--------|------|-------------|------|
+| `GET` | `/markets` | List all markets | Read |
+
+**Router:** `films.py` | **Tag:** Films
+
+| Method | Path | Description | Auth |
+|--------|------|-------------|------|
+| `GET` | `/films` | List all films with metadata | Read |
+| `GET` | `/films/{film_title}` | Get specific film metadata | Read |
+| `POST` | `/films/{film_title}/enrich` | Enrich film via OMDb | Operator |
+| `POST` | `/films/discover/fandango` | Discover films from Fandango | Operator |
+
+**Router:** `theater_amenities.py` | **Tag:** Theater Amenities
+
+| Method | Path | Description | Auth |
+|--------|------|-------------|------|
+| `GET` | `/theater-amenities` | List all amenity records | Read |
+| `GET` | `/theater-amenities/summary` | Amenities summary | Read |
+| `GET` | `/theater-amenities/{amenity_id}` | Get specific amenity | Read |
+| `POST` | `/theater-amenities` | Create amenity record | Operator |
+| `PUT` | `/theater-amenities/{amenity_id}` | Update amenity | Operator |
+| `DELETE` | `/theater-amenities/{amenity_id}` | Delete amenity | Admin |
+| `POST` | `/theater-amenities/discover` | Discover amenities for theater | Operator |
+| `POST` | `/theater-amenities/discover-all` | Discover for all theaters | Operator |
+| `GET` | `/theater-amenities/format-summary` | Format distribution summary | Read |
+| `GET` | `/theater-amenities/screen-counts/{theater_name}` | Estimated screen counts | Read |
+
+**Router:** `theater_onboarding.py` | **Tag:** Theater Onboarding | **Prefix:** `/theater-onboarding`
+
+| Method | Path | Description | Auth |
+|--------|------|-------------|------|
+| `GET` | `/theater-onboarding/status/{theater_name}` | Get onboarding status | Read |
+| `GET` | `/theater-onboarding/pending` | List pending theaters | Read |
+| `POST` | `/theater-onboarding/start` | Start onboarding | Operator |
+| `POST` | `/theater-onboarding/bulk-start` | Bulk start onboarding | Operator |
+| `POST` | `/theater-onboarding/{theater_name}/scrape` | Record initial scrape for theater | Operator |
+| `POST` | `/theater-onboarding/{theater_name}/discover` | Discover theater baselines | Operator |
+| `POST` | `/theater-onboarding/{theater_name}/link` | Link theater to company profile | Operator |
+| `POST` | `/theater-onboarding/{theater_name}/confirm` | Confirm baseline data for theater | Operator |
+| `GET` | `/theater-onboarding/{theater_name}/coverage` | Get data coverage indicators | Read |
+| `GET` | `/theater-onboarding/market/{market}` | Theaters by market | Read |
+| `GET` | `/theater-onboarding/amenities/missing` | Theaters missing amenities | Read |
+| `POST` | `/theater-onboarding/{theater_name}/amenities` | Discover theater amenities | Operator |
+| `POST` | `/theater-onboarding/amenities/backfill` | Backfill amenity data | Operator |
+
+**Router:** `alternative_content.py` | **Tag:** Alternative Content | **Prefix:** `/alternative-content`
+
+| Method | Path | Description | Auth |
+|--------|------|-------------|------|
+| `GET` | `/alternative-content` | List alternative content films | Read |
+| `GET` | `/alternative-content/{film_id}` | Get specific AC film | Read |
+| `POST` | `/alternative-content` | Create AC film entry | Operator |
+| `PUT` | `/alternative-content/{film_id}` | Update AC film | Operator |
+| `DELETE` | `/alternative-content/{film_id}` | Delete AC film | Admin |
+| `POST` | `/alternative-content/detect` | Run AC detection | Operator |
+| `GET` | `/alternative-content/detect/preview` | Preview detection | Read |
+| `GET` | `/alternative-content/check/{film_title}` | Check if film is AC | Read |
+| `GET` | `/alternative-content/circuit-pricing` | Circuit AC pricing summary | Read |
+| `GET` | `/alternative-content/circuit-pricing/{circuit_name}` | Get pricing for specific circuit | Read |
+| `PUT` | `/alternative-content/circuit-pricing/{circuit_name}` | Update circuit AC pricing | Operator |
+
+---
+
+### Reports
+
+**Router:** `reports.py` | **Tag:** Reports
+
+| Method | Path | Description | Auth |
+|--------|------|-------------|------|
+| `POST` | `/reports/selection-analysis` | Generate selection analysis | Read |
+| `POST` | `/reports/showtime-view/html` | Generate showtime HTML view | Read |
+| `POST` | `/reports/showtime-view/pdf` | Generate showtime PDF | Read |
+| `GET` | `/reports/daily-lineup` | Get daily lineup data | Read |
+| `GET` | `/reports/operating-hours` | Get operating hours comparison | Read |
+| `GET` | `/reports/plf-formats` | Get PLF format data | Read |
+| `POST` | `/reports/scrape-results/pdf` | Generate PDF summary of scrape results | Read |
+| `GET` | `/reports/box-office-board` | Generate box office board for digital signage or printing | Read |
+
+Query params: `theater` (required), `date` (YYYY-MM-DD, required), `resolution` (720p/1080p/4k/letter), `output_format` (html/image)
+
+---
+
+### Schedule Monitoring
+
+**Router:** `schedule_monitor.py` | **Tag:** Schedule Alerts
+
+| Method | Path | Description | Auth |
+|--------|------|-------------|------|
+| `GET` | `/schedule-alerts` | List schedule alerts | Read |
+| `GET` | `/schedule-alerts/summary` | Alert summary | Read |
+| `PUT` | `/schedule-alerts/{alert_id}/acknowledge` | Acknowledge alert | Operator |
+| `POST` | `/schedule-alerts/acknowledge-bulk` | Bulk acknowledge | Operator |
+| `POST` | `/schedule-monitor/check` | Trigger schedule check | Operator |
+| `GET` | `/schedule-monitor/status` | Monitor status | Read |
+| `GET` | `/schedule-monitor/config` | Get monitor configuration | Read |
+| `PUT` | `/schedule-monitor/config` | Update monitor config | Admin |
+| `POST` | `/schedule-baselines/snapshot` | Create schedule baseline snapshot | Operator |
+| `POST` | `/schedule-posting/check` | Trigger schedule posting check | Operator |
+| `GET` | `/schedule-posting/summary` | Get schedule posting summary | Read |
+| `GET` | `/schedule-posting/pending-dates` | Get pending posting dates | Read |
+
+---
+
+### Settings
+
+**Router:** `settings.py` | **Tag:** Settings | **Prefix:** `/settings`
+
+| Method | Path | Description | Auth |
+|--------|------|-------------|------|
+| `GET` | `/settings/tax-config` | Get tax estimation configuration for EntTelligence price adjustment | Read |
+| `PUT` | `/settings/tax-config` | Update tax estimation configuration | Admin |
+
+---
+
+### System & Operations
+
+**Router:** `system.py` | **Tag:** System
+
+| Method | Path | Description | Auth |
+|--------|------|-------------|------|
+| `GET` | `/system/health` | Detailed system health check | Admin |
+| `POST` | `/system/circuits/reset` | Reset all circuit breakers | Admin |
+| `POST` | `/system/circuits/{name}/reset` | Reset specific circuit | Admin |
+| `POST` | `/system/circuits/{name}/open` | Force-open circuit breaker | Admin |
+| `POST` | `/system/maintenance/retention` | Run data retention | Admin |
+| `GET` | `/system/maintenance/status` | Maintenance status | Admin |
+| `GET` | `/system/tasks/{task_id}` | Get background task status | Read |
+
+**Router:** `cache.py` | **Tag:** Cache
+
+| Method | Path | Description | Auth |
+|--------|------|-------------|------|
+| `GET` | `/cache/status` | Cache health status | Read |
+| `GET` | `/cache/theaters` | Full theater cache with metadata | Read |
+| `GET` | `/cache/markets` | Cached market data | Read |
+| `POST` | `/cache/refresh` | Force cache refresh | Operator |
+| `GET` | `/cache/backup` | Get cache backup status | Admin |
+| `POST` | `/cache/maintenance` | Run cache maintenance operations | Admin |
+| `GET` | `/cache/maintenance/health` | Check cache health status | Read |
+| `GET` | `/cache/maintenance/history` | Maintenance operation history | Read |
+| `POST` | `/cache/maintenance/run` | Run maintenance with specific options | Admin |
+| `GET` | `/cache/repair-queue/status` | Repair queue status | Read |
+| `GET` | `/cache/repair-queue/jobs` | Repair queue jobs | Read |
+| `GET` | `/cache/repair-queue/failed` | List failed repair jobs | Read |
+| `POST` | `/cache/repair-queue/reset` | Reset a repair job | Operator |
+| `DELETE` | `/cache/repair-queue/failed` | Clear all failed repair jobs | Admin |
+| `POST` | `/cache/repair-queue/process` | Process repair queue | Operator |
+| `GET` | `/theaters/unmatched` | List unmatched theaters | Read |
+| `POST` | `/theaters/match` | Match an unmatched theater to a profile | Operator |
+| `POST` | `/theaters/discover` | Discover theater URL from name | Operator |
+| `GET` | `/theaters/discover/{theater_name}` | Discover theater URL via GET | Operator |
+
+**Router:** `tasks.py` | **Tag:** Tasks
+
+| Method | Path | Description | Auth |
+|--------|------|-------------|------|
+| `GET` | `/tasks` | List scheduled tasks | Read |
+
+**Router:** `market_context.py` | **Tag:** Market Context | **Prefix:** `/market-context`
+
+| Method | Path | Description | Auth |
+|--------|------|-------------|------|
+| `GET` | `/market-context/theaters` | Theater metadata | Read |
+| `GET` | `/market-context/events` | Market events | Read |
+| `GET` | `/market-context/operating-hours` | Get theater operating hours | Read |
+| `POST` | `/market-context/operating-hours` | Update theater operating hours | Operator |
+| `POST` | `/market-context/sync/theaters` | Sync theater metadata | Operator |
+| `GET` | `/market-context/theaters/heatmap-data` | Heatmap visualization data | Read |
+
+---
+
+### Metrics
+
+**Router:** `metrics.py` | **Tag:** Metrics
+
+| Method | Path | Description | Auth |
+|--------|------|-------------|------|
+| `GET` | `/metrics` | Prometheus-format metrics endpoint | None |
+
+---
+
+## Rate Limiting
+
+| Tier | Requests/min | Burst |
+|------|-------------|-------|
+| Free | 60 | 10 |
+| Premium | 300 | 50 |
+| Enterprise | Unlimited | -- |
+
+Rate limit headers: `X-RateLimit-Remaining`, `X-RateLimit-Reset`
+
+---
+
+## Environments
+
+| Environment | URL |
+|-------------|-----|
+| Production | `https://app-pricescout-prod.azurewebsites.net/api/v1` |
+| Development | `https://app-pricescout-dev.azurewebsites.net/api/v1` |
+| Local | `http://localhost:8000/api/v1` |
+
+---
+
+*Generated February 4, 2026. For the most up-to-date spec, use the interactive Swagger UI at `/api/v1/docs`.*

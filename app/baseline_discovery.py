@@ -34,17 +34,26 @@ PREMIUM_FORMATS = {
     'IMAX', 'IMAX 3D', 'IMAX with Laser', 'IMAX HFR 3D',
     'Dolby Cinema', 'Dolby Atmos', 'Dolby Vision',
     '3D', 'RealD 3D', 'Digital 3D',
-    'PLF', 'Premium Large Format', 'XD', 'RPX', 'BigD',
+    'PLF', 'Premium Large Format', 'Premium Format', 'XD', 'RPX', 'BigD',
     '4DX', 'D-BOX', 'ScreenX', 'MX4D',
     'Laser IMAX', 'GTX', 'UltraAVX',
 }
 
 # Event cinema / special presentations (expected higher prices)
 EVENT_CINEMA_KEYWORDS = [
-    'Fathom', 'TCM', 'Met Opera', 'NT Live', 'National Theatre',
-    'Bolshoi', 'Royal Opera', 'Concert', 'Live Event',
-    'Anniversary', 'Encore', 'Special Presentation',
-    'Fan Event', 'Marathon', 'Double Feature',
+    'Fathom', 'Trafalgar', 'TCM', 'Turner Classic',
+    'Met Opera', 'NT Live', 'National Theatre', 'Bolshoi', 'Royal Opera',
+    'Royal Ballet', 'Globe Theatre',
+    'Concert', 'Live Event', 'Live in Concert',
+    'Anniversary', 'Encore', 'Special Presentation', 'Special Event',
+    'Special Engagement', 'Fan Event',
+    'Marathon', 'Double Feature', 'Triple Feature',
+    'Rerelease', 'Re-release',
+    # Generic "Event)" suffix — catches "(2026 Event)" style titles
+    'Event)',
+    'WWE', 'UFC', 'Boxing', 'Wrestling',
+    'Crunchyroll', 'Funimation',
+    'Birthday Party', 'Private Screening', 'Private Event',
 ]
 
 
@@ -162,6 +171,7 @@ class BaselineDiscoveryService:
                     'avg_price': float(avg_p) if avg_p else None,
                     'volatility_percent': round(float(volatility), 1),
                     'is_premium': self.is_premium_format(format_type),
+                    'source': 'fandango',
                 })
 
         logger.info(f"Discovered {len(discovered)} baselines for company {self.company_id}")
@@ -200,10 +210,6 @@ class BaselineDiscoveryService:
 
         with get_session() as session:
             for baseline_data in baselines:
-                # Skip premium formats - they shouldn't have baselines for surge detection
-                if baseline_data.get('is_premium'):
-                    continue
-
                 # Extract optional fields (may be None)
                 day_of_week = baseline_data.get('day_of_week')
                 daypart = baseline_data.get('daypart')
@@ -245,6 +251,10 @@ class BaselineDiscoveryService:
                         # Update existing baseline price instead of creating new
                         existing.baseline_price = Decimal(str(baseline_data['baseline_price']))
                         existing.effective_from = effective_from
+                        existing.source = baseline_data.get('source', 'fandango')
+                        existing.tax_status = 'inclusive'
+                        existing.sample_count = baseline_data.get('sample_count')
+                        existing.last_discovery_at = datetime.now(UTC)
                         saved_count += 1
                     # Skip if not overwriting - baseline already exists
                     continue
@@ -260,7 +270,11 @@ class BaselineDiscoveryService:
                     day_of_week=day_of_week,
                     baseline_price=Decimal(str(baseline_data['baseline_price'])),
                     effective_from=effective_from,
-                    effective_to=None  # Active
+                    effective_to=None,  # Active
+                    source=baseline_data.get('source', 'fandango'),
+                    tax_status='inclusive',
+                    sample_count=baseline_data.get('sample_count'),
+                    last_discovery_at=datetime.now(UTC),
                 )
                 session.add(new_baseline)
                 saved_count += 1

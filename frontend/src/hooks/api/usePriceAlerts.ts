@@ -130,6 +130,26 @@ export function useBulkAcknowledge() {
   });
 }
 
+/**
+ * Acknowledge ALL pending alerts for the company
+ */
+export function useAcknowledgeAll() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async ({ notes }: { notes?: string } = {}) => {
+      const response = await api.put<{ acknowledged_count: number }>(
+        '/price-alerts/acknowledge-all',
+        { notes }
+      );
+      return response.data;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.priceAlerts.all });
+    },
+  });
+}
+
 // =============================================================================
 // ADVANCE SURGE SCANNER
 // =============================================================================
@@ -152,6 +172,23 @@ export interface SurgeDetection {
   discount_day_price: number | null;  // Expected discount price if is_discount_day
 }
 
+export interface DiscountDayComplianceItem {
+  theater_name: string;
+  circuit_name: string | null;
+  film_title: string;
+  play_date: string;
+  ticket_type: string;
+  format: string | null;
+  current_price: number;
+  expected_discount_price: number;
+  discount_program_name: string | null;
+  is_compliant: boolean;
+  is_special_event: boolean;
+  is_loyalty_ac: boolean;
+  is_plf: boolean;
+  deviation_percent: number | null;
+}
+
 export interface AdvanceSurgeScanResponse {
   scan_date_from: string;
   scan_date_to: string;
@@ -163,6 +200,8 @@ export interface AdvanceSurgeScanResponse {
   circuits_scanned: string[];
   films_with_surges: string[];
   discount_day_prices_filtered: number;  // Count of prices skipped due to discount day matching
+  discount_day_compliance: DiscountDayComplianceItem[];  // Detailed per-film compliance info
+  discount_day_violations: number;  // Count of non-compliant (excluding special events)
   circuits_with_profiles: string[];  // Circuits that have discovered profiles
 }
 

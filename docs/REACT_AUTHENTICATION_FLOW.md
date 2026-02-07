@@ -1,7 +1,7 @@
 # React Authentication Flow
 
 **Project:** PriceScout React Migration
-**Date:** 2026-01-07
+**Date:** 2026-02-05 (Updated for Entra ID security enhancements)
 
 ---
 
@@ -102,11 +102,17 @@ React App                                         API Server
     │                                                  │
 ```
 
-### 3. Entra ID SSO Flow
+### 3. Entra ID SSO Flow (Updated February 2026)
+
+**Security Features:**
+- CSRF protection via cryptographic state parameter
+- Redirect URL allowlist prevents open redirects
+- Auth code exchange pattern (tokens not exposed in URLs)
+- JWKS signature validation for all tokens
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                      ENTRA ID SSO FLOW                               │
+│                 ENTRA ID SSO FLOW (Secure)                           │
 └─────────────────────────────────────────────────────────────────────┘
 
 User          React App         API Server         Microsoft Entra
@@ -114,10 +120,15 @@ User          React App         API Server         Microsoft Entra
  │ Click SSO      │                  │                    │
  │───────────────>│                  │                    │
  │                │                  │                    │
- │                │ GET /auth/entra/login                 │
+ │                │ GET /auth/entra/login?redirect_url=...            │
  │                │─────────────────>│                    │
  │                │                  │                    │
- │                │ Redirect URL     │                    │
+ │                │                  │ Validate redirect_url against   │
+ │                │                  │ ALLOWED_REDIRECT_DOMAINS        │
+ │                │                  │ Generate CSRF state (32 bytes)  │
+ │                │                  │ Store state -> redirect_url     │
+ │                │                  │                    │
+ │                │ { auth_url }     │                    │
  │                │<─────────────────│                    │
  │                │                  │                    │
  │                │ Redirect to Microsoft                 │
@@ -126,27 +137,44 @@ User          React App         API Server         Microsoft Entra
  │ Login at Microsoft                │                    │
  │──────────────────────────────────────────────────────>│
  │                │                  │                    │
- │ Redirect back with auth code      │                    │
+ │ Redirect back with code + state   │                    │
  │<──────────────────────────────────────────────────────│
  │                │                  │                    │
- │                │ GET /auth/entra/callback?code=xxx    │
+ │                │ GET /auth/entra/callback?code=xxx&state=yyy       │
  │                │─────────────────>│                    │
  │                │                  │                    │
- │                │                  │ Exchange code      │
+ │                │                  │ Validate CSRF state             │
+ │                │                  │ (reject if invalid/expired)     │
+ │                │                  │                    │
+ │                │                  │ Exchange code (MSAL)            │
  │                │                  │───────────────────>│
  │                │                  │                    │
- │                │                  │ User info + tokens │
+ │                │                  │ ID token + access_token         │
  │                │                  │<───────────────────│
  │                │                  │                    │
- │                │                  │ Create/update user │
- │                │                  │ Generate our JWT   │
+ │                │                  │ Validate token sig via JWKS     │
+ │                │                  │ Validate tenant + audience      │
+ │                │                  │ Create session JWT               │
+ │                │                  │ Create auth_code (60s, 1-use)   │
  │                │                  │                    │
- │                │ { access_token } │                    │
+ │                │ Redirect with ?auth_code=zzz          │
+ │                │<─────────────────│                    │
+ │                │                  │                    │
+ │                │ POST /auth/entra/exchange?auth_code=zzz           │
+ │                │─────────────────>│                    │
+ │                │                  │                    │
+ │                │ { access_token, user }                │
  │                │<─────────────────│                    │
  │                │                  │                    │
  │ Dashboard      │                  │                    │
  │<───────────────│                  │                    │
 ```
+
+**Why Auth Code Exchange?**
+The session JWT is never placed in URLs or browser history. The short-lived auth code (60 seconds, single-use) is exchanged server-side for the actual token, preventing:
+- Token leakage via browser history
+- Token leakage via referrer headers
+- Token leakage via server logs
 
 ---
 

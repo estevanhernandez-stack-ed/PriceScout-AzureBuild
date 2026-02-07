@@ -40,7 +40,7 @@ def parse_showtime_for_sort(showtime_str):
             return dt_time(hour % 24, minute % 60)
 
         return dt_time(23, 59, 59)  # Default to end of day
-    except:
+    except Exception:
         return dt_time(23, 59, 59)
 
 
@@ -86,7 +86,7 @@ def parse_runtime_minutes(runtime_str):
             return int(match.group(1)) * 60
 
         return None
-    except:
+    except Exception:
         return None
 
 
@@ -131,7 +131,7 @@ def calculate_outtime(showtime_str, runtime_minutes, use_military_time=False, sh
             if hour == 0:
                 hour = 12
             return f"{hour}:{end_time.minute:02d}"
-    except:
+    except Exception:
         return None
 
 
@@ -797,7 +797,7 @@ def format_showtime(showtime_str, use_military_time=False, show_ampm=True):
             if hour == 0:
                 hour = 12
             return f"{hour}:{time_obj.minute:02d}"
-    except:
+    except Exception:
         return showtime_str
 
 

@@ -34,7 +34,6 @@ import {
 } from '@/components/ui/table';
 import {
   Target,
-  Database,
   Search,
   Building2,
   DollarSign,
@@ -42,7 +41,9 @@ import {
   AlertCircle,
   CheckCircle2,
   TrendingUp,
+  CalendarClock,
 } from 'lucide-react';
+import { useAuthStore } from '@/stores/authStore';
 import {
   useBaselines,
   useEntTelligenceAnalyze,
@@ -145,11 +146,18 @@ export function BaselinesPage() {
     refetchNewFilm();
   };
 
+  // Auth for admin-gating
+  const user = useAuthStore((state) => state.user);
+
   // Stats calculations
   const entStats = entAnalysis?.overall_stats;
   const fandangoStats = fandangoAnalysis?.overall_stats;
-  const hasEntData = (entStats?.total_records ?? 0) > 0;
-  const hasFandangoData = (fandangoStats?.total_records ?? 0) > 0;
+  const totalTheaters = Math.max(entStats?.total_theaters ?? 0, fandangoStats?.total_theaters ?? 0);
+  const totalCircuits = Math.max(entStats?.total_circuits ?? 0, fandangoStats?.total_circuits ?? 0);
+  const latestDate = [entStats?.date_range?.max, fandangoStats?.date_range?.max]
+    .filter(Boolean)
+    .sort()
+    .pop();
 
   return (
     <div className="space-y-6">
@@ -178,32 +186,34 @@ export function BaselinesPage() {
 
         <Card>
           <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-            <CardTitle className="text-sm font-medium">EntTelligence Data</CardTitle>
-            <Database className="h-4 w-4 text-blue-500" />
+            <CardTitle className="text-sm font-medium">Theaters Covered</CardTitle>
+            <Building2 className="h-4 w-4 text-blue-500" />
           </CardHeader>
           <CardContent>
             <div className="text-2xl font-bold">
-              {entAnalysisLoading ? '...' : (entStats?.total_records ?? 0).toLocaleString()}
+              {entAnalysisLoading || fandangoAnalysisLoading ? '...' : totalTheaters.toLocaleString()}
             </div>
             <p className="text-xs text-muted-foreground">
-              {entStats?.total_theaters?.toLocaleString() ?? 0} theaters, {entStats?.total_circuits ?? 0} circuits
+              {totalCircuits} circuits monitored
             </p>
           </CardContent>
         </Card>
 
         <Card>
           <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-            <CardTitle className="text-sm font-medium">Fandango Data</CardTitle>
-            <Building2 className="h-4 w-4 text-orange-500" />
+            <CardTitle className="text-sm font-medium">Data Freshness</CardTitle>
+            <CalendarClock className="h-4 w-4 text-orange-500" />
           </CardHeader>
           <CardContent>
             <div className="text-2xl font-bold">
-              {fandangoAnalysisLoading ? '...' : (fandangoStats?.total_records ?? 0).toLocaleString()}
+              {entAnalysisLoading || fandangoAnalysisLoading
+                ? '...'
+                : latestDate
+                  ? new Date(latestDate + 'T00:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
+                  : 'No data'}
             </div>
             <p className="text-xs text-muted-foreground">
-              {hasFandangoData
-                ? `${fandangoStats?.total_theaters?.toLocaleString() ?? 0} theaters, ${fandangoStats?.total_circuits ?? 0} circuits`
-                : 'Run scrapes to populate'}
+              Last 30 days lookback
             </p>
           </CardContent>
         </Card>
@@ -218,11 +228,7 @@ export function BaselinesPage() {
               ${(fandangoStats?.overall_avg_price ?? entStats?.overall_avg_price)?.toFixed(2) ?? '0.00'}
             </div>
             <p className="text-xs text-muted-foreground">
-              {hasFandangoData && hasEntData
-                ? `Fandango: $${fandangoStats?.overall_avg_price?.toFixed(2)} • Ent: $${entStats?.overall_avg_price?.toFixed(2)}`
-                : hasFandangoData
-                  ? 'From Fandango scrapes'
-                  : 'From EntTelligence data'}
+              Across {totalTheaters.toLocaleString()} theaters
             </p>
           </CardContent>
         </Card>
@@ -236,7 +242,7 @@ export function BaselinesPage() {
           <TabsTrigger value="company-profiles">Company Profiles</TabsTrigger>
           <TabsTrigger value="alternative-content">Alternative Content</TabsTrigger>
           <TabsTrigger value="baseline-details">Baseline Details</TabsTrigger>
-          <TabsTrigger value="data-comparison">Data Sources</TabsTrigger>
+          {user?.is_admin && <TabsTrigger value="data-comparison">Data Sources</TabsTrigger>}
           <TabsTrigger value="coverage-gaps">Coverage Gaps</TabsTrigger>
           <TabsTrigger value="surge">Surge Scanner</TabsTrigger>
           <TabsTrigger value="onboarding">Theater Onboarding</TabsTrigger>
@@ -267,10 +273,12 @@ export function BaselinesPage() {
           <BaselineDetailsPanel />
         </TabsContent>
 
-        {/* Data Source Comparison Tab */}
-        <TabsContent value="data-comparison" className="space-y-4">
-          <DataSourceComparisonPanel />
-        </TabsContent>
+        {/* Data Source Comparison Tab (admin only) */}
+        {user?.is_admin && (
+          <TabsContent value="data-comparison" className="space-y-4">
+            <DataSourceComparisonPanel />
+          </TabsContent>
+        )}
 
         {/* Coverage Gaps Tab */}
         <TabsContent value="coverage-gaps" className="space-y-4">
@@ -415,7 +423,7 @@ export function BaselinesPage() {
                     Advance Surge Price Detection
                   </p>
                   <p className="text-muted-foreground mt-1">
-                    Scan EntTelligence cache data for surge pricing on upcoming dates. Compares advance prices
+                    Scan advance pricing data for surge pricing on upcoming dates. Compares advance prices
                     against your baselines to detect surge pricing before it becomes current. Perfect for
                     identifying surges on special events, holidays, or high-demand films.
                   </p>

@@ -98,7 +98,7 @@ async def sync_enttelligence_data(
         cache_service = get_cache_service()
 
         # Get company_id from user (default to 1 if not set)
-        company_id = 1  # Default company ID
+        company_id = config.DEFAULT_COMPANY_ID
 
         if config.USE_CELERY:
             from app.tasks.sync import sync_enttelligence_task
@@ -139,13 +139,27 @@ async def sync_enttelligence_data(
             }
         )
 
+        # Auto-refresh EntTelligence baselines with drift protection
+        refresh_msg = ""
+        try:
+            from app.baseline_guard import trigger_post_scrape_refresh
+            refresh_result = trigger_post_scrape_refresh(company_id, source="enttelligence")
+            applied = refresh_result.get("applied", 0)
+            new = refresh_result.get("new", 0)
+            flagged = refresh_result.get("flagged", 0)
+            if applied or new or flagged:
+                refresh_msg = f" | Baselines: {applied} updated, {new} new, {flagged} flagged"
+                logger.info(f"[EntSync] Baseline auto-refresh:{refresh_msg}")
+        except Exception as refresh_err:
+            logger.warning(f"[EntSync] Baseline auto-refresh failed: {refresh_err}")
+
         return SyncResponse(
             status=result["status"],
             records_fetched=result["records_fetched"],
             records_cached=result["records_cached"],
             circuits=result["circuits"],
             errors=result["errors"],
-            message=f"Successfully cached {result['records_cached']} prices from EntTelligence"
+            message=f"Successfully cached {result['records_cached']} prices from EntTelligence{refresh_msg}"
         )
 
     except ValueError as e:
@@ -167,7 +181,7 @@ async def get_cache_stats(
     """
     try:
         cache_service = get_cache_service()
-        company_id = 1  # Default company ID (User model doesn't have company_id)
+        company_id = config.DEFAULT_COMPANY_ID
 
         stats = cache_service.get_cache_stats(company_id)
 
@@ -197,7 +211,7 @@ async def lookup_cached_prices(
     """
     try:
         cache_service = get_cache_service()
-        company_id = 1  # Default company ID (User model doesn't have company_id)
+        company_id = config.DEFAULT_COMPANY_ID
 
         results = cache_service.lookup_cached_prices(
             showtime_keys=request.showtime_keys,
@@ -250,7 +264,7 @@ async def cleanup_expired_cache(
     """
     try:
         cache_service = get_cache_service()
-        company_id = 1  # Default company ID (User model doesn't have company_id)
+        company_id = config.DEFAULT_COMPANY_ID
 
         deleted = cache_service.cleanup_expired(company_id)
 
@@ -283,7 +297,7 @@ async def get_sync_status(
     """
     try:
         cache_service = get_cache_service()
-        company_id = 1  # Default company ID (User model doesn't have company_id)
+        company_id = config.DEFAULT_COMPANY_ID
 
         stats = cache_service.get_cache_stats(company_id)
 

@@ -167,8 +167,8 @@ export interface PriceHistory {
 // Price Alert Types
 // ============================================================================
 
-/** Alert types */
-export type AlertType = 'PriceIncrease' | 'PriceDecrease' | 'NewOffering' | string;
+/** Alert types (snake_case values stored in database) */
+export type AlertType = 'price_increase' | 'price_decrease' | 'surge_detected' | 'new_offering' | 'discontinued' | 'discount_day_overcharge' | string;
 
 /** Price alert model */
 export interface PriceAlert {
@@ -661,6 +661,33 @@ export interface ScrapeJobQueryParams {
   date_to?: ISODateTimeString;
   limit?: number;
   offset?: number;
+}
+
+// ============================================================================
+// Tax Configuration Types
+// ============================================================================
+
+/** Tax configuration for estimated tax adjustment on EntTelligence prices */
+export interface TaxConfig {
+  enabled: boolean;
+  /** Default tax rate as decimal (e.g., 0.075 = 7.5%) */
+  default_rate: number;
+  /** Per-state tax rate overrides, keyed by 2-letter state code */
+  per_state: Record<string, number>;
+}
+
+/** Tax config API response */
+export interface TaxConfigResponse {
+  enabled: boolean;
+  default_rate: number;
+  per_state: Record<string, number>;
+}
+
+/** Tax config update request (partial update supported) */
+export interface TaxConfigUpdateRequest {
+  enabled?: boolean;
+  default_rate?: number;
+  per_state?: Record<string, number>;
 }
 
 /** Query parameters for circuit benchmarks */

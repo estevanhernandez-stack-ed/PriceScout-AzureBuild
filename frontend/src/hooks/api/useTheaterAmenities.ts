@@ -182,7 +182,7 @@ export function useTheaterAmenities(filters: AmenitiesFilters = {}) {
  */
 export function useTheaterAmenity(id: number | null, options?: { enabled?: boolean }) {
   return useQuery({
-    queryKey: theaterAmenitiesKeys.detail(id!),
+    queryKey: theaterAmenitiesKeys.detail(id ?? 0),
     queryFn: async () => {
       const response = await api.get<TheaterAmenities>(`/theater-amenities/${id}`);
       return response.data;
@@ -317,10 +317,10 @@ export function useScreenCountEstimate(
   options?: { enabled?: boolean }
 ) {
   return useQuery({
-    queryKey: theaterAmenitiesKeys.screenCounts(theaterName!, lookbackDays),
+    queryKey: theaterAmenitiesKeys.screenCounts(theaterName ?? '', lookbackDays),
     queryFn: async () => {
       const response = await api.get<ScreenCountEstimate>(
-        `/theater-amenities/screen-counts/${encodeURIComponent(theaterName!)}?lookback_days=${lookbackDays}`
+        `/theater-amenities/screen-counts/${encodeURIComponent(theaterName ?? '')}?lookback_days=${lookbackDays}`
       );
       return response.data;
     },

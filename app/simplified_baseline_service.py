@@ -23,13 +23,19 @@ from decimal import Decimal
 from typing import Optional, Tuple, List, Dict, Any
 from collections import defaultdict
 import json
+import re
 
-from sqlalchemy import and_, or_, func
+from sqlalchemy import and_, or_, func, case
 from sqlalchemy.orm import Session
 
 from app.db_models import (
     PriceBaseline, CompanyProfile, DiscountDayProgram,
     TheaterMetadata, EntTelligencePriceCache
+)
+from api.services.tax_estimation import (
+    get_tax_config as _get_tax_config,
+    get_tax_rate_for_theater,
+    get_theater_state,
 )
 
 
@@ -39,6 +45,139 @@ KNOWN_CIRCUITS = [
     'B&B Theatres', 'LOOK Cinemas', 'Studio Movie Grill',
     'Alamo Drafthouse', 'Harkins', 'Landmark'
 ]
+
+# Normalize full corporation names from EntTelligence metadata to the short
+# circuit names used by discount programs and company profiles.  Movie Tavern
+# is a Marcus brand and shares the same discount/baseline programs.
+CIRCUIT_NAME_NORMALIZE: dict[str, str] = {
+    'Marcus Theatres Corporation': 'Marcus',
+    'AMC Entertainment Inc': 'AMC',
+    'Regal Entertainment Group': 'Regal',
+    'Cinemark Theatres': 'Cinemark',
+    'B & B Theatres': 'B&B Theatres',
+    'Emagine Entertainment': 'Emagine',
+    'Harkins Theatres': 'Harkins',
+    'Malco Theatres': 'Malco',
+    'Galaxy Theatres': 'Galaxy',
+    'Megaplex Theatres': 'Megaplex',
+    'Classic Cinemas': 'Classic',
+    'ShowBiz Cinemas': 'ShowBiz',
+    'ACX Cinemas': 'ACX',
+    'Landmark Theatres': 'Landmark',
+    'Alamo Drafthouse': 'Alamo Drafthouse',
+    'LOOK Cinemas': 'LOOK Cinemas',
+    'Studio Movie Grill': 'Studio Movie Grill',
+    'Flix Brewhouse': 'Flix Brewhouse',
+    # Movie Tavern is a Marcus brand — same discount programs apply
+    'Movie Tavern': 'Marcus',
+}
+
+
+# Normalize legacy / inconsistent daypart values to canonical forms.
+# Canonical dayparts: Matinee, Twilight, Prime, Late Night
+# NOTE: 'Standard' is NOT a real daypart — it means the theater has flat
+# pricing with no time-based variation.  find_baseline() treats 'Standard'
+# as a wildcard fallback (similar to NULL daypart).
+DAYPART_NORMALIZE: dict[str, str] = {
+    'evening': 'Prime',
+    'prime': 'Prime',
+    'matinee': 'Matinee',
+    'late': 'Late Night',
+    'late night': 'Late Night',
+    'late_night': 'Late Night',
+    'twilight': 'Twilight',
+}
+
+
+def normalize_daypart(raw: Optional[str]) -> Optional[str]:
+    """Normalize a daypart value to the canonical form.
+
+    Handles case-insensitive matching of legacy values like 'evening' → 'Prime'.
+    Returns None unchanged.
+    """
+    if not raw:
+        return raw
+    return DAYPART_NORMALIZE.get(raw.lower(), raw)
+
+
+# Normalize ticket type typos and case inconsistencies.
+# Only normalizes clear-cut duplicates — does NOT merge Adult/General Admission
+# as those have different price points at the same theater.
+TICKET_TYPE_NORMALIZE: dict[str, str] = {
+    'early bird': 'Early Bird',
+    'early': 'Early Bird',
+    'lfx early bird': 'Early Bird',
+    'matine': 'Matinee',
+    'matine prime': 'Matinee',
+    'tues mat': 'Matinee',
+    'wednesday 50off': 'Bargain Wednesday',
+    'bargain wednesday': 'Bargain Wednesday',
+    'general': 'General Admission',
+}
+
+
+def normalize_ticket_type(raw: str) -> str:
+    """Normalize a ticket type to canonical form.
+
+    Fixes typos and case inconsistencies. Does not merge semantically
+    different types like Adult vs General Admission.
+    """
+    if not raw:
+        return raw
+    return TICKET_TYPE_NORMALIZE.get(raw.lower(), raw)
+
+
+# Normalize format strings across sources.
+# Showings table uses 'Standard'; EntTelligence and baselines use '2D'.
+# Both mean the same thing — standard digital projection (not 3D, IMAX, etc.).
+FORMAT_NORMALIZE: dict[str, str] = {
+    'standard': '2D',
+}
+
+
+def normalize_format(raw: Optional[str]) -> Optional[str]:
+    """Normalize a format value to the canonical form.
+
+    'Standard' (from Fandango scraper) → '2D' (baseline canonical).
+    Returns None unchanged.
+    """
+    if not raw:
+        return raw
+    return FORMAT_NORMALIZE.get(raw.lower(), raw)
+
+
+# Common low-value terms stripped from theater names for fuzzy matching.
+_THEATER_STRIP_TERMS = sorted([
+    'cinemas', 'cinema', 'cine', 'movies', 'theatres', 'theatre', 'theater',
+    'showplace', 'imax', 'dolby', 'ultrascreen', 'xd', 'superscreen',
+    'dine-in',
+], key=len, reverse=True)
+_THEATER_STRIP_PATTERN = re.compile(
+    r'\b(' + '|'.join(re.escape(t) for t in _THEATER_STRIP_TERMS) + r')\b',
+    re.IGNORECASE,
+)
+
+
+def normalize_theater_name(name: str) -> str:
+    """Strip common cinema terms for fuzzy matching.
+
+    Used as a fallback in find_baseline() when an exact theater name match
+    fails — e.g. 'Marcus Arnold Cine' matches 'Marcus Arnold Cinemas'.
+    """
+    stripped = _THEATER_STRIP_PATTERN.sub('', name.lower())
+    stripped = re.sub(r'[^\w\s/-]', '', stripped)
+    return re.sub(r'\s+', ' ', stripped).strip()
+
+
+def normalize_circuit_name(raw: str) -> str:
+    """Normalize a circuit name to the canonical short form.
+
+    Handles both full corporation names from EntTelligence metadata and
+    brand prefixes from pattern matching.  Movie Tavern maps to Marcus.
+    """
+    if raw in CIRCUIT_NAME_NORMALIZE:
+        return CIRCUIT_NAME_NORMALIZE[raw]
+    return raw
 
 
 class SimplifiedBaselineService:
@@ -55,41 +194,55 @@ class SimplifiedBaselineService:
     def __init__(self, session: Session, company_id: int):
         self.session = session
         self.company_id = company_id
+        self._theater_norm_cache: Optional[Dict[str, str]] = None
 
-    def find_baseline(
+    def _get_theater_norm_map(self) -> Dict[str, str]:
+        """Build a map of normalized_name → canonical theater_name (lazy, cached)."""
+        if self._theater_norm_cache is not None:
+            return self._theater_norm_cache
+
+        names = self.session.query(PriceBaseline.theater_name).filter(
+            PriceBaseline.company_id == self.company_id,
+        ).distinct().all()
+
+        # Map: normalized → first theater name seen (canonical)
+        self._theater_norm_cache = {}
+        for (name,) in names:
+            norm = normalize_theater_name(name)
+            if norm not in self._theater_norm_cache:
+                self._theater_norm_cache[norm] = name
+        return self._theater_norm_cache
+
+    # Source preference: Fandango prices are customer-facing (tax-inclusive,
+    # format-aware) and should always be preferred over EntTelligence when
+    # both exist for the same theater.  EntTelligence prices have estimated
+    # tax applied which introduces ~10-20% systematic error.
+    _SOURCE_PRIORITY = case(
+        (PriceBaseline.source == 'fandango', 0),
+        else_=1,
+    )
+
+    def _find_baseline_for_theater(
         self,
         theater_name: str,
         ticket_type: str,
-        format_type: Optional[str] = None,
-        daypart: Optional[str] = None
+        format_type: Optional[str],
+        daypart: Optional[str],
     ) -> Optional[PriceBaseline]:
-        """
-        Find the most specific matching baseline for the given parameters.
+        """Run the matching hierarchy for a specific theater name.
 
-        Matching hierarchy (tries in order until found):
-        1. Exact match: theater + ticket + format + daypart
-        2. Any daypart: theater + ticket + format + NULL
-        3. Any format/daypart: theater + ticket + NULL + NULL
-
-        Args:
-            theater_name: Theater name
-            ticket_type: Ticket type (Adult, Child, Senior, etc.)
-            format_type: Format (Standard, IMAX, Dolby, etc.) or None
-            daypart: Daypart (matinee, evening, late_night) or None
-
-        Returns:
-            Most specific matching PriceBaseline or None
+        At each level, prefers Fandango baselines over EntTelligence when
+        both sources provide a match for the same dimensions.
         """
         base_query = self.session.query(PriceBaseline).filter(
             PriceBaseline.company_id == self.company_id,
             PriceBaseline.theater_name == theater_name,
             PriceBaseline.ticket_type == ticket_type,
-            # Only consider active baselines (no end date or end date in future)
             or_(
                 PriceBaseline.effective_to.is_(None),
                 PriceBaseline.effective_to >= date.today()
             )
-        )
+        ).order_by(self._SOURCE_PRIORITY)
 
         # Level 1: Exact match
         baseline = base_query.filter(
@@ -99,7 +252,7 @@ class SimplifiedBaselineService:
         if baseline:
             return baseline
 
-        # Level 2: Match format, any daypart
+        # Level 2: Match format, any daypart (NULL = flat pricing / wildcard)
         baseline = base_query.filter(
             PriceBaseline.format == format_type,
             PriceBaseline.daypart.is_(None)
@@ -123,11 +276,64 @@ class SimplifiedBaselineService:
 
         return baseline
 
+    def find_baseline(
+        self,
+        theater_name: str,
+        ticket_type: str,
+        format_type: Optional[str] = None,
+        daypart: Optional[str] = None
+    ) -> Optional[PriceBaseline]:
+        """
+        Find the most specific matching baseline for the given parameters.
+
+        Matching hierarchy (tries in order until found):
+        1. Exact match: theater + ticket + format + daypart
+        2. Any daypart: theater + ticket + format + NULL
+        3. Any format/daypart: theater + ticket + NULL + NULL
+        4. Match daypart, any format
+
+        If no match on the exact theater name, falls back to a normalized
+        name search (strips 'Cinema'/'Cinemas'/'Cine'/etc.) to handle
+        cross-source naming differences.
+
+        Args:
+            theater_name: Theater name
+            ticket_type: Ticket type (Adult, Child, Senior, etc.)
+            format_type: Format (Standard, IMAX, Dolby, etc.) or None
+            daypart: Daypart (Matinee, Prime, Late Night, Twilight) or None
+
+        Returns:
+            Most specific matching PriceBaseline or None
+        """
+        daypart = normalize_daypart(daypart)
+        ticket_type = normalize_ticket_type(ticket_type)
+        format_type = normalize_format(format_type)
+
+        # Try exact theater name first
+        baseline = self._find_baseline_for_theater(
+            theater_name, ticket_type, format_type, daypart
+        )
+        if baseline:
+            return baseline
+
+        # Fallback: look up the normalized name to find a variant
+        norm = normalize_theater_name(theater_name)
+        norm_map = self._get_theater_norm_map()
+        canonical = norm_map.get(norm)
+        if canonical and canonical != theater_name:
+            return self._find_baseline_for_theater(
+                canonical, ticket_type, format_type, daypart
+            )
+
+        return None
+
     def get_circuit_name(self, theater_name: str) -> Optional[str]:
         """
         Extract circuit name from theater name.
 
         First checks TheaterMetadata, then pattern matching.
+        Always normalizes to the canonical short form so that discount
+        programs and company profiles match correctly.
         """
         # Check metadata first
         metadata = self.session.query(TheaterMetadata).filter(
@@ -136,13 +342,13 @@ class SimplifiedBaselineService:
         ).first()
 
         if metadata and metadata.circuit_name:
-            return metadata.circuit_name
+            return normalize_circuit_name(metadata.circuit_name)
 
         # Pattern matching fallback
         theater_lower = theater_name.lower()
         for circuit in KNOWN_CIRCUITS:
             if theater_lower.startswith(circuit.lower()):
-                return circuit
+                return normalize_circuit_name(circuit)
 
         return None
 
@@ -168,26 +374,29 @@ class SimplifiedBaselineService:
             Tuple of (is_discount_day, program) where program is the
             DiscountDayProgram if applicable, None otherwise
         """
+        daypart = normalize_daypart(daypart)
         circuit_name = self.get_circuit_name(theater_name)
         if not circuit_name:
             return False, None
 
         day_of_week = check_date.weekday()  # 0=Monday, 6=Sunday
 
-        # Find active discount program for this circuit and day
-        program = self.session.query(DiscountDayProgram).filter(
+        # Find active discount programs for this circuit and day (may be
+        # multiple — e.g. AMC has separate programs for different dayparts).
+        programs = self.session.query(DiscountDayProgram).filter(
             DiscountDayProgram.company_id == self.company_id,
             DiscountDayProgram.circuit_name == circuit_name,
             DiscountDayProgram.day_of_week == day_of_week,
             DiscountDayProgram.is_active == True
-        ).first()
+        ).all()
 
-        if not program:
+        if not programs:
             return False, None
 
-        # Check if program applies to the given parameters
-        if program.applies_to(ticket_type, format_type, daypart):
-            return True, program
+        # Check each matching program — return the first one that applies
+        for program in programs:
+            if program.applies_to(ticket_type, format_type, daypart):
+                return True, program
 
         return False, None
 
@@ -444,8 +653,16 @@ class SimplifiedBaselineService:
         adjusted_price = current_price
         if baseline.tax_status == 'exclusive' and baseline.source == 'enttelligence':
             # Assume current price is inclusive, convert baseline to inclusive for comparison
+            # Use per-theater tax rate instead of hardcoded default
+            tax_cfg = _get_tax_config(self.company_id)
+            theater_st = get_theater_state(self.company_id, theater_name)
+            theater_tax_rate = Decimal(str(get_tax_rate_for_theater(
+                tax_cfg, theater_st, theater_name=theater_name
+            )))
+            if theater_tax_rate <= 0:
+                theater_tax_rate = Decimal('0.075')
             adjusted_baseline = self.adjust_for_tax_status(
-                baseline.baseline_price, 'exclusive', 'inclusive'
+                baseline.baseline_price, 'exclusive', 'inclusive', tax_rate=theater_tax_rate
             )
         else:
             adjusted_baseline = baseline.baseline_price

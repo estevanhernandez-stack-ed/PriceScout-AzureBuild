@@ -12,6 +12,7 @@ import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
+import { Switch } from '@/components/ui/switch';
 import {
   Table,
   TableBody,
@@ -29,17 +30,23 @@ import {
   TrendingDown,
   TrendingUp,
   Info,
+  Receipt,
 } from 'lucide-react';
-import { useCompareDataSources, type PriceComparisonItem } from '@/hooks/api';
+import { useCompareDataSources, useTaxConfig, type PriceComparisonItem } from '@/hooks/api';
 
 export function DataSourceComparisonPanel() {
   const [theaterFilter, setTheaterFilter] = useState('');
   const [runComparison, setRunComparison] = useState(false);
+  const [applyTax, setApplyTax] = useState(true);
+
+  const { data: taxConfig } = useTaxConfig();
+  const taxConfigured = taxConfig?.enabled ?? false;
 
   const { data: comparison, isLoading } = useCompareDataSources({
     theaterFilter: theaterFilter || undefined,
     minSamples: 3,
     limit: 200,
+    applyTax,
     enabled: runComparison,
   });
 
@@ -142,6 +149,26 @@ export function DataSourceComparisonPanel() {
               )}
             </Button>
           </div>
+
+          {/* Tax Toggle */}
+          <div className="flex items-center justify-between rounded-lg border p-3 bg-muted/30">
+            <div className="flex items-center gap-2">
+              <Receipt className="h-4 w-4 text-green-600" />
+              <div>
+                <Label className="text-sm font-medium">Apply Estimated Tax</Label>
+                <p className="text-xs text-muted-foreground">
+                  {taxConfigured
+                    ? `Adjust EntTelligence prices with estimated tax (default: ${((taxConfig?.default_rate ?? 0) * 100).toFixed(1)}%)`
+                    : 'Configure tax rates in the Tax Configuration panel below to enable'}
+                </p>
+              </div>
+            </div>
+            <Switch
+              checked={applyTax}
+              onCheckedChange={setApplyTax}
+              disabled={!taxConfigured}
+            />
+          </div>
         </CardContent>
       </Card>
 
@@ -228,6 +255,12 @@ export function DataSourceComparisonPanel() {
             <CardContent>
               {comparison.comparisons.length > 0 ? (
                 <div className="rounded-md border max-h-[500px] overflow-auto">
+                  {comparison.tax_adjustment_applied && (
+                    <div className="px-3 py-2 bg-green-50 dark:bg-green-950/20 border-b text-xs text-green-700 dark:text-green-300 flex items-center gap-1">
+                      <Receipt className="h-3 w-3" />
+                      Tax adjustment applied (default rate: {((comparison.default_tax_rate ?? 0) * 100).toFixed(1)}%)
+                    </div>
+                  )}
                   <Table>
                     <TableHeader>
                       <TableRow>
@@ -235,43 +268,70 @@ export function DataSourceComparisonPanel() {
                         <TableHead>Type</TableHead>
                         <TableHead>Format</TableHead>
                         <TableHead className="text-right">EntTelligence</TableHead>
+                        {comparison.tax_adjustment_applied && (
+                          <TableHead className="text-right">+ Tax</TableHead>
+                        )}
                         <TableHead className="text-right">Fandango</TableHead>
                         <TableHead className="text-right">Difference</TableHead>
+                        {comparison.tax_adjustment_applied && (
+                          <TableHead className="text-right">Tax Rate</TableHead>
+                        )}
                       </TableRow>
                     </TableHeader>
                     <TableBody>
-                      {comparison.comparisons.map((item: PriceComparisonItem, i: number) => (
-                        <TableRow key={i}>
-                          <TableCell className="font-medium max-w-[200px] truncate">
-                            {item.theater_name}
-                          </TableCell>
-                          <TableCell>{item.ticket_type}</TableCell>
-                          <TableCell>{item.format || '2D'}</TableCell>
-                          <TableCell className="text-right font-mono">
-                            ${item.enttelligence_price.toFixed(2)}
-                            <span className="text-xs text-muted-foreground ml-1">
-                              ({item.ent_sample_count})
-                            </span>
-                          </TableCell>
-                          <TableCell className="text-right font-mono font-bold">
-                            ${item.fandango_baseline.toFixed(2)}
-                          </TableCell>
-                          <TableCell className="text-right">
-                            <span
-                              className={
-                                item.difference_percent < -5
-                                  ? 'text-blue-600 font-medium'
-                                  : item.difference_percent > 5
-                                  ? 'text-red-600 font-medium'
-                                  : 'text-muted-foreground'
-                              }
-                            >
-                              {item.difference_percent > 0 ? '+' : ''}
-                              {item.difference_percent.toFixed(1)}%
-                            </span>
-                          </TableCell>
-                        </TableRow>
-                      ))}
+                      {comparison.comparisons.map((item: PriceComparisonItem, i: number) => {
+                        // Use adjusted difference if tax applied, otherwise raw
+                        const displayDiffPct = comparison.tax_adjustment_applied && item.adjusted_difference_percent != null
+                          ? item.adjusted_difference_percent
+                          : item.difference_percent;
+
+                        return (
+                          <TableRow key={i}>
+                            <TableCell className="font-medium max-w-[200px] truncate">
+                              {item.theater_name}
+                            </TableCell>
+                            <TableCell>{item.ticket_type}</TableCell>
+                            <TableCell>{item.format || '2D'}</TableCell>
+                            <TableCell className="text-right font-mono">
+                              ${item.enttelligence_price.toFixed(2)}
+                              <span className="text-xs text-muted-foreground ml-1">
+                                ({item.ent_sample_count})
+                              </span>
+                            </TableCell>
+                            {comparison.tax_adjustment_applied && (
+                              <TableCell className="text-right font-mono text-green-700 dark:text-green-400">
+                                {item.ent_price_tax_adjusted != null
+                                  ? `$${item.ent_price_tax_adjusted.toFixed(2)}`
+                                  : '—'}
+                              </TableCell>
+                            )}
+                            <TableCell className="text-right font-mono font-bold">
+                              ${item.fandango_baseline.toFixed(2)}
+                            </TableCell>
+                            <TableCell className="text-right">
+                              <span
+                                className={
+                                  displayDiffPct < -5
+                                    ? 'text-blue-600 font-medium'
+                                    : displayDiffPct > 5
+                                    ? 'text-red-600 font-medium'
+                                    : 'text-muted-foreground'
+                                }
+                              >
+                                {displayDiffPct > 0 ? '+' : ''}
+                                {displayDiffPct.toFixed(1)}%
+                              </span>
+                            </TableCell>
+                            {comparison.tax_adjustment_applied && (
+                              <TableCell className="text-right text-xs text-muted-foreground font-mono">
+                                {item.tax_rate_applied != null
+                                  ? `${(item.tax_rate_applied * 100).toFixed(1)}%`
+                                  : '—'}
+                              </TableCell>
+                            )}
+                          </TableRow>
+                        );
+                      })}
                     </TableBody>
                   </Table>
                 </div>

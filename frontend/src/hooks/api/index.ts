@@ -14,7 +14,12 @@ export {
   usePriceCheckSummary,
   usePriceComparison,
 } from './usePriceChecks';
-export * from './useAnalytics';
+export {
+  useDashboardStats,
+  useScrapeActivity,
+  type DashboardStats,
+  type ScrapeActivityEntry,
+} from './useAnalytics';
 
 // Price Alerts
 export {
@@ -24,10 +29,12 @@ export {
   usePriceAlert,
   useAcknowledgeAlert,
   useBulkAcknowledge,
+  useAcknowledgeAll,
   useAdvanceSurgeScan,
   useNewFilmMonitor,
   type SurgeDetection,
   type AdvanceSurgeScanResponse,
+  type DiscountDayComplianceItem,
   type NewFilmSurge,
   type NewFilmSurgeResponse,
 } from './usePriceAlerts';
@@ -50,8 +57,17 @@ export {
   useSearchTheatersFandango,
   useSearchTheatersCache,
   useLiveScrapeJobs,
+  useTriggerVerification,
+  useVerificationResults,
+  useCompareShowtimes,
   type Showing,
   type TheaterSearchResult,
+  type PriceVerificationItem,
+  type VerificationSummary,
+  type VerificationResponse,
+  type ShowtimeMatchItem,
+  type TheaterVerificationSummary,
+  type CompareShowtimesResponse,
 } from './useScrapes';
 
 // Users
@@ -92,10 +108,21 @@ export {
 export {
   usePresales,
   usePresaleFilms,
+  usePresaleCircuits,
   usePresaleTrajectory,
   usePresaleVelocity,
   usePresaleComparison,
+  usePresaleCompliance,
+  usePresaleHeatmapData,
   useSyncPresales,
+  type MarketScope,
+  type PresaleFilm,
+  type PresaleCircuit,
+  type ComplianceResponse,
+  type FilmComplianceData,
+  type CircuitComplianceInfo,
+  type PresaleHeatmapTheater,
+  type PresaleHeatmapResponse,
 } from './usePresales';
 
 // Cache Management
@@ -310,6 +337,15 @@ export {
   type DataCoverageResponse,
 } from './useCompanyProfiles';
 
+// Gap Fill (Baseline Gap Filling)
+export {
+  useGapFillProposals,
+  useApplyGapFills,
+  type ProposedGapFill,
+  type GapFillProposals,
+  type GapFillApplyResult,
+} from './useGapFill';
+
 // Coverage Gaps
 export {
   useTheaterCoverage,
@@ -440,3 +476,66 @@ export {
   type ScreenCountEstimate,
   type AmenitiesFilters,
 } from './useTheaterAmenities';
+
+// Settings (Tax Config, Market Scope, Name Mapping, Diagnostics)
+export {
+  useTaxConfig,
+  useUpdateTaxConfig,
+  useMarketScope,
+  useNameMapping,
+  useSystemDiagnostics,
+  settingsKeys,
+  type DirectorBreakdown,
+  type MatchDiagnostics,
+  type MarketScopeResponse,
+  type NameAlias,
+  type NameMappingResponse,
+  type DataSourceInfo,
+  type BaselineSummaryItem,
+  type SystemDiagnosticsResponse,
+} from './useSettings';
+
+// Presale Watches
+export {
+  usePresaleWatches,
+  useCreatePresaleWatch,
+  useUpdatePresaleWatch,
+  useDeletePresaleWatch,
+  usePresaleWatchNotifications,
+  useMarkNotificationRead,
+  type PresaleWatch,
+  type PresaleWatchCreate,
+  type PresaleWatchUpdate,
+  type PresaleWatchNotification,
+} from './usePresaleWatches';
+
+// Zero Showtime Analysis
+export {
+  useZeroShowtimeAnalysis,
+  useMarkTheaterStatus,
+  type ZeroShowtimeTheater,
+  type ZeroShowtimeAnalysis,
+  type MarkTheaterStatusRequest,
+  type MarkTheaterStatusResponse,
+} from './useZeroShowtimes';
+
+// Demand Lookup (Presale fill rates)
+export {
+  useDemandLookup,
+  demandKey,
+  getFillRateColor,
+  getFillRateBadgeVariant,
+  computeDemandSummary,
+  buildDemandMap,
+  type DemandMetric,
+  type DemandSummary,
+} from './useDemandLookup';
+
+// Box Office Board
+export {
+  useBoxOfficeBoard,
+  downloadBoardHtml,
+  downloadBoardImage,
+  RESOLUTION_LABELS,
+  type BoardResolution,
+} from './useBoxOfficeBoard';

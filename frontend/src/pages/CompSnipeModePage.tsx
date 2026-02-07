@@ -240,12 +240,12 @@ export function CompSnipeModePage() {
       }));
       setTheaters(homeTheaters);
     }
-  }, [user, marketTheaters, theaters.length]);
+  }, [user, marketTheaters, theaters, searchCacheMutation]);
 
   // Handle stale job IDs (e.g., server restarted and job no longer exists)
   useEffect(() => {
     if (jobStatusError && jobId) {
-      const isNotFound = (jobStatusError as any)?.response?.status === 404;
+      const isNotFound = jobStatusError && 'response' in jobStatusError && (jobStatusError as { response?: { status?: number } }).response?.status === 404;
       if (isNotFound) {
         console.log('[CompSnipe] Job not found (server may have restarted), clearing stale job ID:', jobId);
         localStorage.removeItem(COMPSNIPE_JOB_STORAGE_KEY);

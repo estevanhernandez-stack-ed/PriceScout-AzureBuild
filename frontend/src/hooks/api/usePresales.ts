@@ -43,10 +43,19 @@ export interface PresaleFilm {
   film_title: string;
   release_date: string;
   total_circuits: number;
+  circuit_name: string | null; // populated for single-circuit films or when filtered by circuit
   current_tickets: number;
   current_revenue: number;
   days_until_release: number;
   latest_snapshot: string;
+}
+
+export interface PresaleCircuit {
+  circuit_name: string;
+  total_films: number;
+  total_tickets: number;
+  total_revenue: number;
+  snapshot_count: number;
 }
 
 export interface VelocityMetrics {
@@ -74,6 +83,8 @@ export interface CircuitPresaleComparison {
   }[];
 }
 
+export type MarketScope = 'our_markets' | 'full';
+
 export interface PresaleFilters {
   film_title?: string;
   circuit_name?: string;
@@ -81,6 +92,7 @@ export interface PresaleFilters {
   days_before_release?: number;
   limit?: number;
   offset?: number;
+  market_scope?: MarketScope;
 }
 
 // ============================================================================
@@ -91,8 +103,9 @@ export interface PresaleFilters {
  * Fetch presale snapshots with optional filtering
  */
 export function usePresales(filters: PresaleFilters = {}) {
+  const scope = filters.market_scope || 'our_markets';
   return useQuery({
-    queryKey: queryKeys.presales.list(filters),
+    queryKey: [...queryKeys.presales.list(filters), scope],
     queryFn: async () => {
       const params = new URLSearchParams();
       if (filters.film_title) params.append('film_title', filters.film_title);
@@ -103,6 +116,7 @@ export function usePresales(filters: PresaleFilters = {}) {
       }
       if (filters.limit) params.append('limit', String(filters.limit));
       if (filters.offset) params.append('offset', String(filters.offset));
+      params.append('market_scope', scope);
 
       const response = await api.get<PresaleSnapshot[]>(
         `/presales?${params.toString()}`
@@ -113,30 +127,50 @@ export function usePresales(filters: PresaleFilters = {}) {
 }
 
 /**
- * Fetch all films with presale data
+ * Fetch all films with presale data.
+ * Optionally filter by circuit_name to see a specific circuit's films.
  */
-export function usePresaleFilms() {
+export function usePresaleFilms(circuitFilter?: string, marketScope: MarketScope = 'our_markets') {
   return useQuery({
-    queryKey: ['presales', 'films'],
+    queryKey: ['presales', 'films', circuitFilter || '__all__', marketScope],
     queryFn: async () => {
-      const response = await api.get<PresaleFilm[]>('/presales/films');
+      const params = new URLSearchParams();
+      if (circuitFilter) params.append('circuit_name', circuitFilter);
+      params.append('market_scope', marketScope);
+      const response = await api.get<PresaleFilm[]>(`/presales/films?${params.toString()}`);
       return response.data;
     },
   });
 }
 
 /**
+ * Fetch all circuits with presale data and aggregate stats.
+ */
+export function usePresaleCircuits(marketScope: MarketScope = 'our_markets') {
+  return useQuery({
+    queryKey: ['presales', 'circuits', marketScope],
+    queryFn: async () => {
+      const response = await api.get<PresaleCircuit[]>(
+        `/presales/circuits?market_scope=${marketScope}`
+      );
+      return response.data;
+    },
+    staleTime: 5 * 60 * 1000,
+  });
+}
+
+/**
  * Fetch presale trajectory for a specific film
  */
-export function usePresaleTrajectory(filmTitle: string, circuitName?: string) {
+export function usePresaleTrajectory(filmTitle: string, circuitName?: string, marketScope: MarketScope = 'our_markets') {
   return useQuery({
-    queryKey: queryKeys.presales.trajectory(filmTitle, circuitName || 'all'),
+    queryKey: [...queryKeys.presales.trajectory(filmTitle, circuitName || 'all'), marketScope],
     queryFn: async () => {
-      const params = circuitName
-        ? `?circuit_name=${encodeURIComponent(circuitName)}`
-        : '';
+      const params = new URLSearchParams();
+      if (circuitName) params.append('circuit_name', circuitName);
+      params.append('market_scope', marketScope);
       const response = await api.get<PresaleTrajectory>(
-        `/presales/${encodeURIComponent(filmTitle)}${params}`
+        `/presales/${encodeURIComponent(filmTitle)}?${params.toString()}`
       );
       return response.data;
     },
@@ -147,12 +181,12 @@ export function usePresaleTrajectory(filmTitle: string, circuitName?: string) {
 /**
  * Fetch velocity metrics for a film
  */
-export function usePresaleVelocity(filmTitle: string) {
+export function usePresaleVelocity(filmTitle: string, marketScope: MarketScope = 'our_markets') {
   return useQuery({
-    queryKey: queryKeys.presales.velocity({ filmTitle }),
+    queryKey: [...queryKeys.presales.velocity({ filmTitle }), marketScope],
     queryFn: async () => {
       const response = await api.get<VelocityMetrics[]>(
-        `/presales/velocity/${encodeURIComponent(filmTitle)}`
+        `/presales/velocity/${encodeURIComponent(filmTitle)}?market_scope=${marketScope}`
       );
       return response.data;
     },
@@ -163,15 +197,16 @@ export function usePresaleVelocity(filmTitle: string) {
 /**
  * Compare presales across circuits for a film
  */
-export function usePresaleComparison(filmTitle: string, circuits?: string[]) {
+export function usePresaleComparison(filmTitle: string, circuits?: string[], marketScope: MarketScope = 'our_markets') {
   return useQuery({
-    queryKey: ['presales', 'compare', filmTitle, circuits?.join(',')],
+    queryKey: ['presales', 'compare', filmTitle, circuits?.join(','), marketScope],
     queryFn: async () => {
       const params = new URLSearchParams();
       params.append('film_title', filmTitle);
       if (circuits && circuits.length > 0) {
         params.append('circuits', circuits.join(','));
       }
+      params.append('market_scope', marketScope);
 
       const response = await api.get<CircuitPresaleComparison>(
         `/presales/compare?${params.toString()}`
@@ -179,6 +214,112 @@ export function usePresaleComparison(filmTitle: string, circuits?: string[]) {
       return response.data;
     },
     enabled: !!filmTitle,
+  });
+}
+
+// ============================================================================
+// Compliance Types & Hook
+// ============================================================================
+
+export interface CircuitComplianceInfo {
+  days_posted_ahead: number;
+  total_showtimes: number;
+  total_theaters: number;
+  earliest_showtime_date: string | null;
+}
+
+export interface FilmComplianceData {
+  film_title: string;
+  release_date: string;
+  days_until_release: number;
+  circuits: Record<string, CircuitComplianceInfo>;
+  circuit_ranking: [string, number][];
+  marcus_rank: number | null;
+  marcus_days_ahead: number | null;
+  avg_days_ahead: number;
+  marcus_delta: number | null;
+  total_circuits: number;
+}
+
+export interface ComplianceResponse {
+  snapshot_date: string;
+  total_films: number;
+  films: FilmComplianceData[];
+}
+
+/**
+ * Fetch presale posting compliance data.
+ * Compares how far in advance each circuit posts showtimes for upcoming films.
+ */
+export function usePresaleCompliance(marketScope: MarketScope = 'our_markets') {
+  return useQuery({
+    queryKey: ['presales', 'compliance', marketScope],
+    queryFn: async () => {
+      const response = await api.get<ComplianceResponse>(
+        `/presales/compliance?market_scope=${marketScope}`
+      );
+      return response.data;
+    },
+    staleTime: 5 * 60 * 1000,
+  });
+}
+
+// ============================================================================
+// Heatmap Types & Hook
+// ============================================================================
+
+export interface PresaleHeatmapTheater {
+  theater_name: string;
+  circuit_name: string | null;
+  market: string | null;
+  latitude: number;
+  longitude: number;
+  total_showtimes: number;
+  total_capacity: number;
+  total_available: number;
+  total_tickets_sold: number;
+  fill_rate_pct: number;
+  avg_price: number | null;
+  films_count: number;
+  is_marcus: boolean;
+}
+
+export interface PresaleHeatmapResponse {
+  total_theaters: number;
+  theaters_with_data: number;
+  film_filter: string | null;
+  theaters: PresaleHeatmapTheater[];
+}
+
+/**
+ * Fetch presale heatmap data with per-theater geographic coordinates.
+ * Returns theaters with lat/lon, presale metrics (showtimes, capacity, tickets sold, fill rate).
+ *
+ * Without filmTitle: aggregate presale activity across all films
+ * With filmTitle: presale data for a specific film
+ */
+export function usePresaleHeatmapData(options?: {
+  filmTitle?: string;
+  circuit?: string;
+  enabled?: boolean;
+  marketScope?: MarketScope;
+}) {
+  const scope = options?.marketScope || 'our_markets';
+  const params = new URLSearchParams();
+  if (options?.filmTitle) params.append('film_title', options.filmTitle);
+  if (options?.circuit) params.append('circuit', options.circuit);
+  params.append('market_scope', scope);
+
+  return useQuery({
+    queryKey: ['presales', 'heatmap', options?.filmTitle, options?.circuit, scope],
+    queryFn: async () => {
+      const response = await api.get<PresaleHeatmapResponse>(
+        `/presales/heatmap-data?${params.toString()}`
+      );
+      return response.data;
+    },
+    enabled: options?.enabled ?? true,
+    staleTime: 5 * 60 * 1000,
   });
 }
 

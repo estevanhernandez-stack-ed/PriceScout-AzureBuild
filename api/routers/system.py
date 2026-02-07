@@ -123,7 +123,7 @@ async def get_system_health(
                 "theaters_checked": val.get('checked', 0),
                 "theaters_failed": val.get('failed', 0)
             }
-    except:
+    except Exception:
         components["fandango_scraper"] = {"status": "unknown"}
 
     # 3. EntTelligence Sync
@@ -140,7 +140,7 @@ async def get_system_health(
                         "last_sync": row[0],
                         "records_synced": row[2]
                     }
-    except:
+    except Exception:
         components["enttelligence"] = {"status": "unknown"}
 
     if "enttelligence" not in components:
@@ -168,7 +168,7 @@ async def get_system_health(
                     "schedule_pending": s_pending,
                     "total_pending": p_pending + s_pending
                 }
-    except:
+    except Exception:
         components["alerts"] = {"status": "unknown"}
 
     # 5. Scheduler
@@ -181,7 +181,7 @@ async def get_system_health(
                 "status": "ok" if age < 10 else "degraded" if age < 60 else "stale",
                 "age_minutes": round(age, 1)
             }
-    except:
+    except Exception:
         components["scheduler"] = {"status": "unknown"}
 
     return SystemHealthResponse(

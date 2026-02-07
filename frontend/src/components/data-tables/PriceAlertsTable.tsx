@@ -10,7 +10,7 @@ import {
 } from '@/components/ui/table';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
-import { Check, RefreshCw, TrendingUp, TrendingDown, Sparkles } from 'lucide-react';
+import { Check, RefreshCw, TrendingUp, TrendingDown, Zap, AlertTriangle } from 'lucide-react';
 
 interface PriceAlertsTableProps {
   acknowledged?: boolean;
@@ -61,12 +61,14 @@ export function PriceAlertsTable({
 
   const getAlertIcon = (alertType: string) => {
     switch (alertType) {
-      case 'PriceIncrease':
+      case 'price_increase':
         return <TrendingUp className="h-4 w-4 text-red-500" />;
-      case 'PriceDecrease':
+      case 'price_decrease':
         return <TrendingDown className="h-4 w-4 text-green-500" />;
-      case 'NewOffering':
-        return <Sparkles className="h-4 w-4 text-blue-500" />;
+      case 'surge_detected':
+        return <Zap className="h-4 w-4 text-orange-500" />;
+      case 'discount_day_overcharge':
+        return <AlertTriangle className="h-4 w-4 text-amber-500" />;
       default:
         return null;
     }
@@ -74,11 +76,15 @@ export function PriceAlertsTable({
 
   const getAlertBadge = (alertType: string) => {
     switch (alertType) {
-      case 'PriceIncrease':
+      case 'price_increase':
         return <Badge variant="destructive">Increase</Badge>;
-      case 'PriceDecrease':
+      case 'price_decrease':
         return <Badge variant="success">Decrease</Badge>;
-      case 'NewOffering':
+      case 'surge_detected':
+        return <Badge variant="warning">Surge</Badge>;
+      case 'discount_day_overcharge':
+        return <Badge variant="warning">Discount Violation</Badge>;
+      case 'new_offering':
         return <Badge variant="info">New</Badge>;
       default:
         return <Badge variant="secondary">{alertType}</Badge>;

@@ -96,7 +96,7 @@ export function BaselineDetailsPanel() {
   const filteredBaselines = useMemo(() => {
     if (!baselines) return [];
 
-    let result = baselines.filter((b) => {
+    const result = baselines.filter((b) => {
       // Theater name filter (case-insensitive)
       if (theaterFilter && !b.theater_name.toLowerCase().includes(theaterFilter.toLowerCase())) {
         return false;

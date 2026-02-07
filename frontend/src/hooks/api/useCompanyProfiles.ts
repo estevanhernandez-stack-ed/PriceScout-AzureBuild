@@ -94,7 +94,7 @@ export function useCompanyProfile(circuitName: string | null) {
     queryKey: ['companyProfiles', circuitName],
     queryFn: async () => {
       const response = await api.get<CompanyProfile>(
-        `/company-profiles/${encodeURIComponent(circuitName!)}`
+        `/company-profiles/${encodeURIComponent(circuitName ?? '')}`
       );
       return response.data;
     },
@@ -251,7 +251,7 @@ export function useDiscountDayDiagnostic(circuitName: string | null, lookbackDay
       if (lookbackDays) params.append('lookback_days', String(lookbackDays));
 
       const response = await api.get<DiscountDayDiagnostic>(
-        `/company-profiles/${encodeURIComponent(circuitName!)}/discount-day-diagnostic?${params}`
+        `/company-profiles/${encodeURIComponent(circuitName ?? '')}/discount-day-diagnostic?${params}`
       );
       return response.data;
     },
@@ -297,7 +297,7 @@ export function useDataCoverage(circuitName: string | null, lookbackDays?: numbe
       if (lookbackDays) params.append('lookback_days', String(lookbackDays));
 
       const response = await api.get<DataCoverageResponse>(
-        `/company-profiles/${encodeURIComponent(circuitName!)}/data-coverage?${params}`
+        `/company-profiles/${encodeURIComponent(circuitName ?? '')}/data-coverage?${params}`
       );
       return response.data;
     },

@@ -30,6 +30,7 @@ from sqlalchemy.orm import Session
 
 from app.db_session import get_session
 from app.db_models import EntTelligencePriceCache, PriceBaseline
+from app.simplified_baseline_service import normalize_daypart, normalize_ticket_type
 
 logger = logging.getLogger(__name__)
 
@@ -50,13 +51,11 @@ PREMIUM_FORMATS = {
     'IMAX', 'IMAX 3D', 'IMAX with Laser', 'IMAX HFR 3D',
     'Dolby Cinema', 'Dolby Atmos', 'Dolby Vision',
     '3D', 'RealD 3D', 'Digital 3D',
-    'PLF', 'Premium Large Format', 'XD', 'RPX', 'BigD',
+    'PLF', 'Premium Large Format', 'Premium Format', 'XD', 'RPX', 'BigD',
     '4DX', 'D-BOX', 'ScreenX', 'MX4D',
     'Laser IMAX', 'GTX', 'UltraAVX',
 }
 
-# Event cinema / special presentations - prices set by distributor, not theater
-# These should be excluded from baseline calculation but tracked separately
 EVENT_CINEMA_KEYWORDS = [
     # Distributors
     'Fathom', 'Trafalgar',
@@ -65,14 +64,20 @@ EVENT_CINEMA_KEYWORDS = [
     'Royal Ballet', 'Globe Theatre', 'Stratford Festival',
     # Concert/Music events
     'Concert', 'Live Event', 'Live in Concert', 'Tour Film',
-    # Special presentations
+    # Special presentations / re-releases / events
     'TCM', 'Turner Classic', 'Anniversary', 'Encore',
     'Special Presentation', 'Special Event', 'Fan Event',
+    'Special Engagement',
     'Marathon', 'Double Feature', 'Triple Feature',
+    'Rerelease', 'Re-release',
+    # Generic "Event" suffix — catches "(2026 Event)" style EntTelligence titles
+    'Event)',
     # Sports/other
     'WWE', 'UFC', 'Boxing', 'Wrestling',
     # Anime events (often Fathom distributed)
     'Crunchyroll', 'Funimation',
+    # Private/party bookings (not regular showings)
+    'Birthday Party', 'Private Screening', 'Private Event',
 ]
 
 
@@ -215,7 +220,8 @@ class EntTelligenceBaselineDiscoveryService:
         circuit_filter: Optional[List[str]] = None,
         split_by_day_type: bool = False,
         split_by_daypart: bool = False,
-        split_by_day_of_week: bool = False
+        split_by_day_of_week: bool = False,
+        exclude_plf_prices: bool = True,
     ) -> List[Dict]:
         """
         Discover baselines from EntTelligence cached price data.
@@ -233,6 +239,9 @@ class EntTelligenceBaselineDiscoveryService:
             split_by_daypart: Whether to calculate separate matinee/evening/late baselines
             split_by_day_of_week: Whether to calculate separate baselines for each day (Mon-Sun)
                                   Note: If True, day_type is ignored since day_of_week is more granular
+            exclude_plf_prices: Whether to use Fandango PLF baselines to filter out likely
+                                PLF prices from "2D" data. Recommended True since EntTelligence
+                                lumps PLF into "2D" without distinction.
 
         Returns:
             List of discovered baseline configurations
@@ -240,6 +249,17 @@ class EntTelligenceBaselineDiscoveryService:
         import sys
         sys.stderr.write(f"[DISCOVERY SERVICE] discover_baselines called: company_id={self.company_id}, split_day_type={split_by_day_type}, split_daypart={split_by_daypart}\n")
         sys.stderr.flush()
+
+        # Build PLF thresholds from Fandango baselines if PLF filtering enabled
+        plf_thresholds = None
+        if exclude_plf_prices:
+            try:
+                from app.plf_calibration_service import build_plf_thresholds
+                plf_thresholds = build_plf_thresholds(self.company_id)
+                if plf_thresholds:
+                    logger.info(f"PLF calibration loaded: {len(plf_thresholds)} theaters with thresholds")
+            except Exception as e:
+                logger.warning(f"PLF calibration unavailable, continuing without PLF filtering: {e}")
 
         discovered = []
         cutoff_date = date.today() - timedelta(days=lookback_days)
@@ -250,13 +270,15 @@ class EntTelligenceBaselineDiscoveryService:
                 discovered = self._discover_with_splits(
                     session, cutoff_date, min_samples, percentile,
                     exclude_premium, exclude_event_cinema, circuit_filter,
-                    split_by_day_type, split_by_daypart, split_by_day_of_week
+                    split_by_day_type, split_by_daypart, split_by_day_of_week,
+                    plf_thresholds=plf_thresholds
                 )
             else:
                 # Original logic - no splitting
                 discovered = self._discover_without_day_type_split(
                     session, cutoff_date, min_samples, percentile,
-                    exclude_premium, exclude_event_cinema, circuit_filter
+                    exclude_premium, exclude_event_cinema, circuit_filter,
+                    plf_thresholds=plf_thresholds
                 )
 
         logger.info(f"Discovered {len(discovered)} baselines from EntTelligence data for company {self.company_id}")
@@ -270,7 +292,8 @@ class EntTelligenceBaselineDiscoveryService:
         percentile: int,
         exclude_premium: bool,
         exclude_event_cinema: bool,
-        circuit_filter: Optional[List[str]]
+        circuit_filter: Optional[List[str]],
+        plf_thresholds: Optional[Dict] = None
     ) -> List[Dict]:
         """
         Discovery logic without day type or daypart splitting.
@@ -281,6 +304,7 @@ class EntTelligenceBaselineDiscoveryService:
         from collections import defaultdict
         discovered = []
         skipped_event_cinema = 0
+        skipped_plf = 0
 
         # Build base query - need film_title for event cinema filtering
         query = session.query(
@@ -322,11 +346,20 @@ class EntTelligenceBaselineDiscoveryService:
             if not price or float(price) <= 0:
                 continue
 
+            # Skip likely PLF prices using Fandango-derived thresholds
+            if plf_thresholds and format_type in ('2D', None):
+                from app.plf_calibration_service import classify_price
+                if classify_price(theater_name, float(price), format_type or '2D', plf_thresholds) == 'plf':
+                    skipped_plf += 1
+                    continue
+
             key = (theater_name, ticket_type, format_type, circuit_name)
             grouped_data[key].append(float(price))
 
         if skipped_event_cinema > 0:
             logger.info(f"Excluded {skipped_event_cinema} event cinema price records from baseline calculation")
+        if skipped_plf > 0:
+            logger.info(f"Excluded {skipped_plf} likely PLF prices from standard 2D baseline calculation (using Fandango PLF thresholds)")
 
         logger.info(f"Found {len(grouped_data)} theater/ticket/format combinations")
 
@@ -374,7 +407,8 @@ class EntTelligenceBaselineDiscoveryService:
         circuit_filter: Optional[List[str]],
         split_by_day_type: bool,
         split_by_daypart: bool,
-        split_by_day_of_week: bool = False
+        split_by_day_of_week: bool = False,
+        plf_thresholds: Optional[Dict] = None
     ) -> List[Dict]:
         """
         Discovery logic with flexible splitting by day_type, daypart, and/or day_of_week.
@@ -419,6 +453,7 @@ class EntTelligenceBaselineDiscoveryService:
         grouped_data = defaultdict(list)
         skipped_unparseable = 0
         skipped_event_cinema = 0
+        skipped_plf = 0
 
         for row in query.all():
             theater_name, ticket_type, format_type, circuit_name, play_date, showtime, price, film_title = row
@@ -434,6 +469,13 @@ class EntTelligenceBaselineDiscoveryService:
 
             if not price or float(price) <= 0:
                 continue
+
+            # Skip likely PLF prices using Fandango-derived thresholds
+            if plf_thresholds and format_type in ('2D', None):
+                from app.plf_calibration_service import classify_price
+                if classify_price(theater_name, float(price), format_type or '2D', plf_thresholds) == 'plf':
+                    skipped_plf += 1
+                    continue
 
             # Determine day_of_week (0=Monday, 6=Sunday) if splitting by day of week
             day_of_week_val = play_date.weekday() if split_by_day_of_week else None
@@ -461,6 +503,8 @@ class EntTelligenceBaselineDiscoveryService:
 
         if skipped_event_cinema > 0:
             logger.info(f"Excluded {skipped_event_cinema} event cinema price records from baseline calculation")
+        if skipped_plf > 0:
+            logger.info(f"Excluded {skipped_plf} likely PLF prices from standard 2D baseline calculation (using Fandango PLF thresholds)")
 
         split_desc = []
         if split_by_day_of_week:
@@ -522,7 +566,8 @@ class EntTelligenceBaselineDiscoveryService:
         Analyze prices across time buckets and determine if dayparts are meaningful.
 
         If prices differ by more than DAYPART_PRICE_THRESHOLD across buckets,
-        return separate daypart baselines. Otherwise, return a single 'Standard' baseline.
+        return separate daypart baselines. Otherwise, return a single flat-price
+        baseline with daypart=None (no time-based variation).
 
         Args:
             prices_by_bucket: Dict mapping time bucket ('early', 'mid', 'late') to price list
@@ -530,7 +575,7 @@ class EntTelligenceBaselineDiscoveryService:
 
         Returns:
             Dict mapping daypart name to baseline price.
-            Returns {'Standard': price} if all buckets have similar pricing.
+            Returns {None: price} if all buckets have similar pricing (flat pricing).
         """
         # Calculate baseline for each bucket that has enough samples
         bucket_baselines = {}
@@ -542,20 +587,20 @@ class EntTelligenceBaselineDiscoveryService:
         if not bucket_baselines:
             return {}
 
-        # If only one bucket has data, return it as Standard
+        # If only one bucket has data, return as flat-price (no daypart)
         if len(bucket_baselines) == 1:
-            return {'Standard': list(bucket_baselines.values())[0]}
+            return {None: list(bucket_baselines.values())[0]}
 
         # Check if prices differ meaningfully across buckets
         baseline_prices = list(bucket_baselines.values())
         price_range = max(baseline_prices) - min(baseline_prices)
 
         if price_range < DAYPART_PRICE_THRESHOLD:
-            # Prices are similar - use single Standard baseline
+            # Prices are similar - use single flat-price baseline (no daypart)
             all_prices = []
             for prices in prices_by_bucket.values():
                 all_prices.extend(prices)
-            return {'Standard': self._percentile(sorted(all_prices), percentile)}
+            return {None: self._percentile(sorted(all_prices), percentile)}
 
         # Prices differ - map buckets to proper daypart names
         result = {}
@@ -570,6 +615,55 @@ class EntTelligenceBaselineDiscoveryService:
 
         return result
 
+    def _detect_discount_days(
+        self,
+        prices_by_dow: Dict[int, List[float]],
+        threshold: float = 0.30,
+    ) -> set:
+        """
+        Detect discount days by comparing each day's median price to the overall median.
+
+        If a day of week's median price is more than `threshold` (30%) below the
+        median of all other days, it's flagged as a discount day.
+
+        Args:
+            prices_by_dow: Dict mapping day_of_week (0=Mon..6=Sun) to list of prices
+            threshold: Fraction below overall median to flag as discount (default 30%)
+
+        Returns:
+            Set of day_of_week integers that are discount days
+        """
+        if len(prices_by_dow) < 3:
+            return set()
+
+        # Calculate median for each day
+        day_medians = {}
+        for dow, prices in prices_by_dow.items():
+            if len(prices) >= 3:
+                sorted_p = sorted(prices)
+                mid = len(sorted_p) // 2
+                day_medians[dow] = sorted_p[mid]
+
+        if len(day_medians) < 3:
+            return set()
+
+        # Calculate the median of NON-lowest days (to avoid the discount day
+        # dragging down the reference)
+        all_medians = sorted(day_medians.values())
+        # Use upper 5 of 7 days as the reference (skip lowest 2 to be safe)
+        reference_medians = all_medians[2:] if len(all_medians) >= 5 else all_medians[1:]
+        reference = sum(reference_medians) / len(reference_medians)
+
+        if reference <= 0:
+            return set()
+
+        discount_days = set()
+        for dow, median in day_medians.items():
+            if (reference - median) / reference >= threshold:
+                discount_days.add(dow)
+
+        return discount_days
+
     def discover_baselines_price_based(
         self,
         min_samples: int = 5,
@@ -577,19 +671,28 @@ class EntTelligenceBaselineDiscoveryService:
         percentile: int = 25,
         exclude_premium: bool = True,
         exclude_event_cinema: bool = True,
-        circuit_filter: Optional[List[str]] = None
+        exclude_discount_days: bool = True,
+        circuit_filter: Optional[List[str]] = None,
+        exclude_plf_prices: bool = True,
     ) -> List[Dict]:
         """
         Discover baselines using price-based daypart detection.
 
         Instead of blindly splitting by time, this method:
         1. Groups prices by theater/ticket/format
-        2. Analyzes if prices differ across time periods
-        3. Only creates separate dayparts if there's a meaningful price difference
+        2. Detects and excludes discount-day prices (e.g., Marcus $5 Tuesdays)
+        3. Analyzes if prices differ across time periods
+        4. Only creates separate dayparts if there's a meaningful price difference
 
         This produces cleaner baselines - e.g., if a theater charges the same
-        price at 7pm and 11pm, they get a single 'Standard' daypart instead of
+        price at 7pm and 11pm, they get a single NULL-daypart baseline instead of
         separate 'Prime' and 'Late Night' entries.
+
+        Args:
+            exclude_discount_days: If True, detect days of week with significantly
+                lower prices (>30% below median) and exclude them from baseline
+                calculation. This prevents Marcus $5 Tuesdays, Movie Tavern discount
+                days, etc. from dragging down standard baselines.
 
         Returns:
             List of discovered baseline configurations
@@ -599,7 +702,7 @@ class EntTelligenceBaselineDiscoveryService:
         cutoff_date = date.today() - timedelta(days=lookback_days)
 
         with get_session() as session:
-            # Get all records with showtime for time bucket analysis
+            # Get all records with showtime and play_date for time bucket + DOW analysis
             query = session.query(
                 EntTelligencePriceCache.theater_name,
                 EntTelligencePriceCache.ticket_type,
@@ -607,7 +710,8 @@ class EntTelligenceBaselineDiscoveryService:
                 EntTelligencePriceCache.circuit_name,
                 EntTelligencePriceCache.showtime,
                 EntTelligencePriceCache.price,
-                EntTelligencePriceCache.film_title
+                EntTelligencePriceCache.film_title,
+                EntTelligencePriceCache.play_date,
             ).filter(
                 and_(
                     EntTelligencePriceCache.company_id == self.company_id,
@@ -621,13 +725,26 @@ class EntTelligenceBaselineDiscoveryService:
                     EntTelligencePriceCache.circuit_name.in_(circuit_filter)
                 )
 
-            # Group by theater/ticket/format, then by time bucket
-            # Structure: {(theater, ticket, format, circuit): {'early': [prices], 'mid': [...], 'late': [...]}}
-            grouped_data = defaultdict(lambda: defaultdict(list))
+            # Build PLF thresholds if filtering enabled
+            plf_thresholds = None
+            if exclude_plf_prices:
+                try:
+                    from app.plf_calibration_service import build_plf_thresholds, classify_price
+                    plf_thresholds = build_plf_thresholds(self.company_id)
+                except Exception as e:
+                    logger.warning(f"PLF calibration unavailable: {e}")
+
+            # First pass: collect all prices by (theater, ticket, format, circuit)
+            # grouped by day of week, so we can detect discount days.
+            # Structure: {combo_key: {dow: [prices]}}
+            raw_by_dow = defaultdict(lambda: defaultdict(list))
+            # Also collect (row, combo_key) for second pass
+            all_rows = []
             skipped_event_cinema = 0
+            skipped_plf = 0
 
             for row in query.all():
-                theater_name, ticket_type, format_type, circuit_name, showtime, price, film_title = row
+                theater_name, ticket_type, format_type, circuit_name, showtime, price, film_title, play_date = row
 
                 if exclude_premium and self.is_premium_format(format_type):
                     continue
@@ -639,16 +756,57 @@ class EntTelligenceBaselineDiscoveryService:
                 if not price or float(price) <= 0:
                     continue
 
-                # Get time bucket for this showtime
+                # Skip likely PLF prices using Fandango-derived thresholds
+                if plf_thresholds and format_type in ('2D', None):
+                    if classify_price(theater_name, float(price), format_type or '2D', plf_thresholds) == 'plf':
+                        skipped_plf += 1
+                        continue
+
                 bucket = self._get_time_bucket(showtime)
                 if bucket is None:
                     continue
 
                 key = (theater_name, ticket_type, format_type, circuit_name)
-                grouped_data[key][bucket].append(float(price))
+                p = float(price)
+                dow = play_date.weekday()
+
+                raw_by_dow[key][dow].append(p)
+                all_rows.append((key, bucket, p, dow))
 
             if skipped_event_cinema > 0:
                 logger.info(f"Excluded {skipped_event_cinema} event cinema records")
+            if skipped_plf > 0:
+                logger.info(f"Excluded {skipped_plf} likely PLF prices from standard 2D baseline (using Fandango PLF thresholds)")
+
+            # Detect discount days per combination
+            discount_days_map = {}  # combo_key -> set of discount DOWs
+            total_discount_excluded = 0
+            if exclude_discount_days:
+                for key, prices_by_dow in raw_by_dow.items():
+                    dd = self._detect_discount_days(prices_by_dow)
+                    if dd:
+                        discount_days_map[key] = dd
+                        excluded_count = sum(len(prices_by_dow[d]) for d in dd)
+                        total_discount_excluded += excluded_count
+
+                if discount_days_map:
+                    dow_names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+                    unique_days = set()
+                    for dd_set in discount_days_map.values():
+                        unique_days.update(dd_set)
+                    logger.info(
+                        f"Detected discount days in {len(discount_days_map)} combinations, "
+                        f"excluding {total_discount_excluded} price records "
+                        f"(days: {', '.join(dow_names[d] for d in sorted(unique_days))})"
+                    )
+
+            # Second pass: group by time bucket, excluding discount days
+            grouped_data = defaultdict(lambda: defaultdict(list))
+
+            for key, bucket, price, dow in all_rows:
+                if key in discount_days_map and dow in discount_days_map[key]:
+                    continue  # Skip discount day price
+                grouped_data[key][bucket].append(price)
 
             logger.info(f"Found {len(grouped_data)} theater/ticket/format combinations for price-based analysis")
 
@@ -702,6 +860,11 @@ class EntTelligenceBaselineDiscoveryService:
         """
         Save discovered baselines to the database.
 
+        EntTelligence prices are tax-exclusive. Before saving, we apply
+        estimated tax so all stored baselines are tax-inclusive (matching
+        Fandango baselines). This allows direct comparison without
+        source-specific adjustments at read time.
+
         Args:
             baselines: List of baseline dicts from discover_baselines()
             effective_from: Start date for baselines (default: today)
@@ -715,15 +878,35 @@ class EntTelligenceBaselineDiscoveryService:
 
         saved_count = 0
 
+        # Load tax config once for the company
+        from api.services.tax_estimation import (
+            get_tax_config, get_tax_rate_for_theater,
+            apply_estimated_tax, bulk_get_theater_states,
+        )
+        tax_config = get_tax_config(self.company_id)
+        tax_enabled = tax_config.get('enabled', False)
+
+        # Batch-lookup theater states for efficient tax rate resolution
+        theater_names = list({b['theater_name'] for b in baselines})
+        theater_states = bulk_get_theater_states(self.company_id, theater_names) if tax_enabled else {}
+
         with get_session() as session:
             for baseline_data in baselines:
-                # Skip premium formats
-                if baseline_data.get('is_premium'):
-                    continue
-
                 day_type = baseline_data.get('day_type')
                 day_of_week = baseline_data.get('day_of_week')
-                daypart = baseline_data.get('daypart')
+                daypart = normalize_daypart(baseline_data.get('daypart'))
+                # Belt-and-suspenders: normalize ticket_type too
+                baseline_data['ticket_type'] = normalize_ticket_type(baseline_data['ticket_type']) or baseline_data['ticket_type']
+
+                # Apply estimated tax to make price tax-inclusive
+                raw_price = float(baseline_data['baseline_price'])
+                if tax_enabled:
+                    theater_state = theater_states.get(baseline_data['theater_name'])
+                    tax_rate = get_tax_rate_for_theater(tax_config, theater_state, theater_name=baseline_data['theater_name'])
+                    final_price = apply_estimated_tax(raw_price, tax_rate)
+                else:
+                    tax_rate = 0.0
+                    final_price = round(raw_price, 2)
 
                 # Build filter for existing baseline check
                 # Include day_type, day_of_week, and daypart in the uniqueness check
@@ -763,7 +946,7 @@ class EntTelligenceBaselineDiscoveryService:
                         # Skip - baseline already exists
                         continue
 
-                # Create new baseline
+                # Create new baseline with tax-inclusive price
                 new_baseline = PriceBaseline(
                     company_id=self.company_id,
                     theater_name=baseline_data['theater_name'],
@@ -772,16 +955,23 @@ class EntTelligenceBaselineDiscoveryService:
                     day_type=day_type,
                     day_of_week=day_of_week,
                     daypart=daypart,
-                    baseline_price=Decimal(str(baseline_data['baseline_price'])),
+                    baseline_price=Decimal(str(final_price)),
                     effective_from=effective_from,
-                    effective_to=None  # Active
+                    effective_to=None,  # Active
+                    source='enttelligence',
+                    tax_status='inclusive',
+                    sample_count=baseline_data.get('sample_count'),
+                    last_discovery_at=datetime.now(UTC),
                 )
                 session.add(new_baseline)
                 saved_count += 1
 
             session.flush()
 
-        logger.info(f"Saved {saved_count} EntTelligence baselines for company {self.company_id}")
+        logger.info(
+            f"Saved {saved_count} EntTelligence baselines for company {self.company_id} "
+            f"(tax {'applied' if tax_enabled else 'disabled'})"
+        )
         return saved_count
 
     def analyze_event_cinema(

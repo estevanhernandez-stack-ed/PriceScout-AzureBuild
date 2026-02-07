@@ -19,11 +19,53 @@ from pydantic import BaseModel, Field
 from api.routers.auth import get_current_user, User, require_operator, require_read_admin
 from app.db_session import get_session
 from app.audit_service import audit_service
+from app.simplified_baseline_service import normalize_daypart, normalize_ticket_type
 from sqlalchemy import text
 import logging
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+# ============================================================================
+# CROSS-SOURCE EQUIVALENCE MAPPINGS (read-layer only — stored data is unchanged)
+# These mappings let cross-source comparisons and surge scans match correctly
+# when Fandango and EntTelligence use different names for the same thing.
+# ============================================================================
+
+# Ticket types: EntTelligence "Adult" == Fandango "General Admission"
+TICKET_TYPE_EQUIVALENTS: dict[str, list[str]] = {
+    "Adult": ["General Admission"],
+    "General Admission": ["Adult"],
+}
+
+# Formats: EntTelligence "2D" == Fandango "Standard" (regular, non-PLF screenings)
+# NOTE: "Premium Format" is NOT equivalent to "2D" — Fandango is the source of
+# truth for PLF pricing since EntTelligence lumps PLF into "2D" without distinction.
+FORMAT_EQUIVALENTS: dict[str, list[str]] = {
+    "2D": ["Standard"],
+    "Standard": ["2D"],
+}
+
+
+def get_equivalent_ticket_types(ticket_type: str) -> list[str]:
+    """Return a list of equivalent ticket type names for cross-source matching.
+
+    Always includes the original type first, then any known equivalents.
+    E.g., 'Adult' -> ['Adult', 'General Admission']
+    """
+    equivalents = TICKET_TYPE_EQUIVALENTS.get(ticket_type, [])
+    return [ticket_type] + equivalents
+
+
+def get_equivalent_formats(fmt: str) -> list[str]:
+    """Return a list of equivalent format names for cross-source matching.
+
+    Always includes the original format first, then any known equivalents.
+    E.g., '2D' -> ['2D', 'Standard']
+    """
+    equivalents = FORMAT_EQUIVALENTS.get(fmt, [])
+    return [fmt] + equivalents
 
 
 # ============================================================================
@@ -63,6 +105,11 @@ class AcknowledgeResponse(BaseModel):
     acknowledged: bool = True
     acknowledged_at: datetime
     acknowledged_by: str
+
+
+class AcknowledgeAllRequest(BaseModel):
+    """Request model for acknowledging all pending alerts."""
+    notes: Optional[str] = Field(None, max_length=1000, description="Optional notes for the bulk acknowledgment")
 
 
 class AlertSummary(BaseModel):
@@ -323,6 +370,134 @@ async def get_alert_configuration(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# NOTE: Bulk action endpoints must be defined BEFORE /{alert_id} to avoid route conflicts.
+# FastAPI/Starlette matches paths in declaration order — {alert_id} would catch "acknowledge-bulk" etc.
+
+@router.put("/price-alerts/acknowledge-bulk", tags=["Price Alerts"])
+async def acknowledge_alerts_bulk(
+    alert_ids: List[int],
+    notes: Optional[str] = None,
+    current_user: dict = Depends(require_operator)
+):
+    """
+    Acknowledge multiple alerts at once.
+
+    Returns count of alerts acknowledged.
+    """
+    try:
+        if not alert_ids:
+            raise HTTPException(status_code=400, detail="No alert IDs provided")
+
+        with get_session() as session:
+            now = datetime.now(timezone.utc)
+
+            # Build IN clause (safe since alert_ids are integers)
+            id_list = ",".join(str(int(id)) for id in alert_ids)
+
+            result = session.execute(
+                text(f"""
+                    UPDATE price_alerts
+                    SET is_acknowledged = 1,
+                        acknowledged_by = :user_id,
+                        acknowledged_at = :now,
+                        acknowledgment_notes = :notes
+                    WHERE alert_id IN ({id_list})
+                      AND company_id = :company_id
+                      AND is_acknowledged = 0
+                """),
+                {
+                    "company_id": current_user.get("company_id") or 1,
+                    "user_id": current_user.get("user_id"),
+                    "now": now,
+                    "notes": notes
+                }
+            )
+
+            count = result.rowcount
+            session.commit()
+
+            # Audit bulk acknowledgment
+            audit_service.data_event(
+                event_type="acknowledge_price_alerts_bulk",
+                user_id=current_user.get("user_id"),
+                username=current_user.get("username"),
+                company_id=current_user.get("company_id") or 1,
+                details={"alert_ids_count": len(alert_ids), "count_updated": count}
+            )
+
+            logger.info(f"{count} alerts acknowledged by user {current_user.get('username')}")
+
+            return {
+                "acknowledged_count": count,
+                "requested_count": len(alert_ids),
+                "acknowledged_at": now.isoformat(),
+                "acknowledged_by": current_user.get("username")
+            }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"Error bulk acknowledging alerts: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.put("/price-alerts/acknowledge-all", tags=["Price Alerts"])
+async def acknowledge_all_alerts(
+    request: Optional[AcknowledgeAllRequest] = None,
+    current_user: dict = Depends(require_operator)
+):
+    """
+    Acknowledge ALL pending alerts for the current company.
+
+    Use this to clear stale alerts in bulk (e.g., after fixing detection logic).
+    Returns count of alerts acknowledged.
+    """
+    try:
+        with get_session() as session:
+            now = datetime.now(timezone.utc)
+            company_id = current_user.get("company_id") or 1
+            notes = request.notes if request else "Bulk cleared all pending alerts"
+
+            result = session.execute(
+                text("""
+                    UPDATE price_alerts
+                    SET is_acknowledged = 1,
+                        acknowledged_by = :user_id,
+                        acknowledged_at = :now,
+                        acknowledgment_notes = :notes
+                    WHERE company_id = :company_id
+                      AND is_acknowledged = 0
+                """),
+                {
+                    "company_id": company_id,
+                    "user_id": current_user.get("user_id"),
+                    "now": now,
+                    "notes": notes
+                }
+            )
+
+            count = result.rowcount
+            session.commit()
+
+            audit_service.data_event(
+                event_type="acknowledge_all_price_alerts",
+                user_id=current_user.get("user_id"),
+                username=current_user.get("username"),
+                company_id=company_id,
+                details={"count_acknowledged": count}
+            )
+
+            logger.info(f"All {count} pending alerts acknowledged by user {current_user.get('username')}")
+
+            return {
+                "acknowledged_count": count,
+                "acknowledged_at": now.isoformat(),
+                "acknowledged_by": current_user.get("username")
+            }
+    except Exception as e:
+        logger.exception(f"Error acknowledging all alerts: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/price-alerts/{alert_id}", response_model=PriceAlert, tags=["Price Alerts"])
 async def get_price_alert(
     alert_id: int,
@@ -447,73 +622,6 @@ async def acknowledge_alert(
         raise
     except Exception as e:
         logger.exception(f"Error acknowledging alert: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.put("/price-alerts/acknowledge-bulk", tags=["Price Alerts"])
-async def acknowledge_alerts_bulk(
-    alert_ids: List[int],
-    notes: Optional[str] = None,
-    current_user: dict = Depends(require_operator)
-):
-    """
-    Acknowledge multiple alerts at once.
-
-    Returns count of alerts acknowledged.
-    """
-    try:
-        if not alert_ids:
-            raise HTTPException(status_code=400, detail="No alert IDs provided")
-
-        with get_session() as session:
-            now = datetime.now(timezone.utc)
-
-            # Build IN clause (safe since alert_ids are integers)
-            id_list = ",".join(str(int(id)) for id in alert_ids)
-
-            result = session.execute(
-                text(f"""
-                    UPDATE price_alerts
-                    SET is_acknowledged = 1,
-                        acknowledged_by = :user_id,
-                        acknowledged_at = :now,
-                        acknowledgment_notes = :notes
-                    WHERE alert_id IN ({id_list})
-                      AND company_id = :company_id
-                      AND is_acknowledged = 0
-                """),
-                {
-                    "company_id": current_user.get("company_id") or 1,
-                    "user_id": current_user.get("user_id"),
-                    "now": now,
-                    "notes": notes
-                }
-            )
-
-            count = result.rowcount
-            session.commit()
-
-            # Audit bulk acknowledgment
-            audit_service.data_event(
-                event_type="acknowledge_price_alerts_bulk",
-                user_id=current_user.get("user_id"),
-                username=current_user.get("username"),
-                company_id=current_user.get("company_id") or 1,
-                details={"alert_ids_count": len(alert_ids), "count_updated": count}
-            )
-
-            logger.info(f"{count} alerts acknowledged by user {current_user.get("username")}")
-
-            return {
-                "acknowledged_count": count,
-                "requested_count": len(alert_ids),
-                "acknowledged_at": now.isoformat(),
-                "acknowledged_by": current_user.get("username")
-            }
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception(f"Error bulk acknowledging alerts: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -671,6 +779,9 @@ class PriceBaselineResponse(BaseModel):
     baseline_price: float
     effective_from: date
     effective_to: Optional[date] = None
+    source: Optional[str] = None
+    sample_count: Optional[int] = None
+    last_discovery_at: Optional[datetime] = None
     created_at: datetime
 
 
@@ -704,7 +815,7 @@ async def list_price_baselines(
             if theater_name:
                 query = query.filter(PriceBaseline.theater_name.ilike(f"%{theater_name}%"))
             if ticket_type:
-                query = query.filter(PriceBaseline.ticket_type == ticket_type)
+                query = query.filter(PriceBaseline.ticket_type == (normalize_ticket_type(ticket_type) or ticket_type))
             if day_type and day_type != 'all':
                 query = query.filter(PriceBaseline.day_type == day_type)
             if active_only:
@@ -733,6 +844,9 @@ async def list_price_baselines(
                     baseline_price=float(b.baseline_price),
                     effective_from=b.effective_from,
                     effective_to=b.effective_to,
+                    source=b.source,
+                    sample_count=b.sample_count,
+                    last_discovery_at=b.last_discovery_at,
                     created_at=b.created_at
                 )
                 for b in baselines
@@ -760,9 +874,9 @@ async def create_price_baseline(
             baseline = PriceBaseline(
                 company_id=company_id,
                 theater_name=request.theater_name,
-                ticket_type=request.ticket_type,
+                ticket_type=normalize_ticket_type(request.ticket_type) or request.ticket_type,
                 format=request.format,
-                daypart=request.daypart,
+                daypart=normalize_daypart(request.daypart),
                 day_type=request.day_type,
                 baseline_price=Decimal(str(request.baseline_price)),
                 effective_from=request.effective_from,
@@ -921,9 +1035,9 @@ async def update_price_baseline(
                 raise HTTPException(status_code=404, detail=f"Baseline {baseline_id} not found")
 
             baseline.theater_name = request.theater_name
-            baseline.ticket_type = request.ticket_type
+            baseline.ticket_type = normalize_ticket_type(request.ticket_type) or request.ticket_type
             baseline.format = request.format
-            baseline.daypart = request.daypart
+            baseline.daypart = normalize_daypart(request.daypart)
             baseline.day_type = request.day_type
             baseline.baseline_price = Decimal(str(request.baseline_price))
             baseline.effective_from = request.effective_from
@@ -1095,6 +1209,7 @@ class PriceAnalysisResponse(BaseModel):
 async def discover_baselines(
     min_samples: int = Query(5, ge=1, description="Minimum price samples required"),
     lookback_days: int = Query(90, ge=7, le=365, description="Days of history to analyze"),
+    exclude_premium: bool = Query(False, description="Exclude premium formats (IMAX, Dolby, PLF). Default FALSE = include PLF baselines."),
     save: bool = Query(False, description="Save discovered baselines to database"),
     current_user: dict = Depends(require_operator)
 ):
@@ -1105,8 +1220,9 @@ async def discover_baselines(
     theater/ticket_type/format combination. Uses the 25th percentile to
     establish a conservative baseline that ignores surge pricing spikes.
 
-    Premium formats (IMAX, Dolby, 3D, etc.) are identified but excluded from
-    surge detection since they have inherently higher expected prices.
+    Premium formats (IMAX, Dolby, 3D, etc.) are included by default so that
+    PLF prices can be compared against PLF-specific baselines for accurate
+    surge detection.
     """
     try:
         from app.baseline_discovery import BaselineDiscoveryService
@@ -1116,7 +1232,8 @@ async def discover_baselines(
 
         baselines = service.discover_baselines(
             min_samples=min_samples,
-            lookback_days=lookback_days
+            lookback_days=lookback_days,
+            exclude_premium=exclude_premium
         )
 
         saved_count = None
@@ -1158,6 +1275,260 @@ async def refresh_baselines(
 
     except Exception as e:
         logger.exception(f"Error refreshing baselines: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/price-baselines/guarded-refresh", tags=["Price Alerts"])
+async def guarded_refresh_baselines(
+    source: str = Query("fandango", description="Data source: fandango or enttelligence"),
+    max_drift_percent: float = Query(15.0, ge=1, le=50, description="Max allowed drift % before flagging"),
+    min_samples: int = Query(8, ge=3, description="Minimum samples for auto-refresh"),
+    lookback_days: int = Query(60, ge=7, le=365, description="Days of history to analyze"),
+    dry_run: bool = Query(False, description="Preview changes without applying"),
+    current_user: dict = Depends(require_operator)
+):
+    """
+    Guarded baseline refresh with drift protection.
+
+    Discovers new baselines from fresh data and compares each against
+    the existing stored baseline. Only applies changes within the drift
+    tolerance. Large changes are flagged for manual review instead of
+    being applied, protecting against bad scrape data corrupting baselines.
+
+    Use dry_run=true to preview what would change without writing anything.
+    """
+    try:
+        from app.baseline_guard import guarded_refresh
+
+        company_id = current_user.get("company_id") or current_user.get("default_company_id") or 1
+        result = guarded_refresh(
+            company_id=company_id,
+            source=source,
+            max_drift_percent=max_drift_percent,
+            min_samples=min_samples,
+            lookback_days=lookback_days,
+            dry_run=dry_run,
+        )
+
+        return result
+
+    except Exception as e:
+        logger.exception(f"Error in guarded baseline refresh: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/price-baselines/health", tags=["Price Alerts"])
+async def get_baselines_health(
+    current_user: dict = Security(get_current_user, scopes=["read:price_alerts"])
+):
+    """
+    Data health dashboard for baselines and normalization.
+
+    Returns freshness, staleness, source breakdown, normalization coverage,
+    and theater metadata completeness — everything needed to assess whether
+    the pricing data is current and well-formed.
+    """
+    company_id = current_user.get("company_id") or current_user.get("default_company_id") or 1
+
+    try:
+        with get_session() as session:
+            # ── Baseline counts by source ──
+            source_counts = session.execute(text("""
+                SELECT source, COUNT(*) as cnt,
+                       MIN(effective_from) as oldest,
+                       MAX(effective_from) as newest,
+                       MAX(last_discovery_at) as last_refresh
+                FROM price_baselines
+                WHERE effective_to IS NULL
+                GROUP BY source
+            """)).fetchall()
+
+            sources = {}
+            total_active = 0
+            for r in source_counts:
+                sources[r[0]] = {
+                    "count": r[1],
+                    "oldest_effective_from": str(r[2]) if r[2] else None,
+                    "newest_effective_from": str(r[3]) if r[3] else None,
+                    "last_refresh": str(r[4]) if r[4] else None,
+                }
+                total_active += r[1]
+
+            # ── Staleness: baselines older than 30 days ──
+            stale_30d = session.execute(text("""
+                SELECT COUNT(*) FROM price_baselines
+                WHERE effective_to IS NULL
+                  AND effective_from < date('now', '-30 days')
+            """)).scalar() or 0
+
+            stale_90d = session.execute(text("""
+                SELECT COUNT(*) FROM price_baselines
+                WHERE effective_to IS NULL
+                  AND effective_from < date('now', '-90 days')
+            """)).scalar() or 0
+
+            # ── Theater coverage ──
+            theaters_with_baselines = session.execute(text("""
+                SELECT COUNT(DISTINCT theater_name) FROM price_baselines
+                WHERE effective_to IS NULL
+            """)).scalar() or 0
+
+            total_theaters = session.execute(text("""
+                SELECT COUNT(*) FROM theater_metadata
+                WHERE company_id = :cid
+            """), {"cid": company_id}).scalar() or 0
+
+            # ── Ticket type distribution ──
+            ticket_types = session.execute(text("""
+                SELECT ticket_type, COUNT(*) as cnt
+                FROM price_baselines
+                WHERE effective_to IS NULL
+                GROUP BY ticket_type
+                ORDER BY cnt DESC
+            """)).fetchall()
+
+            # ── Format distribution ──
+            formats = session.execute(text("""
+                SELECT COALESCE(format, 'NULL') as fmt, COUNT(*) as cnt
+                FROM price_baselines
+                WHERE effective_to IS NULL
+                GROUP BY format
+                ORDER BY cnt DESC
+            """)).fetchall()
+
+            # ── Daypart distribution ──
+            dayparts = session.execute(text("""
+                SELECT COALESCE(daypart, 'NULL') as dp, COUNT(*) as cnt
+                FROM price_baselines
+                WHERE effective_to IS NULL
+                GROUP BY daypart
+                ORDER BY cnt DESC
+            """)).fetchall()
+
+            # ── Theater metadata completeness ──
+            meta_stats = session.execute(text("""
+                SELECT
+                    COUNT(*) as total,
+                    SUM(CASE WHEN state IS NOT NULL AND state != '' THEN 1 ELSE 0 END) as with_state,
+                    SUM(CASE WHEN dma IS NOT NULL AND dma != '' THEN 1 ELSE 0 END) as with_dma,
+                    SUM(CASE WHEN circuit_name IS NOT NULL AND circuit_name != '' THEN 1 ELSE 0 END) as with_circuit,
+                    SUM(CASE WHEN latitude IS NOT NULL THEN 1 ELSE 0 END) as with_coords,
+                    SUM(CASE WHEN market IS NOT NULL AND market != '' THEN 1 ELSE 0 END) as with_market
+                FROM theater_metadata
+                WHERE company_id = :cid
+            """), {"cid": company_id}).fetchone()
+
+            # ── EntTelligence cache freshness ──
+            ent_cache = session.execute(text("""
+                SELECT
+                    COUNT(*) as total,
+                    SUM(CASE WHEN play_date >= date('now') THEN 1 ELSE 0 END) as future,
+                    MAX(fetched_at) as last_fetch,
+                    COUNT(DISTINCT theater_name) as theaters,
+                    COUNT(DISTINCT play_date) as dates
+                FROM enttelligence_price_cache
+                WHERE company_id = :cid
+            """), {"cid": company_id}).fetchone()
+
+            # ── Tax config coverage ──
+            from api.services.tax_estimation import get_tax_config
+            tax_config = get_tax_config(company_id)
+            per_theater_count = len(tax_config.get("per_theater", {}))
+            per_state_count = len(tax_config.get("per_state", {}))
+
+            meta_total = meta_stats[0] if meta_stats else 0
+
+            return {
+                "baselines": {
+                    "total_active": total_active,
+                    "by_source": sources,
+                    "stale_30d": stale_30d,
+                    "stale_90d": stale_90d,
+                    "stale_30d_pct": round(stale_30d / total_active * 100, 1) if total_active else 0,
+                    "theaters_with_baselines": theaters_with_baselines,
+                },
+                "normalization": {
+                    "ticket_types": {r[0]: r[1] for r in ticket_types},
+                    "formats": {r[0]: r[1] for r in formats},
+                    "dayparts": {r[0]: r[1] for r in dayparts},
+                },
+                "theater_metadata": {
+                    "total": meta_total,
+                    "with_state": meta_stats[1] if meta_stats else 0,
+                    "with_state_pct": round((meta_stats[1] or 0) / meta_total * 100, 1) if meta_total else 0,
+                    "with_dma": meta_stats[2] if meta_stats else 0,
+                    "with_circuit": meta_stats[3] if meta_stats else 0,
+                    "with_coords": meta_stats[4] if meta_stats else 0,
+                    "with_market": meta_stats[5] if meta_stats else 0,
+                },
+                "enttelligence_cache": {
+                    "total_entries": ent_cache[0] if ent_cache else 0,
+                    "future_entries": ent_cache[1] if ent_cache else 0,
+                    "last_fetch": str(ent_cache[2]) if ent_cache and ent_cache[2] else None,
+                    "theaters": ent_cache[3] if ent_cache else 0,
+                    "dates_covered": ent_cache[4] if ent_cache else 0,
+                },
+                "tax_estimation": {
+                    "enabled": tax_config.get("enabled", False),
+                    "default_rate": tax_config.get("default_rate", 0.075),
+                    "per_theater_rates": per_theater_count,
+                    "per_state_rates": per_state_count,
+                    "total_theaters": meta_total,
+                    "coverage_pct": round((per_theater_count + per_state_count) / max(meta_total, 1) * 100, 1),
+                },
+            }
+
+    except Exception as e:
+        logger.exception(f"Error getting baselines health: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/price-baselines/plf-calibration", tags=["Price Alerts"])
+async def refresh_plf_calibration(
+    current_user: dict = Depends(require_operator)
+):
+    """
+    Refresh PLF (Premium Large Format) calibration data.
+
+    Uses Fandango's Premium Format baselines as the source of truth to build
+    price thresholds for each theater. EntTelligence lumps PLF into "2D" without
+    distinction, so these thresholds are used to separate likely PLF prices from
+    standard 2D prices during baseline discovery.
+
+    **How it works:**
+    1. Loads Fandango `Standard` and `Premium Format` baselines for each theater
+    2. Computes a price threshold (midpoint between Standard ceiling and PF floor)
+    3. Cross-references with theater amenity data (PLF screen counts)
+    4. Reports coverage gaps (theaters with PLF screens but no Fandango PF baselines)
+
+    **Run this after:**
+    - Fandango baseline discovery for theaters with PLF screens
+    - Changes to theater amenity data
+    - Periodically (weekly recommended) to keep PLF thresholds current
+
+    Returns calibration stats, thresholds per theater, and gap analysis.
+    """
+    try:
+        from app.plf_calibration_service import refresh_plf_calibration as _refresh
+
+        company_id = current_user.get("company_id") or current_user.get("default_company_id") or 1
+        result = _refresh(company_id)
+
+        # Summarize (don't return full thresholds dict in top-level response)
+        summary = {
+            "theaters_calibrated": result["theaters_calibrated"],
+            "theaters_with_plf_screens": result["theaters_with_plf_screens"],
+            "coverage_gaps": result["coverage_gaps"],
+            "gap_details": result["gap_details"],
+            "avg_plf_threshold_pretax": result["avg_plf_threshold_pretax"],
+            "sample_thresholds": {
+                k: v for k, v in list(result["thresholds"].items())[:5]
+            },
+        }
+        return summary
+
+    except Exception as e:
+        logger.exception(f"Error in PLF calibration: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1263,6 +1634,7 @@ async def discover_enttelligence_baselines(
     split_by_daypart: bool = Query(False, description="Split baselines by matinee/evening/late (legacy time-based)"),
     split_by_day_of_week: bool = Query(False, description="Split baselines by each day (Mon-Sun). If enabled, day_type is ignored."),
     price_based_dayparts: bool = Query(False, description="RECOMMENDED: Use price-based daypart detection. Only creates separate dayparts if prices actually differ across time periods."),
+    exclude_premium: bool = Query(False, description="Exclude premium formats (IMAX, Dolby, PLF, etc.) from discovery. Default FALSE = include PLF baselines for accurate surge detection."),
     save: bool = Query(False, description="Save discovered baselines to database"),
     current_user: dict = Depends(require_operator)
 ):
@@ -1277,6 +1649,10 @@ async def discover_enttelligence_baselines(
     between data sources.
 
     **Note:** EntTelligence data typically only has 'Adult' ticket type pricing.
+
+    **Premium Formats:** By default, premium formats (IMAX, Dolby, PLF, etc.) are
+    INCLUDED in discovery. PLF baselines are essential for accurate surge detection —
+    PLF prices must be compared against PLF-specific baselines, not 2D baselines.
 
     **RECOMMENDED - Price-Based Dayparts:** When enabled, intelligently detects dayparts
     based on actual price differences, not arbitrary time cutoffs. If prices don't
@@ -1336,6 +1712,7 @@ async def discover_enttelligence_baselines(
             baselines = service.discover_baselines_price_based(
                 min_samples=min_samples,
                 lookback_days=lookback_days,
+                exclude_premium=exclude_premium,
                 circuit_filter=circuit_filter
             )
         else:
@@ -1343,6 +1720,7 @@ async def discover_enttelligence_baselines(
             baselines = service.discover_baselines(
                 min_samples=min_samples,
                 lookback_days=lookback_days,
+                exclude_premium=exclude_premium,
                 circuit_filter=circuit_filter,
                 split_by_day_type=split_by_day_type,
                 split_by_daypart=split_by_daypart,
@@ -2366,6 +2744,24 @@ class SurgeDetection(BaseModel):
     discount_day_price: Optional[float] = None  # Expected discount price if is_discount_day
 
 
+class DiscountDayComplianceItem(BaseModel):
+    """Detail about a film/theater price on a discount day with compliance status."""
+    theater_name: str
+    circuit_name: Optional[str] = None
+    film_title: str
+    play_date: date
+    ticket_type: str
+    format: Optional[str] = None
+    current_price: float
+    expected_discount_price: float
+    discount_program_name: Optional[str] = None
+    is_compliant: bool  # True if price is at/below expected (within 5% tolerance)
+    is_special_event: bool = False  # Excluded from compliance — distributor-set pricing
+    is_loyalty_ac: bool = False  # Excluded from compliance — discounted from original price
+    is_plf: bool = False  # Excluded from compliance — PLF screens priced differently even on discount days
+    deviation_percent: Optional[float] = None  # How far above/below expected (positive = over)
+
+
 class AdvanceSurgeScanResponse(BaseModel):
     """Response model for advance surge scan."""
     scan_date_from: date
@@ -2378,6 +2774,8 @@ class AdvanceSurgeScanResponse(BaseModel):
     circuits_scanned: List[str]
     films_with_surges: List[str]
     discount_day_prices_filtered: int = 0  # Count of prices skipped due to discount day matching
+    discount_day_compliance: List[DiscountDayComplianceItem] = []  # Detailed compliance info per film
+    discount_day_violations: int = 0  # Count of non-compliant (excluding special events/loyalty)
     circuits_with_profiles: List[str] = []  # Circuits that have discovered profiles
 
 
@@ -2415,6 +2813,12 @@ async def scan_advance_dates_for_surges(
     """
     from app.db_models import EntTelligencePriceCache, PriceBaseline, CompanyProfile
     from sqlalchemy import func, or_
+    from api.services.tax_estimation import (
+        get_tax_config as _get_tax_config,
+        get_tax_rate_for_theater,
+        apply_estimated_tax,
+        bulk_get_theater_states,
+    )
     import json
 
     company_id = current_user.get("company_id") or current_user.get("default_company_id") or 1
@@ -2427,10 +2831,24 @@ async def scan_advance_dates_for_surges(
     if (date_to - date_from).days > max_days:
         raise HTTPException(status_code=400, detail=f"Date range cannot exceed {max_days} days")
 
+    # Load tax config for normalizing EntTelligence pre-tax prices to tax-inclusive
+    # (baselines are stored tax-inclusive, EntTelligence cache is pre-tax)
+    tax_config = _get_tax_config(company_id)
+
+    # Load PLF thresholds for discount day compliance — PLF screens have separate
+    # pricing even on discount days and should not be flagged as violations
+    from app.plf_calibration_service import build_plf_thresholds
+    try:
+        plf_thresholds = build_plf_thresholds(company_id)
+    except Exception:
+        plf_thresholds = {}
+
     surges = []
     total_scanned = 0
     circuits_scanned = set()
     films_with_surges = set()
+    discount_day_compliance_items = []
+    discount_day_violations = 0
 
     # Daypart thresholds (same as enttelligence_baseline_discovery.py)
     from datetime import time as dt_time
@@ -2518,7 +2936,7 @@ async def scan_advance_dates_for_surges(
             CompanyProfile.company_id == company_id
         ).all()
 
-        discount_day_lookup: dict = {}  # {circuit_name: {day_of_week: price}}
+        discount_day_lookup: dict = {}  # {circuit_name: {day_of_week: (price, program_name)}}
         for profile in profiles:
             if profile.has_discount_days and profile.discount_days:
                 try:
@@ -2528,18 +2946,20 @@ async def scan_advance_dates_for_surges(
                         for dd in discount_days:
                             dow = dd.get('day_of_week')
                             price = dd.get('price')
+                            name = dd.get('name') or dd.get('program_name') or f"Discount Day"
                             if dow is not None and price is not None:
-                                discount_day_lookup[profile.circuit_name][dow] = float(price)
+                                discount_day_lookup[profile.circuit_name][dow] = (float(price), name)
                 except (json.JSONDecodeError, TypeError):
                     pass
 
         # Helper to check if a date/circuit is a discount day
         def get_discount_info(circuit_name: str, day_of_week: int) -> tuple:
-            """Returns (is_discount_day, discount_price) for a circuit and day."""
+            """Returns (is_discount_day, discount_price, program_name) for a circuit and day."""
             if circuit_name in discount_day_lookup:
                 if day_of_week in discount_day_lookup[circuit_name]:
-                    return True, discount_day_lookup[circuit_name][day_of_week]
-            return False, None
+                    price, name = discount_day_lookup[circuit_name][day_of_week]
+                    return True, price, name
+            return False, None, None
 
         # Track circuits with profiles and discount day filtering
         circuits_with_profiles = list(discount_day_lookup.keys())
@@ -2583,6 +3003,10 @@ async def scan_advance_dates_for_surges(
         results = query.all()
         total_scanned = len(results)
 
+        # Batch-lookup theater states for per-theater tax rate resolution
+        theater_names_in_results = list(set(row[0] for row in results))
+        theater_states = bulk_get_theater_states(company_id, theater_names_in_results)
+
         # Helper to determine day type from date
         def get_day_type(d: date) -> str:
             return 'weekend' if d.weekday() >= 4 else 'weekday'
@@ -2603,57 +3027,97 @@ async def scan_advance_dates_for_surges(
 
             if theater_name in baseline_lookup:
                 theater_baselines = baseline_lookup[theater_name]
-                if ticket_type in theater_baselines:
-                    ticket_baselines = theater_baselines[ticket_type]
+                # Try ticket type and its equivalents (e.g., Adult <-> General Admission)
+                ticket_types_to_try = get_equivalent_ticket_types(ticket_type)
+                for tt in ticket_types_to_try:
+                    if tt in theater_baselines:
+                        ticket_baselines = theater_baselines[tt]
 
-                    # Try format-specific first, then wildcard
-                    format_keys_to_try = [format_type or '*', '*']
-                    for fk in format_keys_to_try:
-                        if fk in ticket_baselines:
-                            # Try day keys in order of specificity:
-                            # 1. day_of_week specific (e.g., 'dow_1' for Tuesday)
-                            # 2. day_type (weekday/weekend)
-                            # 3. wildcard (*)
-                            day_keys_to_try = [f'dow_{day_of_week_val}', day_type, '*']
-                            for dk in day_keys_to_try:
-                                if dk in ticket_baselines[fk]:
-                                    # Try daypart-specific first, then wildcard
-                                    daypart_keys_to_try = [daypart, '*'] if daypart else ['*']
-                                    for dpk in daypart_keys_to_try:
-                                        if dpk in ticket_baselines[fk][dk]:
-                                            baseline = ticket_baselines[fk][dk][dpk]
+                        # Try format-specific first, equivalents, then wildcard
+                        fmt_key = format_type or '*'
+                        format_keys_to_try = get_equivalent_formats(fmt_key) + ['*'] if fmt_key != '*' else ['*']
+                        for fk in format_keys_to_try:
+                            if fk in ticket_baselines:
+                                # Try day keys in order of specificity:
+                                # 1. day_of_week specific (e.g., 'dow_1' for Tuesday)
+                                # 2. day_type (weekday/weekend)
+                                # 3. wildcard (*)
+                                day_keys_to_try = [f'dow_{day_of_week_val}', day_type, '*']
+                                for dk in day_keys_to_try:
+                                    if dk in ticket_baselines[fk]:
+                                        # Try daypart-specific first, then wildcard
+                                        daypart_keys_to_try = [daypart, '*'] if daypart else ['*']
+                                        for dpk in daypart_keys_to_try:
+                                            if dpk in ticket_baselines[fk][dk]:
+                                                baseline = ticket_baselines[fk][dk][dpk]
+                                                break
+                                        if baseline:
                                             break
-                                    if baseline:
-                                        break
-                            if baseline:
-                                break
+                                if baseline:
+                                    break
+                    if baseline:
+                        break
 
             if not baseline:
                 continue  # No baseline to compare
 
             # Calculate surge
+            # Baselines are tax-inclusive; EntTelligence cache prices are pre-tax
+            # Normalize to tax-inclusive for apples-to-apples comparison
             baseline_price = float(baseline.baseline_price)
-            current_price = float(price)
+            ent_tax_rate = get_tax_rate_for_theater(
+                tax_config, theater_states.get(theater_name), theater_name=theater_name
+            )
+            current_price = apply_estimated_tax(float(price), ent_tax_rate)
 
             if baseline_price <= 0:
                 continue
 
             # Check if this is a known discount day for the circuit
-            is_discount_day, discount_price = get_discount_info(circuit_name or "", day_of_week_val)
+            is_discount_day, discount_price, program_name = get_discount_info(circuit_name or "", day_of_week_val)
 
-            # On discount days, compare against discount price instead of regular baseline
-            # This prevents false positives where discount day prices look like "negative surge"
-            # and ensures we catch actual surges even on discount days
+            # On discount days, build detailed compliance item and filter accordingly
             comparison_price = baseline_price
             if is_discount_day and discount_price is not None:
-                # If current price is at or below discount price, it's not a surge
-                # (it's the expected discount day pricing)
-                if current_price <= discount_price * 1.05:  # 5% tolerance
-                    discount_day_filtered_count += 1
-                    continue  # Skip - this is expected discount day pricing
+                from app.alternative_content_service import detect_content_type_from_title, detect_ac_from_ticket_type
+                from app.plf_calibration_service import classify_price as classify_plf_price
 
-                # For prices above discount, use baseline for comparison
-                # (surges can still happen on discount days)
+                is_special = detect_content_type_from_title(film_title)[0] is not None
+                is_ac = detect_ac_from_ticket_type(ticket_type)
+
+                # Check if this price is from a PLF screen — PLF screens have separate
+                # pricing even on discount days (e.g., UltraScreen on $5 Tuesday ≠ $5)
+                is_plf = False
+                if theater_name in plf_thresholds:
+                    plf_class = classify_plf_price(float(price), theater_name, plf_thresholds)
+                    is_plf = (plf_class == 'plf')
+
+                price_compliant = current_price <= discount_price * 1.05  # 5% tolerance
+                deviation = ((current_price - discount_price) / discount_price * 100) if discount_price > 0 else 0
+
+                compliance_item = DiscountDayComplianceItem(
+                    theater_name=theater_name,
+                    circuit_name=circuit_name,
+                    film_title=film_title,
+                    play_date=play_date_val,
+                    ticket_type=ticket_type,
+                    format=format_type,
+                    current_price=round(current_price, 2),
+                    expected_discount_price=round(discount_price, 2),
+                    discount_program_name=program_name,
+                    is_compliant=price_compliant or is_special or is_ac or is_plf,
+                    is_special_event=is_special,
+                    is_loyalty_ac=is_ac,
+                    is_plf=is_plf,
+                    deviation_percent=round(deviation, 1),
+                )
+                discount_day_compliance_items.append(compliance_item)
+
+                if not price_compliant and not is_special and not is_ac and not is_plf:
+                    discount_day_violations += 1
+
+                discount_day_filtered_count += 1
+                continue  # Don't process discount day prices as surges
 
             surge_amount = current_price - comparison_price
             surge_percent = (surge_amount / comparison_price) * 100
@@ -2692,7 +3156,8 @@ async def scan_advance_dates_for_surges(
 
         logger.info(f"Advance surge scan: {date_from} to {date_to}, "
                    f"scanned {total_scanned} prices, found {len(surges)} surges, "
-                   f"filtered {discount_day_filtered_count} discount day prices "
+                   f"filtered {discount_day_filtered_count} discount day prices, "
+                   f"{discount_day_violations} discount day violations "
                    f"(thresholds: {surge_threshold}% or ${min_surge_amount})")
 
         return AdvanceSurgeScanResponse(
@@ -2706,6 +3171,8 @@ async def scan_advance_dates_for_surges(
             circuits_scanned=sorted(circuits_scanned),
             films_with_surges=sorted(films_with_surges),
             discount_day_prices_filtered=discount_day_filtered_count,
+            discount_day_compliance=discount_day_compliance_items[:100],  # Limit to 100
+            discount_day_violations=discount_day_violations,
             circuits_with_profiles=sorted(circuits_with_profiles)
         )
 
@@ -2763,11 +3230,20 @@ async def check_new_films_for_surges(
     """
     from app.db_models import EntTelligencePriceCache, PriceBaseline, CompanyProfile
     from sqlalchemy import func, or_
+    from api.services.tax_estimation import (
+        get_tax_config as _get_tax_config,
+        get_tax_rate_for_theater,
+        apply_estimated_tax,
+        bulk_get_theater_states,
+    )
     import json
 
     company_id = current_user.get("company_id") or current_user.get("default_company_id") or 1
     check_time = datetime.now(UTC)
     lookback_cutoff = check_time - timedelta(hours=lookback_hours)
+
+    # Load tax config for normalizing EntTelligence pre-tax prices to tax-inclusive
+    tax_config = _get_tax_config(company_id)
 
     surges = []
     films_checked = set()
@@ -2837,21 +3313,30 @@ async def check_new_films_for_surges(
         results = query.all()
         total_new_prices = len(results)
 
+        # Batch-lookup theater states for per-theater tax rate resolution
+        theater_names_in_results = list(set(row[0] for row in results))
+        theater_states = bulk_get_theater_states(company_id, theater_names_in_results)
+
         for row in results:
             theater_name, circuit_name, film_title, play_date_val, ticket_type, format_type, price, created_at, is_presale = row
             films_checked.add(film_title)
 
-            # Find matching baseline
+            # Find matching baseline (with ticket type equivalence mapping)
             baseline = None
             if theater_name in baseline_lookup:
                 theater_baselines = baseline_lookup[theater_name]
-                if ticket_type in theater_baselines:
-                    ticket_baselines = theater_baselines[ticket_type]
-                    format_keys = [format_type or '*', '*']
-                    for fk in format_keys:
-                        if fk in ticket_baselines:
-                            baseline = ticket_baselines[fk]
-                            break
+                ticket_types_to_try = get_equivalent_ticket_types(ticket_type)
+                for tt in ticket_types_to_try:
+                    if tt in theater_baselines:
+                        ticket_baselines = theater_baselines[tt]
+                        fmt_key = format_type or '*'
+                        format_keys = get_equivalent_formats(fmt_key) + ['*'] if fmt_key != '*' else ['*']
+                        for fk in format_keys:
+                            if fk in ticket_baselines:
+                                baseline = ticket_baselines[fk]
+                                break
+                    if baseline:
+                        break
 
             if not baseline:
                 continue
@@ -2865,8 +3350,13 @@ async def check_new_films_for_surges(
                         continue  # Skip discount day pricing
 
             # Calculate surge
+            # Baselines are tax-inclusive; EntTelligence cache prices are pre-tax
+            # Normalize to tax-inclusive for apples-to-apples comparison
             baseline_price = float(baseline.baseline_price)
-            current_price = float(price)
+            ent_tax_rate = get_tax_rate_for_theater(
+                tax_config, theater_states.get(theater_name), theater_name=theater_name
+            )
+            current_price = apply_estimated_tax(float(price), ent_tax_rate)
 
             if baseline_price <= 0:
                 continue
@@ -3491,6 +3981,154 @@ async def get_market_coverage(
 
 
 # ============================================================================
+# BASELINE GAP FILLING
+# ============================================================================
+
+class ProposedGapFillResponse(BaseModel):
+    """A proposed baseline to fill a coverage gap."""
+    theater_name: str
+    ticket_type: str
+    format: str
+    daypart: Optional[str] = None
+    day_type: Optional[str] = None
+    proposed_price: float
+    source: str  # 'enttelligence' or 'circuit_average'
+    sample_count: int
+    confidence: float  # 0-1
+    gap_type: str
+    gap_description: str
+
+
+class GapFillProposalsResponse(BaseModel):
+    """Response for gap fill proposal analysis."""
+    theater_name: str
+    total_gaps: int
+    proposals: List[ProposedGapFillResponse]
+    fillable_count: int  # proposals with confidence >= threshold
+    unfillable_gaps: int  # gaps with no data available
+
+
+class GapFillApplyRequest(BaseModel):
+    """Request to apply gap fill proposals."""
+    min_confidence: float = Field(0.7, ge=0.0, le=1.0, description="Only apply proposals at or above this confidence")
+
+
+class GapFillApplyResponse(BaseModel):
+    """Response after applying gap fills."""
+    baselines_created: int
+    baselines_skipped: int
+    theater_name: str
+
+
+@router.get("/baselines/gap-fill/{theater_name}", response_model=GapFillProposalsResponse, tags=["Coverage Gaps"])
+async def propose_gap_fills(
+    theater_name: str,
+    lookback_days: int = Query(90, ge=7, le=365, description="Days of history to analyze"),
+    min_samples: int = Query(3, ge=1, le=50, description="Minimum samples required for proposal"),
+    current_user: dict = Depends(require_read_admin)
+):
+    """
+    Analyze coverage gaps and propose baselines from available data.
+
+    Returns proposals from two data sources:
+    1. **EntTelligence cache** — prices from the EntTelligence API (higher confidence)
+    2. **Circuit average** — averages from other theaters in the same circuit (lower confidence, capped at 0.5)
+
+    Proposals include confidence scores (0-1) to help prioritize which fills to apply.
+    Use the apply endpoint to save selected proposals as baselines.
+    """
+    try:
+        from app.baseline_gap_filler import BaselineGapFillerService
+
+        company_id = current_user.get("company_id") or current_user.get("default_company_id") or 1
+        service = BaselineGapFillerService(company_id)
+        proposals = service.analyze_and_propose(theater_name, lookback_days, min_samples)
+
+        # Count gaps from coverage report
+        report = service.coverage_service.analyze_theater(theater_name, lookback_days)
+        total_gaps = len(report.gaps)
+        fillable = sum(1 for p in proposals if p.confidence >= 0.7)
+        unfillable = total_gaps - len(proposals)
+
+        return GapFillProposalsResponse(
+            theater_name=theater_name,
+            total_gaps=total_gaps,
+            proposals=[
+                ProposedGapFillResponse(
+                    theater_name=p.theater_name,
+                    ticket_type=p.ticket_type,
+                    format=p.format,
+                    daypart=p.daypart,
+                    day_type=p.day_type,
+                    proposed_price=p.proposed_price,
+                    source=p.source,
+                    sample_count=p.sample_count,
+                    confidence=p.confidence,
+                    gap_type=p.gap_type,
+                    gap_description=p.gap_description,
+                )
+                for p in proposals
+            ],
+            fillable_count=fillable,
+            unfillable_gaps=max(0, unfillable),
+        )
+
+    except Exception as e:
+        logger.exception(f"Error proposing gap fills for {theater_name}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/baselines/gap-fill/{theater_name}/apply", response_model=GapFillApplyResponse, tags=["Coverage Gaps"])
+async def apply_gap_fills(
+    theater_name: str,
+    request: GapFillApplyRequest = None,
+    lookback_days: int = Query(90, ge=7, le=365, description="Days of history to analyze"),
+    min_samples: int = Query(3, ge=1, le=50, description="Minimum samples required"),
+    current_user: dict = Depends(require_operator)
+):
+    """
+    Apply gap fill proposals as new baselines for a theater.
+
+    Re-analyzes gaps and applies proposals that meet the confidence threshold.
+    Creates PriceBaseline records with source='gap_fill_enttelligence' or
+    'gap_fill_circuit_average'.
+    """
+    try:
+        from app.baseline_gap_filler import BaselineGapFillerService
+
+        company_id = current_user.get("company_id") or current_user.get("default_company_id") or 1
+        min_confidence = request.min_confidence if request else 0.7
+        user_id = current_user.get("user_id")
+
+        service = BaselineGapFillerService(company_id)
+        proposals = service.analyze_and_propose(theater_name, lookback_days, min_samples)
+        created, skipped = service.apply_fills(proposals, min_confidence, user_id)
+
+        audit_service.data_event(
+            event_type="apply_gap_fills",
+            user_id=user_id,
+            username=current_user.get("username"),
+            company_id=company_id,
+            details={
+                "theater_name": theater_name,
+                "baselines_created": created,
+                "baselines_skipped": skipped,
+                "min_confidence": min_confidence,
+            }
+        )
+
+        return GapFillApplyResponse(
+            baselines_created=created,
+            baselines_skipped=skipped,
+            theater_name=theater_name,
+        )
+
+    except Exception as e:
+        logger.exception(f"Error applying gap fills for {theater_name}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
 # BASELINE MAINTENANCE
 # ============================================================================
 
@@ -3661,6 +4299,11 @@ class PriceComparisonItem(BaseModel):
     difference_percent: float
     ent_sample_count: int
     fandango_sample_count: Optional[int] = None
+    # Tax adjustment fields (populated when apply_tax=true)
+    ent_price_tax_adjusted: Optional[float] = None
+    tax_rate_applied: Optional[float] = None
+    adjusted_difference: Optional[float] = None
+    adjusted_difference_percent: Optional[float] = None
 
 
 class PriceComparisonResponse(BaseModel):
@@ -3674,6 +4317,9 @@ class PriceComparisonResponse(BaseModel):
     likely_tax_exclusive_count: int  # EntTelligence prices ~8-10% lower
     comparisons: List[PriceComparisonItem]
     summary: Dict[str, Any]
+    # Tax adjustment metadata
+    tax_adjustment_applied: bool = False
+    default_tax_rate: Optional[float] = None
 
 
 @router.get("/baselines/compare-sources", response_model=PriceComparisonResponse, tags=["Baseline Analysis"])
@@ -3681,6 +4327,7 @@ async def compare_enttelligence_vs_fandango(
     theater_filter: Optional[str] = Query(None, description="Filter by theater name (partial match)"),
     min_samples: int = Query(3, ge=1, description="Minimum EntTelligence samples to include"),
     limit: int = Query(200, ge=1, le=1000, description="Max comparisons to return"),
+    apply_tax: bool = Query(True, description="Apply estimated tax to EntTelligence prices (default: on for tax-inclusive display)"),
     current_user: dict = Depends(require_read_admin)
 ):
     """
@@ -3694,6 +4341,10 @@ async def compare_enttelligence_vs_fandango(
     **Tax Detection:**
     If EntTelligence prices are consistently 7-10% lower than Fandango,
     they're likely tax-exclusive. Fandango shows customer-facing (tax-inclusive) prices.
+
+    **Tax Adjustment:**
+    When `apply_tax=true`, estimated state/local tax is added to EntTelligence prices
+    using the company's configured tax rates.
 
     **Returns:**
     - Per-theater/ticket/format comparisons
@@ -3745,8 +4396,12 @@ async def compare_enttelligence_vs_fandango(
                 FROM ent_prices e
                 INNER JOIN price_baselines b ON
                     e.theater_name = b.theater_name
-                    AND e.ticket_type = b.ticket_type
-                    AND COALESCE(e.format, '2D') = COALESCE(b.format, '2D')
+                    AND (e.ticket_type = b.ticket_type
+                         OR (e.ticket_type = 'Adult' AND b.ticket_type = 'General Admission')
+                         OR (e.ticket_type = 'General Admission' AND b.ticket_type = 'Adult'))
+                    AND (COALESCE(e.format, '2D') = COALESCE(b.format, '2D')
+                         OR (COALESCE(e.format, '2D') = '2D' AND COALESCE(b.format, '2D') = 'Standard')
+                         OR (COALESCE(e.format, '2D') = 'Standard' AND COALESCE(b.format, '2D') = '2D'))
                 WHERE b.company_id = :company_id
                     AND b.effective_to IS NULL
                     {theater_clause}
@@ -3756,6 +4411,21 @@ async def compare_enttelligence_vs_fandango(
 
             result = db.execute(query, params)
             rows = result.fetchall()
+
+            # Load tax config if tax adjustment requested
+            tax_config = None
+            theater_states = {}
+            if apply_tax:
+                from api.services.tax_estimation import (
+                    get_tax_config as _get_tax_config,
+                    get_tax_rate_for_theater,
+                    apply_estimated_tax,
+                    bulk_get_theater_states,
+                )
+                tax_config = _get_tax_config(company_id)
+                # Batch-lookup states for all theaters in results
+                theater_names = list(set(row[0] for row in rows))
+                theater_states = bulk_get_theater_states(company_id, theater_names)
 
             comparisons = []
             total_diff = 0
@@ -3771,6 +4441,18 @@ async def compare_enttelligence_vs_fandango(
                 diff = ent_price - fandango_price
                 diff_pct = (diff / fandango_price * 100) if fandango_price > 0 else 0
 
+                # Tax adjustment
+                ent_adjusted = None
+                tax_rate = None
+                adj_diff = None
+                adj_diff_pct = None
+                if apply_tax and tax_config and tax_config.get("enabled"):
+                    theater_state = theater_states.get(row[0])
+                    tax_rate = get_tax_rate_for_theater(tax_config, theater_state, theater_name=row[0])
+                    ent_adjusted = apply_estimated_tax(ent_price, tax_rate)
+                    adj_diff = round(ent_adjusted - fandango_price, 2)
+                    adj_diff_pct = round((adj_diff / fandango_price * 100) if fandango_price > 0 else 0, 1)
+
                 comparisons.append(PriceComparisonItem(
                     theater_name=row[0],
                     ticket_type=row[1],
@@ -3782,7 +4464,11 @@ async def compare_enttelligence_vs_fandango(
                     difference=round(diff, 2),
                     difference_percent=round(diff_pct, 1),
                     ent_sample_count=row[7],
-                    fandango_sample_count=row[8]
+                    fandango_sample_count=row[8],
+                    ent_price_tax_adjusted=ent_adjusted,
+                    tax_rate_applied=tax_rate,
+                    adjusted_difference=adj_diff,
+                    adjusted_difference_percent=adj_diff_pct,
                 ))
 
                 total_diff += diff
@@ -3829,7 +4515,9 @@ async def compare_enttelligence_vs_fandango(
                 exact_match_count=exact_match,
                 likely_tax_exclusive_count=likely_tax_exclusive,
                 comparisons=comparisons,
-                summary=summary
+                summary=summary,
+                tax_adjustment_applied=apply_tax and bool(tax_config and tax_config.get("enabled")),
+                default_tax_rate=tax_config.get("default_rate") if tax_config else None,
             )
 
     except Exception as e:

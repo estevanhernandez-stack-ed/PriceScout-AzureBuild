@@ -1,14 +1,7 @@
-import { Outlet, Link, useLocation } from 'react-router-dom';
+import { Outlet, Link, useLocation, useNavigate } from 'react-router-dom';
 import { useAuthStore } from '@/stores/authStore';
 import { cn } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select';
 import {
   Users,
   LogOut,
@@ -33,12 +26,17 @@ import {
   Wrench,
   FileDown,
   GraduationCap,
-  Sparkles,
   Target,
   Map,
+  Loader2,
+  Settings,
 } from 'lucide-react';
 import { useState, useEffect } from 'react';
+import { ErrorBoundary } from '@/components/error/ErrorBoundary';
 import { TrainingCenter } from '@/components/training/TrainingCenter';
+import { useCacheStatus } from '@/hooks/api';
+import { useToast } from '@/hooks/use-toast';
+import { api } from '@/lib/api';
 
 const scrapingModes = [
   { name: 'Market Mode', href: '/market-mode', icon: MapPin },
@@ -48,7 +46,6 @@ const scrapingModes = [
 ];
 
 const analyticsAndData = [
-  { name: 'Historical Data and Analysis', href: '/historical-data', icon: History },
   { name: 'Circuit Benchmarks', href: '/circuit-benchmarks', icon: BarChart3 },
   { name: 'Presale Tracking', href: '/presale-tracking', icon: Ticket },
   { name: 'Price Baselines', href: '/baselines', icon: Target },
@@ -64,18 +61,22 @@ const adminNavigation = [
   { name: 'System Health', href: '/admin/system-health', icon: Activity },
   { name: 'Repair Queue', href: '/admin/repair-queue', icon: Wrench },
   { name: 'Audit Log', href: '/admin/audit-log', icon: History },
+  { name: 'Settings', href: '/admin/settings', icon: Settings },
   { name: 'Admin', href: '/admin/users', icon: Users },
 ];
 
 export function MainLayout() {
   const location = useLocation();
+  const navigate = useNavigate();
   const { user, logout } = useAuthStore();
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [darkMode, setDarkMode] = useState(true);
-  const [selectedCompany, setSelectedCompany] = useState(user?.company || 'Marcus Theatres');
-  const [captureHtmlOnFailure, setCaptureHtmlOnFailure] = useState(false);
-  const [captureHtmlSnapshots, setCaptureHtmlSnapshots] = useState(false);
   const [trainingOpen, setTrainingOpen] = useState(false);
+  const [diagnosticRunning, setDiagnosticRunning] = useState(false);
+  const [cacheRefreshing, setCacheRefreshing] = useState(false);
+  const { toast } = useToast();
+
+  const { data: cacheStatus } = useCacheStatus();
 
   const isAdmin = user?.role === 'admin';
   const isManager = user?.role === 'manager';
@@ -92,6 +93,7 @@ export function MainLayout() {
     if (item.href === '/admin/data-management') return isOperator || isManager;
     if (item.href === '/admin/repair-queue') return isOperator || isManager;
     if (item.href === '/admin/users') return isAuditor || isManager;
+    if (item.href === '/admin/settings') return isOperator || isManager;
     return false;
   });
 
@@ -104,8 +106,33 @@ export function MainLayout() {
     }
   }, [darkMode]);
 
-  // Mock companies for demo - in production, fetch from API
-  const companies = ['Marcus Theatres', 'AMC Entertainment', 'Regal Cinemas'];
+  const handleRunDiagnostic = async () => {
+    setDiagnosticRunning(true);
+    try {
+      const response = await api.get('/cache/maintenance/health');
+      const data = response.data;
+      toast({
+        title: 'Diagnostic Complete',
+        description: `Cache health: ${data.status || 'OK'}. ${data.market_count ?? cacheStatus?.market_count ?? 0} markets, ${data.theater_count ?? cacheStatus?.theater_count ?? 0} theaters.`,
+      });
+    } catch {
+      toast({ title: 'Diagnostic Failed', description: 'Could not reach the cache health endpoint.', variant: 'destructive' });
+    } finally {
+      setDiagnosticRunning(false);
+    }
+  };
+
+  const handleRefreshCache = async () => {
+    setCacheRefreshing(true);
+    try {
+      await api.post('/cache/refresh', { force_full_refresh: true });
+      toast({ title: 'Cache Refresh Started', description: 'A full cache rebuild has been initiated.' });
+    } catch {
+      toast({ title: 'Cache Refresh Failed', description: 'Could not start cache refresh.', variant: 'destructive' });
+    } finally {
+      setCacheRefreshing(false);
+    }
+  };
 
   return (
     <div className="flex h-screen bg-background">
@@ -129,6 +156,7 @@ export function MainLayout() {
           <button
             onClick={() => setDarkMode(!darkMode)}
             className="flex items-center gap-2 text-sm text-muted-foreground hover:text-foreground"
+            aria-label={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}
           >
             <span className={cn(
               'w-3 h-3 rounded-full',
@@ -139,26 +167,6 @@ export function MainLayout() {
           </button>
         </div>
 
-        {/* Company Selection (Admin and Manager only) */}
-        {(isAdmin || isManager) && (
-          <div className="px-4 py-3 border-b">
-            <p className="text-xs text-muted-foreground mb-2">Company Selection</p>
-            <p className="text-xs text-primary mb-1">Select Company</p>
-            <Select value={selectedCompany} onValueChange={setSelectedCompany}>
-              <SelectTrigger className="w-full bg-secondary">
-                <SelectValue placeholder="Select company" />
-              </SelectTrigger>
-              <SelectContent>
-                {companies.map((company) => (
-                  <SelectItem key={company} value={company}>
-                    {company}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-        )}
-
         {/* User Info Card */}
         <div className="px-4 py-3 border-b bg-primary/10">
           <p className="text-sm">
@@ -167,7 +175,7 @@ export function MainLayout() {
           </p>
           <p className="text-sm">
             <span className="text-muted-foreground">Company: </span>
-            <span className="text-primary font-medium">{selectedCompany}</span>
+            <span className="text-primary font-medium">{user?.company || 'Marcus Theatres'}</span>
           </p>
           <Button
             variant="outline"
@@ -199,9 +207,10 @@ export function MainLayout() {
               variant="secondary"
               size="sm"
               className="w-full"
+              onClick={() => { navigate('/market-mode'); setSidebarOpen(false); }}
             >
               <Rocket className="h-4 w-4 mr-2" />
-              Start New Report / Abort
+              Start New Report
             </Button>
           )}
         </div>
@@ -310,14 +319,6 @@ export function MainLayout() {
               <GraduationCap className="mr-2 h-4 w-4" />
               Training Center
             </Button>
-            <Button
-              variant="toggle"
-              size="sm"
-              className="w-full justify-start mt-1"
-            >
-              <Sparkles className="mr-2 h-4 w-4" />
-              What's New?
-            </Button>
           </div>
         </nav>
 
@@ -326,53 +327,40 @@ export function MainLayout() {
           <div className="px-4 py-3 border-t">
             <p className="text-sm font-semibold mb-3">Developer Tools</p>
 
-            {/* Toggle switches */}
-            <div className="space-y-2 mb-3">
-              <label className="flex items-center gap-2 text-sm text-muted-foreground cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={captureHtmlOnFailure}
-                  onChange={(e) => setCaptureHtmlOnFailure(e.target.checked)}
-                  className="rounded border-border"
-                />
-                <span>Capture HTML on Failure</span>
-                <span className="text-muted-foreground">ⓘ</span>
-              </label>
-              <label className="flex items-center gap-2 text-sm text-muted-foreground cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={captureHtmlSnapshots}
-                  onChange={(e) => setCaptureHtmlSnapshots(e.target.checked)}
-                  className="rounded border-border"
-                />
-                <span>Capture HTML Snapshots</span>
-                <span className="text-muted-foreground">ⓘ</span>
-              </label>
-            </div>
-
-            {/* Diagnostic Buttons */}
             <Button
               variant="secondary"
               size="sm"
               className="w-full mb-2"
+              onClick={handleRunDiagnostic}
+              disabled={diagnosticRunning}
             >
-              <Bug className="h-4 w-4 mr-2" />
+              {diagnosticRunning ? (
+                <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+              ) : (
+                <Bug className="h-4 w-4 mr-2" />
+              )}
               Run Market Diagnostic
             </Button>
             <Button
               variant="outline"
               size="sm"
               className="w-full"
+              onClick={handleRefreshCache}
+              disabled={cacheRefreshing}
             >
-              <Trash2 className="h-4 w-4 mr-2" />
-              Delete Theater Cache
+              {cacheRefreshing ? (
+                <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+              ) : (
+                <Trash2 className="h-4 w-4 mr-2" />
+              )}
+              Refresh Theater Cache
             </Button>
           </div>
         )}
 
         {/* Footer */}
         <div className="px-4 py-3 border-t text-xs text-muted-foreground">
-          <p>Cache last updated: 2026-01-09 00:50:46</p>
+          <p>Cache last updated: {cacheStatus?.last_updated || cacheStatus?.metadata?.last_updated || '—'}</p>
           <p className="mt-1">Developed @ 626Labs LLC</p>
         </div>
       </aside>
@@ -384,6 +372,7 @@ export function MainLayout() {
           <button
             onClick={() => setSidebarOpen(true)}
             className="rounded-lg p-2 text-muted-foreground hover:bg-accent"
+            aria-label="Open navigation menu"
           >
             <Menu className="h-6 w-6" />
           </button>
@@ -392,7 +381,9 @@ export function MainLayout() {
 
         {/* Page content */}
         <main className="flex-1 overflow-auto p-6">
-          <Outlet />
+          <ErrorBoundary>
+            <Outlet />
+          </ErrorBoundary>
         </main>
       </div>
       

@@ -25,7 +25,12 @@ from app.db_models import (
     Price, Showing, PriceAlert, AlertConfiguration, PriceBaseline,
     DiscountProgram, DiscountDayProgram, TheaterMetadata
 )
-from app.simplified_baseline_service import SimplifiedBaselineService, KNOWN_CIRCUITS
+from app.simplified_baseline_service import SimplifiedBaselineService, KNOWN_CIRCUITS, normalize_circuit_name, normalize_daypart, normalize_ticket_type, normalize_format
+from api.services.tax_estimation import (
+    get_tax_config,
+    get_tax_rate_for_theater,
+    get_theater_state,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +54,8 @@ class AlertService:
         self._circuit_discount_cache: Dict[str, List['DiscountDayProgram']] = {}  # circuit_name -> list of programs
         self._theater_circuit_cache: Dict[str, str] = {}  # theater_name -> circuit_name
         self._simplified_service: Optional[SimplifiedBaselineService] = None
+        self._tax_config: Optional[Dict] = None
+        self._theater_state_cache: Dict[str, Optional[str]] = {}
 
     def get_config(self, session: Session) -> AlertConfiguration:
         """Load or create default configuration for company."""
@@ -111,8 +118,8 @@ class AlertService:
 
             for _, row in prices_df.iterrows():
                 theater_name = row.get('Theater Name', '')
-                ticket_type = row.get('Ticket Type', '')
-                format_type = row.get('Format', '2D') or '2D'
+                ticket_type = normalize_ticket_type(row.get('Ticket Type', '')) or ''
+                format_type = self._normalize_format(row.get('Format', '2D') or '2D')
 
                 # Parse price - handle both "$XX.XX" strings and numeric values
                 price_val = row.get('Price', 0)
@@ -120,13 +127,13 @@ class AlertService:
                     price_val = price_val.replace('$', '').replace(',', '')
                 try:
                     new_price = Decimal(str(price_val))
-                except:
+                except (ValueError, TypeError, ArithmeticError):
                     logger.warning(f"Could not parse price: {price_val}")
                     continue
 
                 play_date = row.get('play_date')
                 film_title = row.get('Film Title', '')
-                daypart = row.get('Daypart', '')
+                daypart = normalize_daypart(row.get('Daypart', '')) or ''
 
                 # Create unique key for this combination (including daypart for apples-to-apples)
                 combo_key = f"{theater_name}|{ticket_type}|{format_type}|{daypart}"
@@ -184,6 +191,11 @@ class AlertService:
 
         return False
 
+    @staticmethod
+    def _normalize_format(fmt: str) -> str:
+        """Delegate to the shared normalize_format function."""
+        return normalize_format(fmt) or fmt
+
     def _load_baselines_cache(self, session: Session):
         """Pre-load all active baselines for this company.
 
@@ -217,7 +229,9 @@ class AlertService:
                     skipped_discount += 1
                     continue
 
-            key = f"{baseline.theater_name}|{baseline.ticket_type}|{baseline.format or '*'}|{baseline.daypart or '*'}"
+            # Normalize format: "Standard" → "2D" so both sources match
+            fmt = self._normalize_format(baseline.format) or '*'
+            key = f"{baseline.theater_name}|{baseline.ticket_type}|{fmt}|{baseline.daypart or '*'}"
             existing = self._baselines_cache.get(key)
             if not existing:
                 self._baselines_cache[key] = baseline
@@ -246,8 +260,15 @@ class AlertService:
         2. theater|ticket_type|format|* (any daypart)
         3. theater|ticket_type|*|daypart (any format)
         4. theater|ticket_type|*|* (most general)
+
+        NOTE: 3D and PLF are NOT interchangeable — they have different pricing.
+        Only Fandango provides accurate PLF labels; EntTelligence lumps PLF
+        into '2D'. Format normalization maps 'Standard' ↔ '2D' only.
         """
         # NOTE: day_of_week parameter kept for backward compatibility but not used
+
+        # Normalize format: "Standard" → "2D"
+        format_type = self._normalize_format(format_type)
 
         # Try most specific first, then fall back to more general
         keys_to_try = [
@@ -311,7 +332,7 @@ class AlertService:
 
         for m in metadata:
             if m.circuit_name:
-                self._theater_circuit_cache[m.theater_name] = m.circuit_name
+                self._theater_circuit_cache[m.theater_name] = normalize_circuit_name(m.circuit_name)
 
         # Also detect circuits from theater names for theaters not in metadata
         # This ensures we can match even without explicit metadata entries
@@ -322,16 +343,17 @@ class AlertService:
 
         First checks metadata cache, then falls back to pattern matching.
         """
-        # Check cache first
+        # Check cache first (already normalized during load)
         if theater_name in self._theater_circuit_cache:
             return self._theater_circuit_cache[theater_name]
 
-        # Pattern matching fallback
+        # Pattern matching fallback — normalize to canonical short form
         theater_lower = theater_name.lower()
         for circuit in KNOWN_CIRCUITS:
             if theater_lower.startswith(circuit.lower()):
-                self._theater_circuit_cache[theater_name] = circuit
-                return circuit
+                normalized = normalize_circuit_name(circuit)
+                self._theater_circuit_cache[theater_name] = normalized
+                return normalized
 
         return None
 
@@ -450,10 +472,12 @@ class AlertService:
 
         return False, None
 
-    # Valid daypart values (lowercase) - must match to compare apples-to-apples
-    # Scraper produces: "Matinee", "Twilight", "Prime", "Late Night"
-    # EntTelligence produces: "Matinee", "Evening", "Late"
-    VALID_DAYPARTS = {'matinee', 'twilight', 'prime', 'late night', 'evening', 'late'}
+    # Valid daypart values (lowercase) - must match to compare apples-to-apples.
+    # Dayparts are normalized at entry via normalize_daypart() to canonical forms:
+    #   Matinee, Twilight, Prime, Late Night
+    # NOTE: 'Standard' is NOT valid here — it's a flat-pricing marker in baselines,
+    # not a daypart that should appear in incoming scrape data.
+    VALID_DAYPARTS = {'Matinee', 'Twilight', 'Prime', 'Late Night'}
 
     # Keywords that indicate special events (Fathom, marathons, re-releases, etc.)
     # These should not be compared against standard releases
@@ -466,6 +490,10 @@ class AlertService:
 
     # Price threshold - films priced above this are likely special events
     SPECIAL_EVENT_PRICE_THRESHOLD = Decimal('15.00')
+
+    # Keywords that indicate loyalty/AC ticket types
+    # These are discounted from original price, not from flat discount day price
+    LOYALTY_AC_KEYWORDS = {'ac ', ' ac', 'loyalty', 'alternative content', 'a-list', 'stubs'}
 
     # Day of week categories for pricing comparison
     # 0=Monday, 1=Tuesday, ... 6=Sunday
@@ -503,6 +531,20 @@ class AlertService:
 
         return False
 
+    def _is_loyalty_or_ac_ticket(self, ticket_type: str) -> bool:
+        """Check if ticket type is a loyalty/AC type discounted from original price.
+
+        Loyalty and alternative content tickets use a different discount model:
+        they are discounted from the regular ticket price, not from the flat
+        discount day price. For example, if "$5 Tuesdays" sets Adult to $5,
+        an "AC Loyalty Member" ticket at $10 (discounted from $13 regular)
+        should NOT be flagged as a discount day violation.
+        """
+        if not ticket_type:
+            return False
+        ticket_lower = ticket_type.lower()
+        return any(kw in ticket_lower for kw in self.LOYALTY_AC_KEYWORDS)
+
     def _check_price_change(
         self, session: Session, config: AlertConfiguration,
         theater_name: str, ticket_type: str, format_type: str,
@@ -521,8 +563,9 @@ class AlertService:
         """
 
         # CRITICAL: Skip if daypart is missing or invalid - cannot compare apples-to-apples
-        daypart_lower = (daypart or '').lower().strip()
-        if not daypart_lower or daypart_lower not in self.VALID_DAYPARTS:
+        # daypart is already normalized at the entry point (normalize_daypart())
+        daypart_canonical = (daypart or '').strip()
+        if not daypart_canonical or daypart_canonical not in self.VALID_DAYPARTS:
             logger.debug(f"Skipping alert check - invalid or missing daypart '{daypart}' for {theater_name}")
             return None
 
@@ -542,7 +585,7 @@ class AlertService:
         # shouldn't trigger "price decrease" alerts when comparing to normal days
         # Now checks BOTH circuit-level (DiscountDayProgram) and theater-level (DiscountProgram)
         is_discount, discount_program = self._is_discount_day(
-            theater_name, play_date, ticket_type, format_type, daypart_lower
+            theater_name, play_date, ticket_type, format_type, daypart_canonical
         )
         if is_discount:
             program_name = getattr(discount_program, 'program_name', 'unknown')
@@ -562,7 +605,7 @@ class AlertService:
                 Showing.theater_name == theater_name,
                 Price.ticket_type == ticket_type,
                 Showing.format == format_type,
-                func.lower(Showing.daypart) == daypart_lower,  # Case-insensitive daypart match
+                Showing.daypart == daypart_canonical,  # Canonical daypart match
                 Price.price < self.SPECIAL_EVENT_PRICE_THRESHOLD  # Exclude high-priced special events
             )
         ).order_by(Price.created_at.desc()).limit(20).all()  # Get more results to filter by day category
@@ -575,14 +618,14 @@ class AlertService:
             if self._get_day_category(row_play_date) != current_day_category:
                 continue
             # Exclude prices from known discount days
-            is_discount, _ = self._is_discount_day(theater_name, row_play_date, ticket_type, format_type, daypart_lower)
+            is_discount, _ = self._is_discount_day(theater_name, row_play_date, ticket_type, format_type, daypart_canonical)
             if is_discount:
                 continue
             matching_prices.append(row)
 
         if len(matching_prices) < 2:
             # Not enough history to compare - need at least 2 prices (current + previous)
-            logger.debug(f"Not enough {current_day_category} price history for {theater_name} {ticket_type} {format_type} ({daypart_lower})")
+            logger.debug(f"Not enough {current_day_category} price history for {theater_name} {ticket_type} {format_type} ({daypart_canonical})")
             return None
 
         # The most recent is the current price, the second is the previous
@@ -594,7 +637,7 @@ class AlertService:
         old_play_date = matching_prices[1][4]
 
         # Log comparison details for debugging
-        logger.debug(f"Comparing {current_day_category} prices at {theater_name} ({ticket_type}, {format_type}, {daypart_lower}): "
+        logger.debug(f"Comparing {current_day_category} prices at {theater_name} ({ticket_type}, {format_type}, {daypart_canonical}): "
                     f"'{old_film_title}' ${old_price} ({old_play_date}) vs '{film_title}' ${new_price} ({play_date})")
 
         if old_price == new_price:
@@ -678,14 +721,39 @@ class AlertService:
 
         if is_discount and discount_program:
             # On discount days, we expect lower prices - don't flag as surge
-            # But we COULD flag if price is HIGHER than expected discount
+            # But flag if price is HIGHER than expected discount (compliance violation)
             if expected_discount_price and current_price > expected_discount_price:
-                # Price higher than expected discount - potential issue
-                logger.info(f"Discount day price above expected: {theater_name} {ticket_type} {format_type}: "
-                           f"${current_price} vs expected ${expected_discount_price} "
-                           f"({discount_program.program_name})")
-                # For now, skip alerting on discount days entirely
-                # Future: could alert on "discount_day_overcharge"
+                # Skip special events - distributor-set pricing (Fathom, Met Opera, etc.)
+                if self._is_special_event(film_title, current_price):
+                    logger.debug(f"Discount day skip (special event): {film_title} at {theater_name}")
+                    return None
+
+                # Skip loyalty/AC tickets - discounted from original price, not flat discount
+                if self._is_loyalty_or_ac_ticket(ticket_type):
+                    logger.debug(f"Discount day skip (loyalty/AC): {ticket_type} for {film_title} at {theater_name}")
+                    return None
+
+                # Genuine discount day overcharge - generate alert with film name
+                percent_over = ((current_price - expected_discount_price) / expected_discount_price * 100)
+                logger.info(
+                    f"Discount day overcharge: {film_title} at {theater_name} "
+                    f"{ticket_type} {format_type}: ${current_price} vs expected "
+                    f"${expected_discount_price} ({discount_program.program_name})"
+                )
+                return PriceAlert(
+                    company_id=self.company_id,
+                    theater_name=theater_name,
+                    film_title=film_title,
+                    ticket_type=ticket_type,
+                    format=format_type,
+                    daypart=daypart,
+                    alert_type='discount_day_overcharge',
+                    old_price=expected_discount_price,
+                    new_price=current_price,
+                    price_change_percent=percent_over,
+                    play_date=play_date,
+                    triggered_at=datetime.now(UTC),
+                )
             return None
 
         # Find applicable baseline (SIMPLIFIED - no day_of_week matching)
@@ -709,10 +777,18 @@ class AlertService:
         adjusted_baseline = baseline_price
         if hasattr(baseline, 'tax_status') and baseline.tax_status == 'exclusive':
             # Baseline is tax-exclusive, current price likely tax-inclusive
-            # Add estimated tax to baseline for fair comparison
-            tax_rate = Decimal('0.09')  # Default 9% tax
+            # Add estimated tax to baseline for fair comparison using per-theater rate
+            if self._tax_config is None:
+                self._tax_config = get_tax_config(self.company_id)
+            if theater_name not in self._theater_state_cache:
+                self._theater_state_cache[theater_name] = get_theater_state(self.company_id, theater_name)
+            tax_rate = Decimal(str(get_tax_rate_for_theater(
+                self._tax_config, self._theater_state_cache[theater_name], theater_name=theater_name
+            )))
+            if tax_rate <= 0:
+                tax_rate = Decimal('0.075')  # Fallback for tax-inclusive circuits
             adjusted_baseline = baseline_price * (1 + tax_rate)
-            logger.debug(f"Adjusted baseline from ${baseline_price} to ${adjusted_baseline} for tax comparison")
+            logger.debug(f"Adjusted baseline from ${baseline_price} to ${adjusted_baseline} (tax rate {tax_rate}) for tax comparison")
 
         # Calculate surge against adjusted baseline
         surge_percent = ((current_price - adjusted_baseline) / adjusted_baseline * 100)

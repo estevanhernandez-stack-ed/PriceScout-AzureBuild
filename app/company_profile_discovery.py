@@ -32,6 +32,7 @@ from sqlalchemy.orm import Session
 
 from app.db_session import get_session
 from app.db_models import Price, Showing, CompanyProfile
+from app.simplified_baseline_service import normalize_daypart
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +58,7 @@ PREMIUM_FORMATS = {
     'IMAX', 'IMAX 3D', 'IMAX with Laser', 'IMAX HFR 3D',
     'Dolby Cinema', 'Dolby Atmos', 'Dolby Vision',
     '3D', 'RealD 3D', 'Digital 3D',
-    'PLF', 'Premium Large Format', 'XD', 'RPX', 'BigD',
+    'PLF', 'Premium Large Format', 'Premium Format', 'XD', 'RPX', 'BigD',
     '4DX', 'D-BOX', 'ScreenX', 'MX4D',
     'Laser IMAX', 'GTX', 'UltraAVX', 'UltraScreen',
 }
@@ -260,7 +261,7 @@ class CompanyProfileDiscoveryService:
 
         for row in price_data:
             ticket_type_lower = (row['ticket_type'] or '').lower()
-            daypart_lower = (row['daypart'] or '').lower()
+            daypart_norm = normalize_daypart(row['daypart']) or row.get('daypart') or ''
 
             # Check if "matinee" is in the ticket type itself
             if 'matinee' in ticket_type_lower:
@@ -277,7 +278,7 @@ class CompanyProfileDiscoveryService:
                     matinee_prices['flat_matinee'].append(row['price'])
 
             # Check if daypart is matinee with age-based ticket type
-            elif 'matinee' in daypart_lower:
+            elif daypart_norm == 'Matinee':
                 if 'adult' in ticket_type_lower:
                     adult_matinee_prices.append(row['price'])
                 elif 'child' in ticket_type_lower:
@@ -311,7 +312,7 @@ class CompanyProfileDiscoveryService:
         daypart_times = defaultdict(list)
 
         for row in price_data:
-            daypart = row['daypart']
+            daypart = normalize_daypart(row['daypart']) or row.get('daypart')
             showtime = row['showtime']
             if daypart and showtime:
                 dayparts_seen.add(daypart)

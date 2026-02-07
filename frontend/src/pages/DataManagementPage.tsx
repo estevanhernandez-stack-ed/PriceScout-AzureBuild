@@ -498,7 +498,7 @@ export function DataManagementPage() {
 
                         {expandedMarket === market.market_name && fullCacheData?.markets?.[market.market_name] && (
                            <div className="pl-6 space-y-1 pb-2">
-                              {fullCacheData.markets[market.market_name].theaters.map((t: any) => (
+                              {fullCacheData.markets[market.market_name].theaters.map((t: { name: string; url?: string; status?: string }) => (
                                  <div key={t.name} className="flex items-center justify-between p-2 text-xs border rounded-md bg-background shadow-sm">
                                     <div className="flex-1 min-w-0">
                                        <p className="font-medium truncate">{t.name}</p>

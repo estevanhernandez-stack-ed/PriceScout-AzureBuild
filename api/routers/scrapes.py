@@ -1,7 +1,33 @@
-from fastapi import APIRouter, Security, HTTPException, BackgroundTasks, Depends
+"""
+Scrapes API Router
+
+Endpoints for managing Fandango web scraping operations: triggering scrapes,
+monitoring job status, searching theaters, and saving results.
+
+Endpoints:
+    GET    /api/v1/scrapes/active-theaters       - List theaters currently being scraped
+    POST   /api/v1/scrapes/check-collision       - Check if scrape would conflict
+    GET    /api/v1/scrapes/jobs                   - List recent scrape jobs
+    POST   /api/v1/scrapes/jobs/{job_id}/cancel   - Cancel a running scrape job
+    GET    /api/v1/scrapes/search-theaters/fandango - Search Fandango for theaters
+    GET    /api/v1/scrapes/search-theaters/cache    - Search local theater cache
+    POST   /api/v1/scrapes/fetch-showtimes       - Fetch showtimes for a theater
+    POST   /api/v1/scrapes/estimate-time         - Estimate scrape duration
+    POST   /api/v1/scrapes/operating-hours       - Scrape operating hours data
+    POST   /api/v1/scrapes/save                  - Save scraped data to database
+    POST   /api/v1/scrape_runs                   - Create a scrape run record
+    POST   /api/v1/scrapes/trigger               - Trigger a full scrape job
+    GET    /api/v1/scrapes/{job_id}/status        - Get scrape job status
+    POST   /api/v1/scrapes/{job_id}/cancel        - Cancel a scrape by job ID
+    POST   /api/v1/scrapes/compare-counts        - Compare showtime counts across sources
+    POST   /api/v1/scrapes/compare-showtimes     - Verify Fandango showtimes against EntTelligence cache
+"""
+
+from fastapi import APIRouter, Security, HTTPException, Depends
 from api.routers.auth import get_current_user, User, require_operator
 from api.telemetry import track_scrape_completed, track_event
 from app.audit_service import audit_service
+from app.simplified_baseline_service import normalize_theater_name
 from app import db_adapter as database
 from app import config
 import pandas as pd
@@ -10,6 +36,7 @@ from typing import List, Dict, Any, Optional
 import time
 import asyncio
 import sys
+import threading
 import concurrent.futures
 from datetime import datetime, date
 
@@ -54,6 +81,38 @@ def _run_async_in_thread_blocking(coro):
     For background tasks, use the async _run_async_in_thread() instead.
     """
     return _run_async_in_thread_sync(coro)
+
+
+def _launch_in_thread(async_fn, *args, **kwargs):
+    """
+    Launch an async function in a completely separate thread with its own event loop.
+
+    This prevents long-running jobs (scrapes, syncs) from blocking the main
+    FastAPI event loop, keeping the API responsive for status checks and
+    other requests while a scrape runs in the background.
+    """
+    def _thread_target():
+        if sys.platform == 'win32':
+            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(async_fn(*args, **kwargs))
+        except Exception as e:
+            print(f"[Thread] Background job failed: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            loop.close()
+
+    thread = threading.Thread(
+        target=_thread_target,
+        daemon=True,
+        name=f"scrape-{threading.active_count()}"
+    )
+    thread.start()
+    return thread
+
 
 # In-memory job storage (in production, use Redis or database)
 _scrape_jobs: Dict[int, Dict[str, Any]] = {}
@@ -196,6 +255,35 @@ class ScrapeStatusResponse(BaseModel):
 
 
 # ============================================================================
+# Theater Search & Collision Check Models
+# ============================================================================
+
+class ActiveTheaterItem(BaseModel):
+    """A theater currently being scraped."""
+    url: str
+    job_id: int
+
+
+class ActiveTheatersResponse(BaseModel):
+    """Response for active theaters query."""
+    active_theater_count: int
+    theaters: List[ActiveTheaterItem]
+
+
+class CollisionCheckResponse(BaseModel):
+    """Response for collision check - fields are optional when no collision."""
+    has_collision: bool
+    conflicting_theaters: Optional[List[str]] = None
+    conflicting_job_ids: Optional[List[int]] = None
+
+
+class FandangoTheaterSearchResult(BaseModel):
+    """A theater found from Fandango search."""
+    name: str
+    url: str
+
+
+# ============================================================================
 # Operating Hours Models
 # ============================================================================
 
@@ -243,7 +331,7 @@ class OperatingHoursResponse(BaseModel):
     error: Optional[str] = None
 
 
-@router.get("/scrapes/active-theaters", tags=["Scrapes"])
+@router.get("/scrapes/active-theaters", tags=["Scrapes"], response_model=ActiveTheatersResponse)
 async def get_active_theaters(current_user: User = Security(get_current_user, scopes=["read:scrapes"])):
     """
     Get list of theaters currently being scraped.
@@ -261,7 +349,7 @@ async def get_active_theaters(current_user: User = Security(get_current_user, sc
     }
 
 
-@router.post("/scrapes/check-collision", tags=["Scrapes"])
+@router.post("/scrapes/check-collision", tags=["Scrapes"], response_model=CollisionCheckResponse)
 async def check_theater_collision(
     theaters: List[TheaterRequest],
     current_user: User = Security(get_current_user, scopes=["read:scrapes"])
@@ -335,7 +423,7 @@ async def cancel_scrape_job(job_id: int, current_user: User = Security(get_curre
     return {"message": f"Job already in state: {job.get('status')}"}
 
 
-@router.get("/scrapes/search-theaters/fandango", tags=["Scrapes"])
+@router.get("/scrapes/search-theaters/fandango", tags=["Scrapes"], response_model=List[FandangoTheaterSearchResult])
 async def search_theaters_fandango(
     query: str,
     search_type: str = "name",  # 'name' or 'zip'
@@ -354,11 +442,16 @@ async def search_theaters_fandango(
                 from datetime import date as dt_date, timedelta
                 date = (dt_date.today() + timedelta(days=1)).strftime('%Y-%m-%d')
             results = await scout.live_search_by_zip(query, date)
+            # Convert dictionary to list for frontend
+            return [{"name": name, "url": data["url"]} for name, data in results.items()]
         else:
-            results = await scout.live_search_by_name(query)
-            
-        # Convert dictionary to list for frontend
-        return [{"name": name, "url": data["url"]} for name, data in results.items()]
+            # Use discover_theater_url (URL-based search) instead of live_search_by_name
+            # (UI selector-based) which breaks when Fandango updates their site
+            result = await scout.discover_theater_url(query)
+            return [
+                {"name": t["name"], "url": t["url"]}
+                for t in result.get("all_results", [])
+            ]
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -612,7 +705,7 @@ async def fetch_operating_hours(
                                 try:
                                     normalized = normalize_time_string(t)
                                     return dt.strptime(normalized, "%I:%M%p")
-                                except:
+                                except Exception:
                                     return dt.strptime("12:00PM", "%I:%M%p")
 
                             parsed_times = [(t, parse_time(t)) for t in times]
@@ -835,7 +928,6 @@ async def create_scrape_run(mode: str, context: str, current_user: User = Securi
 @router.post("/scrapes/trigger", response_model=TriggerScrapeResponse, tags=["Scrapes"])
 async def trigger_scrape(
     request: TriggerScrapeRequest,
-    background_tasks: BackgroundTasks,
     current_user: dict = Depends(require_operator)
 ):
     """
@@ -900,8 +992,8 @@ async def trigger_scrape(
         _scrape_jobs[job_id]["celery_task_id"] = task.id
         _scrape_jobs[job_id]["status"] = "distributed"
     else:
-        # Fallback to local background task
-        background_tasks.add_task(
+        # Launch scrape in a separate thread so the API stays responsive
+        _launch_in_thread(
             run_scrape_job,
             job_id,
             request.mode,
@@ -1073,6 +1165,7 @@ async def run_scrape_job(
     job["use_cache"] = use_cache
     job["cache_hits"] = 0
     job["cache_misses"] = 0
+    company_id = config.DEFAULT_COMPANY_ID
     start_time = time.time()
 
     # Initialize cache service if using cache
@@ -1089,12 +1182,18 @@ async def run_scrape_job(
     # Progress tracking variables
     base_showings_completed = 0  # Cumulative from previous theater/date batches
 
+    # Lock the total when user provided explicit selections
+    has_fixed_total = selected_keys_set is not None and len(selected_keys_set) > 0
+    if has_fixed_total:
+        job["showings_total"] = len(selected_keys_set)
+
     def make_progress_callback(total_showings: int):
         """Create a progress callback for the current batch of showings."""
         def progress_callback(current: int, total: int):
             job["showings_completed"] = base_showings_completed + current
-            job["showings_total"] = max(job.get("showings_total", 0), base_showings_completed + total)
-            # Calculate overall progress based on showings
+            # Only update the total if the user didn't provide a fixed selection
+            if not has_fixed_total:
+                job["showings_total"] = max(job.get("showings_total", 0), base_showings_completed + total)
             if job["showings_total"] > 0:
                 job["progress"] = int((job["showings_completed"] / job["showings_total"]) * 100)
             job["current_showing"] = f"{current}/{total}"
@@ -1194,48 +1293,71 @@ async def run_scrape_job(
                                     key = f"{date_str}|{theater['name']}|{film}|{st}|{fmt}"
                                     showtime_keys_for_cache.append((key, showing))
 
-                                # Lookup all keys in cache
-                                cache_lookup = cache_service.lookup_cached_prices(
+                                # Lookup all keys in cache (returns all ticket types per key)
+                                cache_lookup = cache_service.lookup_cached_prices_all_types(
                                     [k for k, _ in showtime_keys_for_cache],
-                                    company_id=1,
+                                    company_id=company_id,
                                     max_age_hours=cache_max_age_hours
                                 )
 
                                 for key, showing in showtime_keys_for_cache:
-                                    cached = cache_lookup.get(key)
-                                    if cached:
-                                        # Cache hit - use cached price
+                                    cached_list = cache_lookup.get(key, [])
+                                    if cached_list:
+                                        # Cache hit - build one result per ticket type
                                         job["cache_hits"] = job.get("cache_hits", 0) + 1
-                                        fmt = cached.format or showing.get("format")
-                                        # Convert play_date to date object if it's a string
-                                        play_date = cached.play_date
-                                        if isinstance(play_date, str):
-                                            play_date = datetime.strptime(play_date, "%Y-%m-%d").date()
-                                        cached_results.append({
-                                            # snake_case for React frontend
-                                            "theater_name": cached.theater_name,
-                                            "film_title": cached.film_title,
-                                            "showtime": cached.showtime,
-                                            "price": f"${cached.price:.2f}",
-                                            "ticket_type": cached.ticket_type,
-                                            "format": fmt,
-                                            "play_date": play_date,
-                                            "source": "enttelligence_cache",
-                                            "fetched_at": cached.fetched_at.isoformat(),
-                                            # Title Case for backward compatibility with save_prices
-                                            "Theater Name": cached.theater_name,
-                                            "Film Title": cached.film_title,
-                                            "Showtime": cached.showtime,
-                                            "Price": f"${cached.price:.2f}",
-                                            "Ticket Type": cached.ticket_type,
-                                            "Format": fmt,
-                                        })
+                                        for cached in cached_list:
+                                            fmt = cached.format or showing.get("format")
+                                            # Convert play_date to date object if it's a string
+                                            play_date = cached.play_date
+                                            if isinstance(play_date, str):
+                                                play_date = datetime.strptime(play_date, "%Y-%m-%d").date()
+                                            # Build result with tax estimation
+                                            result_entry = {
+                                                # snake_case for React frontend
+                                                "theater_name": cached.theater_name,
+                                                "film_title": cached.film_title,
+                                                "showtime": cached.showtime,
+                                                "price": f"${cached.price:.2f}",
+                                                "price_raw": cached.price,
+                                                "ticket_type": cached.ticket_type,
+                                                "format": fmt,
+                                                "play_date": play_date,
+                                                "source": "enttelligence_cache",
+                                                "fetched_at": cached.fetched_at.isoformat(),
+                                                # Title Case for backward compatibility with save_prices
+                                                "Theater Name": cached.theater_name,
+                                                "Film Title": cached.film_title,
+                                                "Showtime": cached.showtime,
+                                                "Price": f"${cached.price:.2f}",
+                                                "Ticket Type": cached.ticket_type,
+                                                "Format": fmt,
+                                            }
+
+                                            # Add tax estimation if available
+                                            try:
+                                                from api.services.tax_estimation import (
+                                                    get_tax_config as _get_tax_cfg,
+                                                    get_theater_state,
+                                                    get_tax_rate_for_theater,
+                                                    apply_estimated_tax,
+                                                )
+                                                tc = _get_tax_cfg(company_id)
+                                                if tc.get("enabled"):
+                                                    st = get_theater_state(company_id, cached.theater_name)
+                                                    rate = get_tax_rate_for_theater(tc, st, theater_name=cached.theater_name)
+                                                    adj = apply_estimated_tax(cached.price, rate)
+                                                    result_entry["price_estimated_with_tax"] = adj
+                                                    result_entry["tax_rate"] = rate
+                                            except Exception:
+                                                pass  # Tax estimation is optional
+
+                                            cached_results.append(result_entry)
                                     else:
                                         # Cache miss - need to scrape
                                         job["cache_misses"] = job.get("cache_misses", 0) + 1
                                         showings_to_scrape.append(showing)
 
-                                print(f"  [SCRAPER] Cache: {job['cache_hits']} hits, {job['cache_misses']} misses for {theater['name']}")
+                                print(f"  [SCRAPER] Cache: {job['cache_hits']} hits ({len(cached_results)} prices incl. Child/Senior), {job['cache_misses']} misses for {theater['name']}")
 
                                 # Add cached results immediately and update progress
                                 if cached_results:
@@ -1352,6 +1474,23 @@ async def run_scrape_job(
                     import traceback
                     traceback.print_exc()
 
+                # Auto-refresh baselines with drift protection
+                try:
+                    from app.baseline_guard import trigger_post_scrape_refresh
+
+                    company_id = getattr(config, 'CURRENT_COMPANY_ID', 1)
+                    refresh_result = trigger_post_scrape_refresh(company_id, source="fandango")
+                    applied = refresh_result.get("applied", 0)
+                    new = refresh_result.get("new", 0)
+                    flagged = refresh_result.get("flagged", 0)
+                    if applied or new or flagged:
+                        print(
+                            f"[SCRAPE JOB {job_id}] Baseline auto-refresh: "
+                            f"{applied} updated, {new} new, {flagged} flagged for review"
+                        )
+                except Exception as refresh_err:
+                    print(f"Warning: Baseline auto-refresh failed: {refresh_err}")
+
             except Exception as e:
                 print(f"Error saving results to database: {e}")
                 import traceback
@@ -1377,6 +1516,392 @@ async def run_scrape_job(
             "JobId": str(job_id),
             "Error": str(e)
         })
+
+
+# ============================================================================
+# Fandango Verification (Spot-Check EntTelligence + Tax vs Fandango)
+# ============================================================================
+
+class VerifyPricesRequest(BaseModel):
+    theaters: List[Dict[str, str]]  # Same format as trigger scrape: [{name, url}]
+    dates: List[str]  # YYYY-MM-DD
+    selected_showtimes: Optional[List[str]] = None  # Optional "date|theater|film|time|format" keys
+    market: Optional[str] = None
+
+
+class PriceVerificationItem(BaseModel):
+    theater_name: str
+    film_title: str
+    showtime: str
+    format: Optional[str] = None
+    ticket_type: str
+    fandango_price: float
+    enttelligence_price: float
+    tax_rate: float
+    enttelligence_with_tax: float
+    difference: float
+    difference_percent: float
+    match_status: str  # 'exact' (<$0.01), 'close' (<2%), 'divergent' (>2%)
+
+
+class VerificationSummary(BaseModel):
+    total_verified: int
+    exact_matches: int
+    close_matches: int
+    divergent: int
+    avg_difference_percent: float
+
+
+class VerificationResponse(BaseModel):
+    job_id: int
+    status: str
+    summary: Optional[VerificationSummary] = None
+    comparisons: Optional[List[PriceVerificationItem]] = None
+    fandango_only: Optional[int] = None  # Prices scraped from Fandango with no cache match
+    error: Optional[str] = None
+
+
+@router.post("/scrapes/verify-prices", tags=["Scrapes"])
+async def verify_prices(
+    request: VerifyPricesRequest,
+    current_user: User = Security(get_current_user, scopes=["read:scrapes"])
+):
+    """
+    Run a Fandango verification scrape: scrapes Fandango live, then compares
+    each price against EntTelligence cache + estimated tax.
+
+    This is a spot-check tool to validate that EntTelligence + tax estimation
+    matches real Fandango prices.
+
+    Returns a job ID; poll /scrapes/{job_id}/status for results.
+    """
+    if not request.theaters:
+        raise HTTPException(status_code=400, detail="No theaters specified")
+    if not request.dates:
+        raise HTTPException(status_code=400, detail="No dates specified")
+
+    # Create verification job (reuses scrape job infrastructure)
+    job_id = int(time.time() * 1000) % 1000000
+    _scrape_jobs[job_id] = {
+        "job_id": job_id,
+        "mode": "verification",
+        "status": "pending",
+        "theaters_total": len(request.theaters),
+        "theaters_completed": 0,
+        "showings_total": 0,
+        "showings_completed": 0,
+        "progress": 0,
+        "results": [],
+        "market": request.market,
+        "current_theater": None,
+        "verification_results": None,
+    }
+
+    # Audit
+    audit_service.data_event(
+        event_type="verify_prices",
+        user_id=current_user.get("user_id"),
+        username=current_user.get("username"),
+        company_id=current_user.get("company_id") or 1,
+        details={
+            "job_id": job_id,
+            "theater_count": len(request.theaters),
+            "dates": request.dates,
+        }
+    )
+
+    # Launch verification in a separate thread so the API stays responsive
+    _launch_in_thread(
+        run_verification_job,
+        job_id=job_id,
+        theaters=request.theaters,
+        dates=request.dates,
+        selected_showtime_keys=request.selected_showtimes,
+        market=request.market,
+    )
+
+    return {"job_id": job_id, "status": "pending", "message": "Verification job started"}
+
+
+async def run_verification_job(
+    job_id: int,
+    theaters: List[Dict[str, str]],
+    dates: List[str],
+    selected_showtime_keys: Optional[List[str]] = None,
+    market: Optional[str] = None,
+):
+    """
+    Background task: scrape Fandango (never cache), then compare each price
+    against EntTelligence cache + tax estimation.
+    """
+    job = _scrape_jobs[job_id]
+    job["status"] = "running"
+    company_id = config.DEFAULT_COMPANY_ID
+    start_time = time.time()
+
+    try:
+        # Step 1: Run a full Fandango scrape (use_cache=False)
+        # We'll reuse the same scraper infrastructure
+        from app.scraper import Scraper
+        scout = Scraper()
+
+        selected_keys_set = set(selected_showtime_keys) if selected_showtime_keys else None
+        all_fandango_results = []
+
+        for theater in theaters:
+            if job.get("status") == "cancelled":
+                break
+
+            job["current_theater"] = theater["name"]
+
+            try:
+                theater_obj = type('Theater', (), {'name': theater["name"], 'url': theater.get("url", "")})()
+
+                for date_str in dates:
+                    if job.get("status") == "cancelled":
+                        break
+
+                    # Fetch showtimes
+                    showtime_data = await _run_async_in_thread(
+                        scout.fetch_showtimes(theater_obj, date_str)
+                    )
+                    if not showtime_data:
+                        continue
+
+                    # Filter by selected keys if provided
+                    if selected_keys_set:
+                        filtered = []
+                        for showing in showtime_data:
+                            film = showing.get("film_title", "Unknown")
+                            st = showing.get("showtime", "")
+                            fmt = showing.get("format", "Standard")
+                            key = f"{date_str}|{theater['name']}|{film}|{st}|{fmt}"
+                            if key in selected_keys_set:
+                                filtered.append(showing)
+                        showtime_data = filtered
+
+                    if not showtime_data:
+                        continue
+
+                    job["showings_total"] = job.get("showings_total", 0) + len(showtime_data)
+
+                    # Build selected_showtimes for scraper
+                    selected_showtimes = {}
+                    for showing in showtime_data:
+                        film = showing.get("film_title", "Unknown")
+                        showtime = showing.get("showtime", "")
+                        if date_str not in selected_showtimes:
+                            selected_showtimes[date_str] = {}
+                        if theater["name"] not in selected_showtimes[date_str]:
+                            selected_showtimes[date_str][theater["name"]] = {}
+                        if film not in selected_showtimes[date_str][theater["name"]]:
+                            selected_showtimes[date_str][theater["name"]][film] = {}
+                        selected_showtimes[date_str][theater["name"]][film][showtime] = [showing]
+
+                    # Scrape from Fandango (never cache)
+                    result, _ = await _run_async_in_thread(
+                        scout.scrape_details([theater_obj], selected_showtimes)
+                    )
+
+                    if result:
+                        play_date_obj = datetime.strptime(date_str, "%Y-%m-%d").date()
+                        for r in result:
+                            r["source"] = "fandango"
+                            r["play_date"] = play_date_obj
+                        all_fandango_results.extend(result)
+
+                    job["showings_completed"] = job.get("showings_completed", 0) + len(showtime_data)
+                    if job["showings_total"] > 0:
+                        job["progress"] = int((job["showings_completed"] / job["showings_total"]) * 100)
+
+                job["theaters_completed"] = job.get("theaters_completed", 0) + 1
+
+            except Exception as e:
+                print(f"[VERIFY] Error processing {theater['name']}: {e}")
+                import traceback
+                traceback.print_exc()
+                continue
+
+        # Step 2: Look up EntTelligence cache prices for the same showings
+        verification_items = []
+        fandango_only_count = 0
+
+        try:
+            from api.services.enttelligence_cache_service import get_cache_service
+            cache_service = get_cache_service()
+        except Exception as e:
+            print(f"[VERIFY] Cache service unavailable: {e}")
+            cache_service = None
+
+        # Load tax config once
+        tax_config = None
+        try:
+            from api.services.tax_estimation import (
+                get_tax_config as _get_tax_cfg,
+                get_theater_state,
+                get_tax_rate_for_theater,
+                apply_estimated_tax,
+            )
+            tax_config = _get_tax_cfg(company_id)
+        except Exception:
+            pass
+
+        if cache_service and all_fandango_results:
+            # Build cache lookup keys from Fandango results
+            from api.services.enttelligence_cache_service import normalize_film_title, normalize_showtime
+
+            fandango_by_key = {}
+            cache_keys = []
+            for r in all_fandango_results:
+                theater_name = r.get("theater_name") or r.get("Theater Name", "")
+                film_title = r.get("film_title") or r.get("Film Title", "")
+                showtime = r.get("showtime") or r.get("Showtime", "")
+                play_date = r.get("play_date")
+                ticket_type = r.get("ticket_type") or r.get("Ticket Type", "Adult")
+                fandango_price_str = r.get("price_raw") or r.get("price") or r.get("Price", "0")
+
+                if isinstance(fandango_price_str, str):
+                    fandango_price_str = fandango_price_str.replace("$", "").strip()
+                fandango_price = float(fandango_price_str) if fandango_price_str else 0
+
+                if isinstance(play_date, date):
+                    date_str = play_date.strftime("%Y-%m-%d")
+                else:
+                    date_str = str(play_date) if play_date else ""
+
+                key = f"{date_str}|{theater_name}|{film_title}|{showtime}"
+                cache_keys.append(key)
+                if key not in fandango_by_key:
+                    fandango_by_key[key] = []
+                fandango_by_key[key].append({
+                    "theater_name": theater_name,
+                    "film_title": film_title,
+                    "showtime": showtime,
+                    "format": r.get("format") or r.get("Format"),
+                    "ticket_type": ticket_type,
+                    "fandango_price": fandango_price,
+                })
+
+            # Deduplicate cache keys
+            unique_keys = list(set(cache_keys))
+
+            # Lookup all ticket types from cache
+            cache_results = cache_service.lookup_cached_prices_all_types(
+                unique_keys, company_id=company_id
+            )
+
+            # Compare each Fandango result against cache
+            for key, fandango_items in fandango_by_key.items():
+                cached_list = cache_results.get(key, [])
+
+                # Build dict of cached prices by ticket type
+                cached_by_type = {c.ticket_type: c for c in cached_list}
+
+                for fitem in fandango_items:
+                    tt = fitem["ticket_type"]
+                    cached = cached_by_type.get(tt)
+
+                    if not cached:
+                        fandango_only_count += 1
+                        continue
+
+                    # Get tax rate for this theater
+                    tax_rate = 0.0
+                    ent_with_tax = cached.price
+                    if tax_config and tax_config.get("enabled"):
+                        try:
+                            st = get_theater_state(company_id, fitem["theater_name"])
+                            tax_rate = get_tax_rate_for_theater(tax_config, st, theater_name=fitem["theater_name"])
+                            ent_with_tax = apply_estimated_tax(cached.price, tax_rate)
+                        except Exception:
+                            pass
+
+                    diff = ent_with_tax - fitem["fandango_price"]
+                    diff_pct = (diff / fitem["fandango_price"] * 100) if fitem["fandango_price"] > 0 else 0
+
+                    # Determine match status
+                    if abs(diff) < 0.01:
+                        match_status = "exact"
+                    elif abs(diff_pct) < 2.0:
+                        match_status = "close"
+                    else:
+                        match_status = "divergent"
+
+                    verification_items.append(PriceVerificationItem(
+                        theater_name=fitem["theater_name"],
+                        film_title=fitem["film_title"],
+                        showtime=fitem["showtime"],
+                        format=fitem.get("format"),
+                        ticket_type=tt,
+                        fandango_price=fitem["fandango_price"],
+                        enttelligence_price=cached.price,
+                        tax_rate=tax_rate,
+                        enttelligence_with_tax=round(ent_with_tax, 2),
+                        difference=round(diff, 2),
+                        difference_percent=round(diff_pct, 1),
+                        match_status=match_status,
+                    ))
+
+        # Build summary
+        exact = sum(1 for v in verification_items if v.match_status == "exact")
+        close = sum(1 for v in verification_items if v.match_status == "close")
+        divergent = sum(1 for v in verification_items if v.match_status == "divergent")
+        avg_diff_pct = (
+            sum(abs(v.difference_percent) for v in verification_items) / len(verification_items)
+            if verification_items else 0
+        )
+
+        summary = VerificationSummary(
+            total_verified=len(verification_items),
+            exact_matches=exact,
+            close_matches=close,
+            divergent=divergent,
+            avg_difference_percent=round(avg_diff_pct, 1),
+        )
+
+        job["status"] = "completed"
+        job["progress"] = 100
+        job["current_theater"] = None
+        job["duration_seconds"] = time.time() - start_time
+        job["results"] = all_fandango_results
+        job["verification_results"] = VerificationResponse(
+            job_id=job_id,
+            status="completed",
+            summary=summary,
+            comparisons=verification_items,
+            fandango_only=fandango_only_count,
+        ).model_dump()
+
+        print(f"[VERIFY JOB {job_id}] Complete: {len(verification_items)} comparisons, "
+              f"{exact} exact, {close} close, {divergent} divergent, "
+              f"{fandango_only_count} fandango-only")
+
+    except Exception as e:
+        job["status"] = "failed"
+        job["error"] = str(e)
+        job["duration_seconds"] = time.time() - start_time
+        print(f"[VERIFY JOB {job_id}] Failed: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+@router.get("/scrapes/{job_id}/verification", tags=["Scrapes"])
+async def get_verification_results(
+    job_id: int,
+    current_user: User = Security(get_current_user, scopes=["read:scrapes"])
+):
+    """Get verification results for a completed verification job."""
+    if job_id not in _scrape_jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    job = _scrape_jobs[job_id]
+    if job.get("mode") != "verification":
+        raise HTTPException(status_code=400, detail="Not a verification job")
+
+    if job["status"] != "completed":
+        return {"job_id": job_id, "status": job["status"], "progress": job.get("progress", 0)}
+
+    return job.get("verification_results", {"job_id": job_id, "status": "completed", "comparisons": []})
 
 
 # ============================================================================
@@ -1634,3 +2159,394 @@ async def compare_showtime_counts(
         current_time=current_time_str,
         filter_applied=f"Only counting showtimes >= {current_time_str}"
     )
+
+
+# =============================================================================
+# SHOWTIME VERIFICATION (Fandango vs EntTelligence Cache)
+# =============================================================================
+
+
+class ShowtimeMatchItem(BaseModel):
+    date: str
+    theater_name: str
+    film_title: str
+    showtime: str  # Original Fandango format ("7:30pm")
+    format: str
+    status: str  # 'cached' | 'new' | 'missing_from_fandango'
+    cached_price: Optional[float] = None
+    cache_age_minutes: Optional[int] = None
+
+
+class TheaterVerificationSummary(BaseModel):
+    theater_name: str
+    cached_count: int
+    new_count: int
+    missing_count: int
+    total_fandango: int
+    total_cached: int
+    closure_warning: bool = False
+    closure_reason: Optional[str] = None
+
+
+class CompareShowtimesRequest(BaseModel):
+    theaters: List[str]
+    play_dates: List[str]  # YYYY-MM-DD format
+    fandango_showtimes: Dict[str, Dict[str, List[Dict[str, Any]]]]
+    # Shape: {date: {theater: [{film_title, format, showtime, ...}]}}
+    company_id: Optional[int] = 1
+
+
+class CompareShowtimesResponse(BaseModel):
+    summary: Dict[str, Any]  # {cached, new, missing, closure_warnings}
+    by_theater: List[TheaterVerificationSummary]
+    matches: List[ShowtimeMatchItem]
+    cache_freshness: Optional[str] = None
+
+
+@router.post("/scrapes/compare-showtimes", response_model=CompareShowtimesResponse, tags=["Scrapes"])
+async def compare_showtimes(
+    request: CompareShowtimesRequest,
+    current_user: User = Security(get_current_user, scopes=["read:scrapes"])
+):
+    """
+    Compare Fandango live showtimes against EntTelligence cache.
+
+    After fetching showtimes from Fandango, this endpoint checks which showtimes
+    have cached pricing (no scrape needed), which are new (need scraping), and
+    which are missing from Fandango (possible closure/cancellation).
+    """
+    from api.services.enttelligence_cache_service import (
+        EntTelligenceCacheService, normalize_film_title, normalize_showtime
+    )
+
+    company_id = request.company_id or 1
+    cache_service = EntTelligenceCacheService()
+
+    # 1. Get all cached showtimes for these theaters/dates
+    cached_data = cache_service.get_cached_showtimes_for_theater_dates(
+        theater_names=request.theaters,
+        play_dates=request.play_dates,
+        company_id=company_id,
+    )
+
+    # 2. Build normalized lookup from cache entries
+    # Key: "date|theater|normalized_film|normalized_time"
+    cache_lookup: Dict[str, Dict[str, Any]] = {}
+    cache_matched: set = set()  # Track which cache entries get matched
+
+    for date_str, theaters in cached_data.items():
+        for theater_name, entries in theaters.items():
+            for entry in entries:
+                norm_film = normalize_film_title(entry['film_title'])
+                norm_time = normalize_showtime(entry['showtime'])
+                key = f"{date_str}|{theater_name}|{norm_film}|{norm_time}"
+                cache_lookup[key] = entry
+
+    # 3. Compare Fandango showtimes against cache
+    matches: List[ShowtimeMatchItem] = []
+    now = datetime.now()
+
+    for date_str, theaters in request.fandango_showtimes.items():
+        for theater_name, showings in theaters.items():
+            for showing in showings:
+                film_title = showing.get('film_title', '')
+                showtime_str = showing.get('showtime', '')
+                fmt = showing.get('format', '')
+
+                norm_film = normalize_film_title(film_title)
+                norm_time = normalize_showtime(showtime_str)
+                key = f"{date_str}|{theater_name}|{norm_film}|{norm_time}"
+
+                if key in cache_lookup:
+                    cache_entry = cache_lookup[key]
+                    cache_matched.add(key)
+
+                    # Calculate cache age in minutes
+                    age_minutes = None
+                    fetched_at = cache_entry.get('fetched_at')
+                    if fetched_at:
+                        try:
+                            fetched_dt = datetime.fromisoformat(str(fetched_at))
+                            age_minutes = int((now - fetched_dt.replace(tzinfo=None)).total_seconds() / 60)
+                        except (ValueError, TypeError):
+                            pass
+
+                    matches.append(ShowtimeMatchItem(
+                        date=date_str,
+                        theater_name=theater_name,
+                        film_title=film_title,
+                        showtime=showtime_str,
+                        format=fmt,
+                        status='cached',
+                        cached_price=cache_entry.get('adult_price'),
+                        cache_age_minutes=age_minutes,
+                    ))
+                else:
+                    matches.append(ShowtimeMatchItem(
+                        date=date_str,
+                        theater_name=theater_name,
+                        film_title=film_title,
+                        showtime=showtime_str,
+                        format=fmt,
+                        status='new',
+                    ))
+
+    # 4. Find cache entries missing from Fandango
+    for key, entry in cache_lookup.items():
+        if key not in cache_matched:
+            parts = key.split('|')
+            if len(parts) >= 4:
+                matches.append(ShowtimeMatchItem(
+                    date=parts[0],
+                    theater_name=parts[1],
+                    film_title=entry['film_title'],
+                    showtime=entry['showtime'],
+                    format=entry.get('format') or '',
+                    status='missing_from_fandango',
+                    cached_price=entry.get('adult_price'),
+                ))
+
+    # 5. Build per-theater summaries with closure detection
+    theater_summaries: Dict[str, TheaterVerificationSummary] = {}
+
+    for theater_name in request.theaters:
+        # Count Fandango showtimes for this theater
+        fandango_count = 0
+        for date_str, theaters in request.fandango_showtimes.items():
+            fandango_count += len(theaters.get(theater_name, []))
+
+        # Count cached showtimes for this theater
+        cached_count = 0
+        for date_str, theaters in cached_data.items():
+            cached_count += len(theaters.get(theater_name, []))
+
+        # Count match statuses for this theater
+        theater_cached = sum(1 for m in matches if m.theater_name == theater_name and m.status == 'cached')
+        theater_new = sum(1 for m in matches if m.theater_name == theater_name and m.status == 'new')
+        theater_missing = sum(1 for m in matches if m.theater_name == theater_name and m.status == 'missing_from_fandango')
+
+        # Closure detection
+        closure_warning = False
+        closure_reason = None
+        if cached_count >= 5 and fandango_count == 0:
+            closure_warning = True
+            closure_reason = f"No Fandango showtimes but {cached_count} cached entries — possible closure"
+        elif cached_count >= 5 and fandango_count > 0 and fandango_count < (cached_count * 0.3):
+            closure_warning = True
+            closure_reason = f"Only {fandango_count} Fandango showtimes vs {cached_count} cached — significant reduction"
+
+        theater_summaries[theater_name] = TheaterVerificationSummary(
+            theater_name=theater_name,
+            cached_count=theater_cached,
+            new_count=theater_new,
+            missing_count=theater_missing,
+            total_fandango=fandango_count,
+            total_cached=cached_count,
+            closure_warning=closure_warning,
+            closure_reason=closure_reason,
+        )
+
+    # 6. Build overall summary
+    total_cached = sum(1 for m in matches if m.status == 'cached')
+    total_new = sum(1 for m in matches if m.status == 'new')
+    total_missing = sum(1 for m in matches if m.status == 'missing_from_fandango')
+    closure_warnings = sum(1 for t in theater_summaries.values() if t.closure_warning)
+
+    # Cache freshness: oldest cache entry age
+    cache_ages = [m.cache_age_minutes for m in matches if m.cache_age_minutes is not None]
+    cache_freshness = None
+    if cache_ages:
+        oldest_minutes = max(cache_ages)
+        if oldest_minutes < 60:
+            cache_freshness = f"{oldest_minutes}m ago"
+        else:
+            cache_freshness = f"{oldest_minutes // 60}h {oldest_minutes % 60}m ago"
+
+    return CompareShowtimesResponse(
+        summary={
+            'cached': total_cached,
+            'new': total_new,
+            'missing': total_missing,
+            'closure_warnings': closure_warnings,
+        },
+        by_theater=list(theater_summaries.values()),
+        matches=matches,
+        cache_freshness=cache_freshness,
+    )
+
+
+# =============================================================================
+# ZERO SHOWTIME ANALYSIS
+# =============================================================================
+
+class ZeroShowtimeRequest(BaseModel):
+    theater_names: Optional[List[str]] = None
+    lookback_days: int = 30
+
+class ZeroShowtimeTheaterResult(BaseModel):
+    theater_name: str
+    total_scrapes: int
+    zero_count: int
+    last_nonzero_date: Optional[str] = None
+    consecutive_zeros: int
+    last_scrape_date: Optional[str] = None
+    classification: str  # "likely_off_fandango" | "warning" | "normal"
+
+class ZeroShowtimeAnalysisResponse(BaseModel):
+    theaters: List[ZeroShowtimeTheaterResult]
+    summary: Dict[str, int]
+
+@router.post("/scrapes/zero-showtime-analysis", tags=["Scrapes"])
+async def analyze_zero_showtimes(
+    request: ZeroShowtimeRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Analyze operating hours history to find theaters consistently returning
+    zero showtimes from Fandango. Helps identify theaters that may have moved
+    to their own ticketing sites.
+
+    Classifications:
+    - likely_off_fandango: 3+ consecutive zero-showtime scrapes
+    - warning: 2 consecutive zero-showtime scrapes
+    - normal: 0-1 zeros (could be weather/holiday)
+    """
+    from app.zero_showtime_service import ZeroShowtimeService
+
+    company_id = current_user.get("company_id", 1)
+    service = ZeroShowtimeService(company_id)
+
+    theater_names = request.theater_names or []
+    if not theater_names:
+        return ZeroShowtimeAnalysisResponse(theaters=[], summary={
+            "likely_off_fandango": 0, "warning": 0, "normal": 0
+        })
+
+    results = service.analyze_theaters(theater_names, request.lookback_days)
+
+    summary = {"likely_off_fandango": 0, "warning": 0, "normal": 0}
+    theater_results = []
+    for r in results:
+        summary[r.classification] = summary.get(r.classification, 0) + 1
+        theater_results.append(ZeroShowtimeTheaterResult(
+            theater_name=r.theater_name,
+            total_scrapes=r.total_scrapes,
+            zero_count=r.zero_count,
+            last_nonzero_date=r.last_nonzero_date,
+            consecutive_zeros=r.consecutive_zeros,
+            last_scrape_date=r.last_scrape_date,
+            classification=r.classification,
+        ))
+
+    return ZeroShowtimeAnalysisResponse(theaters=theater_results, summary=summary)
+
+
+class MarkTheaterStatusRequest(BaseModel):
+    theater_name: str
+    market: str
+    status: str  # "not_on_fandango" | "closed" | "active"
+    external_url: Optional[str] = None  # Theater's own ticketing site URL
+    reason: Optional[str] = None
+
+class MarkTheaterStatusResponse(BaseModel):
+    success: bool
+    theater_name: str
+    new_status: str
+
+@router.post("/scrapes/mark-theater-status", tags=["Scrapes"])
+async def mark_theater_status(
+    request: MarkTheaterStatusRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Update a theater's Fandango availability status in the theater cache.
+
+    Statuses:
+    - not_on_fandango: Theater uses its own ticketing site (optionally provide external_url)
+    - closed: Theater is permanently closed
+    - active: Re-enable a previously flagged theater
+    """
+    import json
+    import os
+    import shutil
+    from app.config import CACHE_FILE
+
+    if not os.path.exists(CACHE_FILE):
+        raise HTTPException(status_code=404, detail="Theater cache file not found")
+
+    try:
+        with open(CACHE_FILE, 'r') as f:
+            cache_data = json.load(f)
+
+        markets = cache_data.get('markets', {})
+        if request.market not in markets:
+            raise HTTPException(status_code=404, detail=f"Market '{request.market}' not found")
+
+        market_data = markets[request.market]
+        theater_found = False
+
+        status_req_norm = normalize_theater_name(request.theater_name)
+        for theater in market_data.get('theaters', []):
+            if theater.get('name') == request.theater_name or normalize_theater_name(theater.get('name', '')) == status_req_norm:
+                theater_found = True
+
+                if request.status == 'not_on_fandango':
+                    theater['not_on_fandango'] = True
+                    if request.external_url:
+                        theater['url'] = request.external_url
+                elif request.status == 'closed':
+                    theater['name'] = f"{request.theater_name} (Permanently Closed)"
+                    theater['url'] = "N/A"
+                    if 'not_on_fandango' in theater:
+                        del theater['not_on_fandango']
+                elif request.status == 'active':
+                    if 'not_on_fandango' in theater:
+                        del theater['not_on_fandango']
+                else:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Invalid status: '{request.status}'. Use 'not_on_fandango', 'closed', or 'active'."
+                    )
+                break
+
+        if not theater_found:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Theater '{request.theater_name}' not found in market '{request.market}'"
+            )
+
+        # Backup and save
+        backup_path = CACHE_FILE + ".bak"
+        if os.path.exists(CACHE_FILE):
+            shutil.copy2(CACHE_FILE, backup_path)
+
+        with open(CACHE_FILE, 'w') as f:
+            json.dump(cache_data, f, indent=2)
+
+        # Audit log
+        try:
+            audit_service.log(
+                company_id=current_user.get("company_id", 1),
+                user_id=current_user.get("user_id"),
+                event_type="theater_status_changed",
+                category="configuration",
+                details={
+                    "theater_name": request.theater_name,
+                    "market": request.market,
+                    "new_status": request.status,
+                    "reason": request.reason,
+                }
+            )
+        except Exception:
+            pass  # Don't fail the request if audit logging fails
+
+        return MarkTheaterStatusResponse(
+            success=True,
+            theater_name=request.theater_name,
+            new_status=request.status,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error updating theater status: {str(e)}")

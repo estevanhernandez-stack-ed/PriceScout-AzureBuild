@@ -139,7 +139,7 @@ export function useTheaterCoverage(theaterName: string | null, options?: { lookb
       if (options?.lookbackDays) params.append('lookback_days', String(options.lookbackDays));
 
       const response = await api.get<CoverageReport>(
-        `/baselines/coverage-gaps/${encodeURIComponent(theaterName!)}?${params}`
+        `/baselines/coverage-gaps/${encodeURIComponent(theaterName ?? '')}?${params}`
       );
       return response.data;
     },
@@ -199,7 +199,7 @@ export function useMarketCoverage(
       if (options?.lookbackDays) params.append('lookback_days', String(options.lookbackDays));
 
       const response = await api.get<MarketCoverageDetail>(
-        `/baselines/coverage-market/${encodeURIComponent(directorName!)}/${encodeURIComponent(marketName!)}?${params}`
+        `/baselines/coverage-market/${encodeURIComponent(directorName ?? '')}/${encodeURIComponent(marketName ?? '')}?${params}`
       );
       return response.data;
     },

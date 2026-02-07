@@ -25,7 +25,7 @@ import { Map as MapIcon, RefreshCw, Filter, Building2, DollarSign, X } from 'luc
 import L from 'leaflet';
 
 // Fix for leaflet marker icons in React
-// @ts-ignore
+// @ts-expect-error leaflet internal prototype manipulation
 delete L.Icon.Default.prototype._getIconUrl;
 L.Icon.Default.mergeOptions({
   iconRetinaUrl: 'https://unpkg.com/leaflet@1.7.1/dist/images/marker-icon-2x.png',

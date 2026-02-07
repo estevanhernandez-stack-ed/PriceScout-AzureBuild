@@ -44,6 +44,11 @@ import {
   MapPin,
   Users,
   Building2,
+  Globe,
+  ExternalLink,
+  XCircle,
+  ClipboardList,
+  Wrench,
 } from 'lucide-react';
 import {
   useAllTheaterCoverage,
@@ -55,7 +60,11 @@ import {
   type DirectorCoverage,
   type MarketCoverage,
   type TheaterCoverageDetail,
+  type CoverageReport,
 } from '@/hooks/api';
+import { useTheaterCache } from '@/hooks/api/useMarkets';
+import { useMarkTheaterStatus } from '@/hooks/api/useZeroShowtimes';
+import { useToast } from '@/hooks/use-toast';
 
 const DAY_NAMES = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 
@@ -685,17 +694,92 @@ function TheaterCoverageRow({ theater, isSelected, onSelect }: TheaterCoverageRo
 
 interface TheaterDetailPanelProps {
   theaterName: string;
-  detail: any;
+  detail: CoverageReport | null | undefined;
   isLoading: boolean;
   onClose: () => void;
 }
 
 function TheaterDetailPanel({ theaterName, detail, isLoading, onClose }: TheaterDetailPanelProps) {
+  const { toast } = useToast();
+  const { data: theaterCache } = useTheaterCache();
+  const markStatusMutation = useMarkTheaterStatus();
+
+  const [editingStatus, setEditingStatus] = useState(false);
+  const [statusAction, setStatusAction] = useState<'not_on_fandango' | 'closed' | 'active'>('not_on_fandango');
+  const [statusUrl, setStatusUrl] = useState('');
+
+  // Look up theater in cache to determine current market and status
+  const theaterCacheInfo = useMemo(() => {
+    if (!theaterCache?.markets) return null;
+    for (const [marketName, marketData] of Object.entries(theaterCache.markets)) {
+      const found = marketData.theaters?.find(
+        (t) => t.name === theaterName
+      );
+      if (found) {
+        return {
+          market: marketName,
+          url: found.url,
+          notOnFandango: found.not_on_fandango === true,
+          status: found.status,
+          company: found.company,
+        };
+      }
+    }
+    return null;
+  }, [theaterCache, theaterName]);
+
+  const currentStatus = useMemo(() => {
+    if (!theaterCacheInfo) return 'unknown';
+    if (theaterName.includes('(Permanently Closed)')) return 'closed';
+    if (theaterCacheInfo.notOnFandango) return 'not_on_fandango';
+    return 'active';
+  }, [theaterCacheInfo, theaterName]);
+
+  const handleSaveStatus = async () => {
+    if (!theaterCacheInfo?.market) {
+      toast({ title: 'Error', description: 'Could not determine market for this theater.', variant: 'destructive' });
+      return;
+    }
+    try {
+      await markStatusMutation.mutateAsync({
+        theater_name: theaterName,
+        market: theaterCacheInfo.market,
+        status: statusAction,
+        external_url: statusAction === 'not_on_fandango' ? statusUrl || undefined : undefined,
+        reason: 'Updated from Coverage Gaps panel',
+      });
+      toast({ title: 'Status Updated', description: `${theaterName} marked as ${statusAction.replace(/_/g, ' ')}.` });
+      setEditingStatus(false);
+      setStatusUrl('');
+    } catch {
+      toast({ title: 'Error', description: 'Failed to update theater status.', variant: 'destructive' });
+    }
+  };
+
   const getGapIcon = (gap: GapInfo) => {
     if (gap.severity === 'error') {
       return <AlertCircle className="h-4 w-4 text-red-500" />;
     }
     return <AlertTriangle className="h-4 w-4 text-yellow-500" />;
+  };
+
+  const getRemediationSuggestion = (gap: GapInfo): string => {
+    const isNotOnFandango = currentStatus === 'not_on_fandango';
+
+    switch (gap.gap_type) {
+      case 'no_data':
+        return isNotOnFandango
+          ? 'Theater not on Fandango — manual entry required. See guidance below.'
+          : 'No price data found. Run a Fandango scrape for this theater via Market Mode.';
+      case 'missing_day':
+        return `Missing data for this day. Schedule a scrape that covers this day of the week.`;
+      case 'missing_format':
+        return `No data for this format. Ensure this format is selected when running scrapes.`;
+      case 'low_samples':
+        return `Low sample count — data may be unreliable. Run additional scrapes to collect more data points.`;
+      default:
+        return 'Run a price scrape for this theater to fill this gap.';
+    }
   };
 
   return (
@@ -784,6 +868,214 @@ function TheaterDetailPanel({ theaterName, detail, isLoading, onClose }: Theater
               </div>
             )}
 
+            {/* ============================================================ */}
+            {/* Theater Status */}
+            {/* ============================================================ */}
+            <div className="border rounded-lg p-4 space-y-3">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <Globe className="h-4 w-4 text-blue-500" />
+                  <span className="text-sm font-medium">Theater Status</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  {currentStatus === 'active' && (
+                    <Badge className="bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200">
+                      Active
+                    </Badge>
+                  )}
+                  {currentStatus === 'not_on_fandango' && (
+                    <Badge className="bg-orange-100 text-orange-800 dark:bg-orange-900 dark:text-orange-200">
+                      Not on Fandango
+                    </Badge>
+                  )}
+                  {currentStatus === 'closed' && (
+                    <Badge variant="secondary">
+                      <XCircle className="h-3 w-3 mr-1" />
+                      Closed
+                    </Badge>
+                  )}
+                  {currentStatus === 'unknown' && (
+                    <Badge variant="outline" className="text-muted-foreground">
+                      Unknown
+                    </Badge>
+                  )}
+                </div>
+              </div>
+
+              {theaterCacheInfo?.url && theaterCacheInfo.url !== 'N/A' && (
+                <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                  <ExternalLink className="h-3 w-3" />
+                  <a
+                    href={theaterCacheInfo.url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-blue-500 hover:underline truncate"
+                  >
+                    {theaterCacheInfo.url}
+                  </a>
+                </div>
+              )}
+
+              {theaterCacheInfo?.market && (
+                <div className="text-xs text-muted-foreground">
+                  Market: {theaterCacheInfo.market}
+                  {theaterCacheInfo.company && ` | ${theaterCacheInfo.company}`}
+                </div>
+              )}
+
+              {!editingStatus ? (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => {
+                    setStatusAction(currentStatus === 'active' ? 'not_on_fandango' : 'active');
+                    setStatusUrl(theaterCacheInfo?.url || '');
+                    setEditingStatus(true);
+                  }}
+                  disabled={!theaterCacheInfo?.market}
+                >
+                  Update Status
+                </Button>
+              ) : (
+                <div className="space-y-3 border-t pt-3">
+                  <div className="space-y-2">
+                    <Label className="text-sm">New Status</Label>
+                    <div className="flex flex-wrap gap-2">
+                      <Button
+                        variant={statusAction === 'not_on_fandango' ? 'default' : 'outline'}
+                        size="sm"
+                        onClick={() => setStatusAction('not_on_fandango')}
+                      >
+                        Not on Fandango
+                      </Button>
+                      <Button
+                        variant={statusAction === 'closed' ? 'default' : 'outline'}
+                        size="sm"
+                        onClick={() => setStatusAction('closed')}
+                      >
+                        Permanently Closed
+                      </Button>
+                      <Button
+                        variant={statusAction === 'active' ? 'default' : 'outline'}
+                        size="sm"
+                        onClick={() => setStatusAction('active')}
+                      >
+                        Active
+                      </Button>
+                    </div>
+                  </div>
+
+                  {statusAction === 'not_on_fandango' && (
+                    <div className="space-y-2">
+                      <Label className="text-sm">Theater Ticketing URL (optional)</Label>
+                      <Input
+                        placeholder="https://www.theater-website.com/tickets"
+                        value={statusUrl}
+                        onChange={(e) => setStatusUrl(e.target.value)}
+                      />
+                    </div>
+                  )}
+
+                  <div className="flex gap-2">
+                    <Button
+                      size="sm"
+                      onClick={handleSaveStatus}
+                      disabled={markStatusMutation.isPending}
+                    >
+                      {markStatusMutation.isPending ? (
+                        <Loader2 className="h-3 w-3 animate-spin mr-1" />
+                      ) : null}
+                      Save
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => setEditingStatus(false)}
+                    >
+                      Cancel
+                    </Button>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* ============================================================ */}
+            {/* Remediation Actions */}
+            {/* ============================================================ */}
+            {detail.gaps?.length > 0 && (
+              <div className="border rounded-lg p-4 space-y-3">
+                <div className="flex items-center gap-2">
+                  <Wrench className="h-4 w-4 text-purple-500" />
+                  <span className="text-sm font-medium">Remediation Actions</span>
+                </div>
+                <div className="space-y-2">
+                  {detail.gaps.map((gap: GapInfo, idx: number) => (
+                    <div
+                      key={idx}
+                      className="text-sm p-2 rounded-md bg-muted/30 border-l-2 border-purple-300"
+                    >
+                      <div className="flex items-start gap-2">
+                        {getGapIcon(gap)}
+                        <div>
+                          <div className="text-muted-foreground text-xs">{gap.description}</div>
+                          <div className="mt-1 font-medium">{getRemediationSuggestion(gap)}</div>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* ============================================================ */}
+            {/* Manual Entry Guidance (only for not-on-fandango theaters) */}
+            {/* ============================================================ */}
+            {currentStatus === 'not_on_fandango' && (
+              <div className="border rounded-lg p-4 space-y-3 border-orange-200 bg-orange-50/50 dark:bg-orange-950/20 dark:border-orange-800">
+                <div className="flex items-center gap-2">
+                  <ClipboardList className="h-4 w-4 text-orange-600" />
+                  <span className="text-sm font-medium text-orange-800 dark:text-orange-300">
+                    Manual Entry Guide
+                  </span>
+                </div>
+                <p className="text-sm text-muted-foreground">
+                  This theater is not on Fandango. To fill baseline gaps, collect pricing
+                  from the theater&apos;s own website or ticketing system:
+                </p>
+                <ol className="text-sm space-y-1.5 list-decimal list-inside text-muted-foreground">
+                  {theaterCacheInfo?.url && theaterCacheInfo.url !== 'N/A' ? (
+                    <li>
+                      Visit the theater&apos;s website:{' '}
+                      <a
+                        href={theaterCacheInfo.url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-blue-500 hover:underline"
+                      >
+                        {theaterCacheInfo.url}
+                      </a>
+                    </li>
+                  ) : (
+                    <li>Find the theater&apos;s website or ticketing page</li>
+                  )}
+                  <li>
+                    Look up ticket prices for:
+                    <ul className="list-disc list-inside ml-4 mt-1 space-y-0.5">
+                      <li>Adult, Child, Senior tickets</li>
+                      <li>Premium formats (IMAX, Dolby, etc.) if applicable</li>
+                      <li>Matinee vs prime time pricing</li>
+                      <li>Weekend vs weekday differences</li>
+                    </ul>
+                  </li>
+                  <li>Record showtimes to determine operating hours</li>
+                  <li>Note any discount programs (e.g., discount Tuesdays)</li>
+                </ol>
+                <p className="text-xs text-muted-foreground border-t pt-2">
+                  Use the <strong>Baseline Details</strong> tab to manually create baselines with this data.
+                </p>
+              </div>
+            )}
+
             {/* Healthy Baselines */}
             {detail.healthy_baselines?.length > 0 && (
               <div>
@@ -802,7 +1094,7 @@ function TheaterDetailPanel({ theaterName, detail, isLoading, onClose }: Theater
                       </TableRow>
                     </TableHeader>
                     <TableBody>
-                      {detail.healthy_baselines.slice(0, 20).map((b: any, idx: number) => (
+                      {detail.healthy_baselines.slice(0, 20).map((b, idx: number) => (
                         <TableRow key={idx}>
                           <TableCell>{b.ticket_type}</TableCell>
                           <TableCell>{b.format}</TableCell>

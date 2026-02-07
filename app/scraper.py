@@ -388,7 +388,7 @@ class Scraper:
                 # Wait for any common movie page element
                 try:
                     await page.wait_for_selector('.details-header__title, .movie-details__movie-title, .mop__title, h1', timeout=20000)
-                except:
+                except Exception:
                     print("  [Fandango Scrape] [WARNING] Specific title selector not found, attempting to proceed with page content.")
                 
                 # Scroll a bit to trigger any lazy-loaded info
@@ -731,14 +731,18 @@ class Scraper:
             # New Fandango structure uses li.shared-movie-showtimes
             movie_blocks = soup.select('li.shared-movie-showtimes')
             
-            if not movie_blocks and _HAS_STREAMLIT and st.session_state.get('capture_html', False):
-                os.makedirs(DEBUG_DIR, exist_ok=True)
-                timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                filename = f"debug_{self._sanitize_filename(theater['name'])}_{timestamp}.html"
-                filepath = os.path.join(DEBUG_DIR, filename)
-                with open(filepath, 'w', encoding='utf-8') as f:
-                    f.write(html_content)
-                print(f"  [DEBUG] No films found for {theater['name']}. Saved HTML snapshot to {filepath}")
+            if not movie_blocks and html_content:
+                # Always save debug HTML when no movies found — helps diagnose scraper issues
+                try:
+                    os.makedirs(DEBUG_DIR, exist_ok=True)
+                    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                    filename = f"debug_{self._sanitize_filename(theater['name'])}_{timestamp}.html"
+                    filepath = os.path.join(DEBUG_DIR, filename)
+                    with open(filepath, 'w', encoding='utf-8') as f:
+                        f.write(html_content)
+                    print(f"  [DEBUG] No films found for {theater['name']}. Saved HTML snapshot to {filepath}")
+                except Exception as e:
+                    print(f"  [DEBUG] Failed to save HTML snapshot for {theater['name']}: {e}")
             
             for movie_block in movie_blocks:
                 # Get film title from new structure

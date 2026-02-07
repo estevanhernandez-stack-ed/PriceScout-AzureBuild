@@ -8,7 +8,7 @@ import { Map as MapIcon } from 'lucide-react';
 import L from 'leaflet';
 
 // Fix for leaflet marker icons in React
-// @ts-ignore
+// @ts-expect-error leaflet internal prototype manipulation
 delete L.Icon.Default.prototype._getIconUrl;
 L.Icon.Default.mergeOptions({
   iconRetinaUrl: 'https://unpkg.com/leaflet@1.7.1/dist/images/marker-icon-2x.png',
@@ -121,7 +121,7 @@ export function MarketHeatmap({ theaters, data, marketName, metric }: MarketHeat
               return (
                 <CircleMarker
                   key={t.id}
-                  center={[t.latitude!, t.longitude!]}
+                  center={[t.latitude ?? 0, t.longitude ?? 0]}
                   radius={12}
                   pathOptions={{
                     fillColor: color,

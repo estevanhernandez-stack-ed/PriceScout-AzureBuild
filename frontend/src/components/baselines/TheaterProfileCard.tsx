@@ -47,9 +47,7 @@ interface TheaterProfileCardProps {
   isDiscovering?: boolean;
 }
 
-/**
- * Extract circuit name from theater name using prefix matching
- */
+// eslint-disable-next-line react-refresh/only-export-components
 export function getCircuitFromTheaterName(theaterName: string): string {
   const words = theaterName.split(' ');
 

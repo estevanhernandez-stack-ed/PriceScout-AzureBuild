@@ -23,9 +23,11 @@ export interface SavedBaseline {
   baseline_price: number;
   effective_from: string;
   effective_to: string | null;
+  source: string | null;
+  sample_count: number | null;
+  last_discovery_at: string | null;
   created_at: string;
   // Optional extended fields (may be populated by some queries)
-  sample_count?: number | null;
   variance_percent?: number | null;
   avg_price?: number | null;
   is_premium?: boolean;
@@ -485,6 +487,7 @@ export function useSaveDiscoveredBaselines() {
       splitByDayType?: boolean;   // If true, creates separate weekday/weekend baselines
       splitByDaypart?: boolean;   // If true, creates separate matinee/evening/late baselines
       splitByDayOfWeek?: boolean; // If true, creates separate Mon-Sun baselines (more granular than day_type)
+      excludePremium?: boolean;   // If true, exclude PLF/IMAX/Dolby from baselines (default: false = include them)
     }) => {
       const params = new URLSearchParams();
       if (options.minSamples) params.append('min_samples', String(options.minSamples));
@@ -493,6 +496,7 @@ export function useSaveDiscoveredBaselines() {
       if (options.splitByDayType) params.append('split_by_day_type', 'true');
       if (options.splitByDaypart) params.append('split_by_daypart', 'true');
       if (options.splitByDayOfWeek) params.append('split_by_day_of_week', 'true');
+      if (options.excludePremium) params.append('exclude_premium', 'true');
       params.append('save', 'true');
 
       const endpoint = options.source === 'enttelligence'
@@ -700,7 +704,7 @@ export function useTheaterBaselines(theaterName: string | null, options?: {
     queryKey: ['baselines', 'theaters', theaterName],
     queryFn: async () => {
       const response = await api.get<TheaterBaselinesResponse>(
-        `/baselines/theaters/${encodeURIComponent(theaterName!)}`
+        `/baselines/theaters/${encodeURIComponent(theaterName ?? '')}`
       );
       return response.data;
     },
@@ -779,6 +783,11 @@ export interface PriceComparisonItem {
   difference_percent: number;
   ent_sample_count: number;
   fandango_sample_count: number | null;
+  // Tax-adjusted fields (populated when apply_tax=true)
+  ent_price_tax_adjusted: number | null;
+  tax_rate_applied: number | null;
+  adjusted_difference: number | null;
+  adjusted_difference_percent: number | null;
 }
 
 export interface PriceComparisonResponse {
@@ -794,6 +803,9 @@ export interface PriceComparisonResponse {
     interpretation: string;
     tax_inclusive_likelihood: 'likely_tax_exclusive' | 'likely_tax_inclusive' | 'likely_tax_inclusive_but_different' | 'unknown';
   };
+  // Tax adjustment fields
+  tax_adjustment_applied: boolean;
+  default_tax_rate: number | null;
 }
 
 /**
@@ -807,17 +819,19 @@ export function useCompareDataSources(options: {
   theaterFilter?: string;
   minSamples?: number;
   limit?: number;
+  applyTax?: boolean;
   enabled?: boolean;
 } = {}) {
-  const { theaterFilter, minSamples = 3, limit = 200, enabled = true } = options;
+  const { theaterFilter, minSamples = 3, limit = 200, applyTax = false, enabled = true } = options;
 
   return useQuery({
-    queryKey: ['baselines', 'compare-sources', theaterFilter, minSamples, limit],
+    queryKey: ['baselines', 'compare-sources', theaterFilter, minSamples, limit, applyTax],
     queryFn: async () => {
       const params = new URLSearchParams();
       if (theaterFilter) params.append('theater_filter', theaterFilter);
       params.append('min_samples', String(minSamples));
       params.append('limit', String(limit));
+      if (applyTax) params.append('apply_tax', 'true');
 
       const response = await api.get<PriceComparisonResponse>(
         `/baselines/compare-sources?${params}`

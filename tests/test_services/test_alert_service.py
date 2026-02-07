@@ -50,30 +50,43 @@ def sample_showing(setup_data):
         session.commit()
         return s.showing_id
 
-def test_price_increase_alert(service, sample_showing):
+def test_surge_detection_alert(service, sample_showing):
+    """Test that price exceeding baseline triggers surge_detected alert."""
     with get_session() as session:
-        # 1. Create previous price
+        # 1. Create a baseline at $10.00 (AlertService compares against baselines)
+        baseline = PriceBaseline(
+            company_id=1,
+            theater_name="T1",
+            ticket_type="Adult",
+            format="2D",
+            baseline_price=Decimal("10.00"),
+            effective_from=date.today() - timedelta(days=10)
+        )
+        session.add(baseline)
+
+        # 2. Create previous price (historical record)
         p1 = Price(
-            company_id=1, 
-            showing_id=sample_showing, 
-            ticket_type="Adult", 
-            price=Decimal("10.00"), 
+            company_id=1,
+            showing_id=sample_showing,
+            ticket_type="Adult",
+            price=Decimal("10.00"),
             created_at=datetime.now(UTC) - timedelta(hours=1)
         )
         session.add(p1)
-        
-        # 2. Create "current" price (newly saved in DB by the scraper)
+
+        # 3. Create "current" price (newly saved in DB by the scraper)
         p2 = Price(
-            company_id=1, 
-            showing_id=sample_showing, 
-            ticket_type="Adult", 
-            price=Decimal("12.00"), 
+            company_id=1,
+            showing_id=sample_showing,
+            ticket_type="Adult",
+            price=Decimal("12.00"),
             created_at=datetime.now(UTC)
         )
         session.add(p2)
         session.commit()
-        
-        # Process results
+
+        # Process results - alert service compares $12.00 against $10.00 baseline
+        # 20% surge exceeds default threshold
         df = pd.DataFrame([{
             "Theater Name": "T1",
             "Ticket Type": "Adult",
@@ -81,14 +94,15 @@ def test_price_increase_alert(service, sample_showing):
             "Price": 12.00,
             "Film Title": "Movie",
             "play_date": date.today(),
-            "Daypart": "evening"
+            "Daypart": "Prime"  # Use Fandango-aligned daypart name
         }])
-        
+
         alerts = service.process_scrape_results(run_id=1, prices_df=df)
-        
+
         assert len(alerts) >= 1
-        alert = next(a for a in alerts if a.alert_type == 'price_increase')
-        assert alert.old_price == Decimal("10.00")
+        # Baseline comparison generates 'surge_detected' alert type
+        alert = next(a for a in alerts if a.alert_type == 'surge_detected')
+        assert alert.baseline_price == Decimal("10.00")
         assert alert.new_price == Decimal("12.00")
         assert alert.price_change_percent == Decimal("20.0")
 

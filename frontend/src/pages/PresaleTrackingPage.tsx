@@ -1,4 +1,4 @@
-import { useState, useMemo, useEffect, useCallback } from 'react';
+import { useState, useMemo, useEffect } from 'react';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
@@ -40,7 +40,6 @@ import {
   Plus,
   RefreshCw,
   Search,
-  Star,
   DollarSign,
   Building2,
   Download,
@@ -54,77 +53,288 @@ import {
   Trash2,
   Settings,
   Zap,
+  MapPin,
 } from 'lucide-react';
 import {
   usePresaleFilms,
+  usePresaleCircuits,
   usePresaleTrajectory,
   usePresaleVelocity,
   usePresaleComparison,
+  usePresaleCompliance,
+  usePresaleHeatmapData,
   useSyncPresales,
   useTaskStatus,
+  usePresaleWatches,
+  useCreatePresaleWatch,
+  useUpdatePresaleWatch,
+  useDeletePresaleWatch,
+  usePresaleWatchNotifications,
+  useMarkNotificationRead,
+  type MarketScope,
+  type PresaleWatch,
+  type PresaleFilm,
 } from '@/hooks/api';
 import { Progress } from '@/components/ui/progress';
 import { Loader2 } from 'lucide-react';
 import { useMarketEvents } from '@/hooks/api/useMarketContext';
 import { format as dateFnsFormat } from 'date-fns';
+import { MapContainer, TileLayer, Popup, CircleMarker } from 'react-leaflet';
+import 'leaflet/dist/leaflet.css';
+import type { PresaleHeatmapTheater } from '@/hooks/api';
 
 // ============================================================================
-// Types
+// Heatmap Sub-Component
 // ============================================================================
 
-interface PresaleAlert {
-  id: string;
-  film_title: string;
-  alert_type: 'velocity_drop' | 'velocity_spike' | 'milestone' | 'days_out' | 'market_share';
-  threshold: number;
-  enabled: boolean;
-  created_at: string;
-  last_triggered?: string;
-  trigger_count: number;
+function PresaleHeatmapMap({
+  theaters,
+}: {
+  theaters: PresaleHeatmapTheater[];
+  filmFilter?: string | null;
+}) {
+  const center = useMemo((): [number, number] => {
+    if (theaters.length === 0) return [39.8283, -98.5795]; // US center
+    const lat = theaters.reduce((s, t) => s + t.latitude, 0) / theaters.length;
+    const lon = theaters.reduce((s, t) => s + t.longitude, 0) / theaters.length;
+    return [lat, lon];
+  }, [theaters]);
+
+  // Color by showtime density (primary metric for "activity")
+  const maxShowtimes = useMemo(
+    () => Math.max(1, ...theaters.map((t) => t.total_showtimes)),
+    [theaters]
+  );
+
+  const getColor = (t: PresaleHeatmapTheater) => {
+    if (t.is_marcus) return '#3b82f6'; // Blue for Marcus
+    const ratio = t.total_showtimes / maxShowtimes;
+    if (ratio > 0.6) return '#ef4444'; // Red - high activity
+    if (ratio > 0.3) return '#f97316'; // Orange
+    if (ratio > 0.1) return '#eab308'; // Yellow
+    return '#22c55e'; // Green - low activity
+  };
+
+  const getRadius = (t: PresaleHeatmapTheater) => {
+    const ratio = t.total_showtimes / maxShowtimes;
+    return Math.max(6, Math.min(18, 6 + ratio * 12));
+  };
+
+  return (
+    <div className="h-[550px] w-full z-10">
+      <MapContainer
+        center={center}
+        zoom={theaters.length <= 20 ? 7 : 5}
+        style={{ height: '100%', width: '100%' }}
+        scrollWheelZoom={true}
+      >
+        <TileLayer
+          attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+          url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+          opacity={0.7}
+        />
+        {theaters.map((t) => (
+          <CircleMarker
+            key={t.theater_name}
+            center={[t.latitude, t.longitude]}
+            radius={getRadius(t)}
+            pathOptions={{
+              fillColor: getColor(t),
+              fillOpacity: 0.8,
+              color: t.is_marcus ? '#1d4ed8' : '#fff',
+              weight: t.is_marcus ? 3 : 2,
+            }}
+          >
+            <Popup>
+              <div className="p-1 space-y-1 min-w-[180px]">
+                <h4 className="font-bold text-slate-900 leading-tight text-sm">{t.theater_name}</h4>
+                <p className="text-xs text-slate-500">{t.circuit_name || 'Independent'}</p>
+                {t.market && <p className="text-xs text-slate-400">{t.market}</p>}
+                <div className="pt-2 border-t mt-2 space-y-1">
+                  <div className="flex justify-between text-xs">
+                    <span className="text-slate-600">Showtimes:</span>
+                    <span className="font-semibold">{t.total_showtimes.toLocaleString()}</span>
+                  </div>
+                  <div className="flex justify-between text-xs">
+                    <span className="text-slate-600">Capacity:</span>
+                    <span className="font-semibold">{t.total_capacity.toLocaleString()}</span>
+                  </div>
+                  <div className="flex justify-between text-xs">
+                    <span className="text-slate-600">Tickets Sold:</span>
+                    <span className="font-semibold">{t.total_tickets_sold.toLocaleString()}</span>
+                  </div>
+                  <div className="flex justify-between text-xs">
+                    <span className="text-slate-600">Fill Rate:</span>
+                    <span className="font-semibold">{t.fill_rate_pct.toFixed(1)}%</span>
+                  </div>
+                  {t.avg_price && (
+                    <div className="flex justify-between text-xs">
+                      <span className="text-slate-600">Avg Price:</span>
+                      <span className="font-semibold">${t.avg_price.toFixed(2)}</span>
+                    </div>
+                  )}
+                  <div className="flex justify-between text-xs">
+                    <span className="text-slate-600">Films:</span>
+                    <span className="font-semibold">{t.films_count}</span>
+                  </div>
+                </div>
+                {t.is_marcus && (
+                  <div className="mt-2 text-center text-xs font-semibold text-blue-600 bg-blue-50 rounded px-2 py-1">
+                    Your Theater
+                  </div>
+                )}
+              </div>
+            </Popup>
+          </CircleMarker>
+        ))}
+      </MapContainer>
+
+      {/* Legend */}
+      <div className="absolute bottom-4 left-4 z-[1000] bg-white/95 backdrop-blur-sm p-3 rounded-lg border shadow-lg max-w-[180px]">
+        <h5 className="text-xs font-bold text-slate-700 mb-2 uppercase tracking-wider">
+          Presale Activity
+        </h5>
+        <div className="space-y-1.5">
+          <div className="flex items-center gap-2">
+            <div className="w-3 h-3 rounded-full bg-[#3b82f6] border-2 border-[#1d4ed8]" />
+            <span className="text-[10px] text-slate-600">Marcus Theatres</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <div className="w-3 h-3 rounded-full bg-[#ef4444]" />
+            <span className="text-[10px] text-slate-600">High Activity</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <div className="w-3 h-3 rounded-full bg-[#f97316]" />
+            <span className="text-[10px] text-slate-600">Moderate</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <div className="w-3 h-3 rounded-full bg-[#eab308]" />
+            <span className="text-[10px] text-slate-600">Low</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <div className="w-3 h-3 rounded-full bg-[#22c55e]" />
+            <span className="text-[10px] text-slate-600">Minimal</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
 }
 
-interface AlertNotification {
-  id: string;
-  alert_id: string;
-  film_title: string;
-  message: string;
-  triggered_at: string;
-  is_read: boolean;
-  severity: 'info' | 'warning' | 'critical';
+// ============================================================================
+// Film Row Sub-Component
+// ============================================================================
+
+function FilmRow({
+  film,
+  isSelected,
+  onSelect,
+}: {
+  film: PresaleFilm;
+  isSelected: boolean;
+  onSelect: (title: string) => void;
+}) {
+  return (
+    <div
+      className={`flex items-center justify-between p-3 border rounded-lg cursor-pointer transition-colors ${
+        isSelected ? 'border-primary bg-primary/5' : 'hover:bg-muted/50'
+      }`}
+      onClick={() => onSelect(film.film_title)}
+    >
+      <div className="flex items-center gap-4 min-w-0">
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2">
+            <span className="font-medium truncate">{film.film_title}</span>
+            <Badge
+              className={`shrink-0 text-[10px] px-1.5 ${
+                film.days_until_release <= 0
+                  ? 'bg-gray-500/10 text-gray-500'
+                  : film.days_until_release <= 7
+                  ? 'bg-red-500/10 text-red-500'
+                  : 'bg-green-500/10 text-green-500'
+              }`}
+            >
+              {film.days_until_release <= 0 ? 'Released' : `${film.days_until_release}d`}
+            </Badge>
+          </div>
+          <div className="flex items-center gap-3 text-xs text-muted-foreground mt-0.5">
+            <span>{film.release_date}</span>
+            <span>{film.total_circuits} circuit{film.total_circuits !== 1 ? 's' : ''}</span>
+          </div>
+        </div>
+      </div>
+      <div className="flex items-center gap-4 shrink-0">
+        <div className="text-right">
+          <p className="text-lg font-bold">{film.current_tickets.toLocaleString()}</p>
+          <p className="text-[10px] text-muted-foreground">tickets</p>
+        </div>
+        <div className="text-right">
+          <p className="text-lg font-bold">${film.current_revenue.toLocaleString()}</p>
+          <p className="text-[10px] text-muted-foreground">revenue</p>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 // ============================================================================
-// Local Storage helpers for alerts (in production, this would be API-backed)
+// Circuit Group Sub-Component (collapsible)
 // ============================================================================
 
-const ALERTS_STORAGE_KEY = 'presale_alerts';
-const NOTIFICATIONS_STORAGE_KEY = 'presale_notifications';
+function CircuitGroup({
+  circuitName,
+  films,
+  selectedFilm,
+  onSelectFilm,
+  isMarcus,
+}: {
+  circuitName: string;
+  films: PresaleFilm[];
+  selectedFilm: string | null;
+  onSelectFilm: (title: string) => void;
+  isMarcus: boolean;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const totalTickets = films.reduce((s, f) => s + f.current_tickets, 0);
+  const totalRevenue = films.reduce((s, f) => s + f.current_revenue, 0);
 
-const loadAlerts = (): PresaleAlert[] => {
-  try {
-    const stored = localStorage.getItem(ALERTS_STORAGE_KEY);
-    return stored ? JSON.parse(stored) : [];
-  } catch {
-    return [];
-  }
-};
-
-const saveAlerts = (alerts: PresaleAlert[]) => {
-  localStorage.setItem(ALERTS_STORAGE_KEY, JSON.stringify(alerts));
-};
-
-const loadNotifications = (): AlertNotification[] => {
-  try {
-    const stored = localStorage.getItem(NOTIFICATIONS_STORAGE_KEY);
-    return stored ? JSON.parse(stored) : [];
-  } catch {
-    return [];
-  }
-};
-
-const saveNotifications = (notifications: AlertNotification[]) => {
-  localStorage.setItem(NOTIFICATIONS_STORAGE_KEY, JSON.stringify(notifications));
-};
+  return (
+    <div className={`border rounded-lg overflow-hidden ${isMarcus ? 'border-blue-300 bg-blue-50/30' : ''}`}>
+      <div
+        className="flex items-center justify-between p-3 cursor-pointer hover:bg-muted/30 transition-colors"
+        onClick={() => setExpanded(!expanded)}
+      >
+        <div className="flex items-center gap-2">
+          <Building2 className={`h-4 w-4 ${isMarcus ? 'text-blue-500' : 'text-muted-foreground'}`} />
+          <span className="font-semibold text-sm">{circuitName}</span>
+          <Badge variant="secondary" className="text-[10px]">
+            {films.length} film{films.length !== 1 ? 's' : ''}
+          </Badge>
+          {isMarcus && (
+            <Badge className="bg-blue-500/10 text-blue-600 text-[10px]">Your Circuit</Badge>
+          )}
+        </div>
+        <div className="flex items-center gap-4">
+          <span className="text-sm font-medium">{totalTickets.toLocaleString()} tickets</span>
+          <span className="text-sm text-muted-foreground">${totalRevenue.toLocaleString()}</span>
+          <span className="text-xs text-muted-foreground">{expanded ? '\u25B2' : '\u25BC'}</span>
+        </div>
+      </div>
+      {expanded && (
+        <div className="border-t px-2 py-1 space-y-1">
+          {films.map((film) => (
+            <FilmRow
+              key={film.film_title}
+              film={film}
+              isSelected={selectedFilm === film.film_title}
+              onSelect={onSelectFilm}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
 
 // ============================================================================
 // Component
@@ -137,20 +347,55 @@ export function PresaleTrackingPage() {
   const [autoRefresh, setAutoRefresh] = useState(false);
   const [refreshInterval, setRefreshInterval] = useState(300000); // 5 minutes
 
-  // Alerts state
-  const [alerts, setAlerts] = useState<PresaleAlert[]>(loadAlerts);
-  const [notifications, setNotifications] = useState<AlertNotification[]>(loadNotifications);
+  // Market scope: default to Marcus markets only
+  const [marketScope, setMarketScope] = useState<MarketScope>('our_markets');
+
+  // Film list sorting & circuit filter
+  type SortField = 'release_date' | 'title' | 'tickets';
+  const [sortField, setSortField] = useState<SortField>('release_date');
+  const [circuitFilter, setCircuitFilter] = useState<string>('__all__');
+
+  // Alerts state (API-backed)
+  const { data: watches = [] } = usePresaleWatches();
+  const { data: notifications = [] } = usePresaleWatchNotifications();
+  const createWatch = useCreatePresaleWatch();
+  const updateWatch = useUpdatePresaleWatch();
+  const deleteWatch = useDeletePresaleWatch();
+  const markRead = useMarkNotificationRead();
   const [showCreateAlertDialog, setShowCreateAlertDialog] = useState(false);
   const [newAlert, setNewAlert] = useState({
     film_title: '',
-    alert_type: 'velocity_drop' as PresaleAlert['alert_type'],
+    alert_type: 'velocity_drop' as PresaleWatch['alert_type'],
     threshold: 10,
   });
 
-  const { data: films, isLoading: filmsLoading, refetch } = usePresaleFilms();
-  const { data: trajectory, isLoading: trajectoryLoading } = usePresaleTrajectory(selectedFilm || '');
-  const { data: velocityData } = usePresaleVelocity(selectedFilm || '');
-  const { data: comparisonData } = usePresaleComparison(selectedFilm || '');
+  const { data: circuits } = usePresaleCircuits(marketScope);
+  const { data: films, isLoading: filmsLoading, refetch } = usePresaleFilms(
+    circuitFilter !== '__all__' ? circuitFilter : undefined,
+    marketScope
+  );
+
+  // Find Marcus circuit name for trajectory filtering (show OUR data in the chart)
+  const marcusCircuitName = useMemo(() => {
+    if (!circuits) return 'Marcus Theatres'; // Default fallback
+    const marcus = circuits.find(c =>
+      c.circuit_name.toLowerCase().includes('marcus') ||
+      c.circuit_name.toLowerCase().includes('movie tavern')
+    );
+    return marcus?.circuit_name || 'Marcus Theatres';
+  }, [circuits]);
+
+  // Trajectory shows Marcus-only time series (circuit comparison is on separate tab)
+  const { data: trajectory, isLoading: trajectoryLoading } = usePresaleTrajectory(selectedFilm || '', marcusCircuitName, marketScope);
+  const { data: velocityData } = usePresaleVelocity(selectedFilm || '', marketScope);
+  const { data: comparisonData } = usePresaleComparison(selectedFilm || '', undefined, marketScope);
+  const { data: complianceData } = usePresaleCompliance(marketScope);
+  // Heatmap tied to the selected film
+  const { data: heatmapData, isLoading: heatmapLoading } = usePresaleHeatmapData({
+    filmTitle: selectedFilm || undefined,
+    enabled: !!selectedFilm,
+    marketScope,
+  });
   const syncMutation = useSyncPresales();
   const [activeSyncTaskId, setActiveSyncTaskId] = useState<string | null>(null);
   const { data: activeTaskStatus } = useTaskStatus(activeSyncTaskId);
@@ -177,16 +422,6 @@ export function PresaleTrackingPage() {
 
     return () => clearInterval(interval);
   }, [autoRefresh, refreshInterval, refetch]);
-
-  // Save alerts when they change
-  useEffect(() => {
-    saveAlerts(alerts);
-  }, [alerts]);
-
-  // Save notifications when they change
-  useEffect(() => {
-    saveNotifications(notifications);
-  }, [notifications]);
 
   const handleSync = async () => {
     try {
@@ -256,9 +491,48 @@ export function PresaleTrackingPage() {
     standard: 'bg-gray-400',
   };
 
-  const filteredFilms = films?.filter((film) =>
-    film.film_title.toLowerCase().includes(searchQuery.toLowerCase())
-  ) || [];
+  // Sort and filter films
+  const filteredFilms = useMemo(() => {
+    let result = films?.filter((film) =>
+      film.film_title.toLowerCase().includes(searchQuery.toLowerCase())
+    ) || [];
+
+    // Sort
+    result = [...result].sort((a, b) => {
+      switch (sortField) {
+        case 'release_date':
+          return (a.release_date || '').localeCompare(b.release_date || '');
+        case 'title':
+          return a.film_title.localeCompare(b.film_title);
+        case 'tickets':
+          return b.current_tickets - a.current_tickets;
+        default:
+          return 0;
+      }
+    });
+
+    return result;
+  }, [films, searchQuery, sortField]);
+
+  // Group single-circuit films by circuit for the grouped view
+  const groupedByCircuit = useMemo(() => {
+    if (circuitFilter !== '__all__') return null; // no grouping when already filtered to a circuit
+
+    const multiCircuit: PresaleFilm[] = [];
+    const byCircuit = new Map<string, PresaleFilm[]>();
+
+    for (const film of filteredFilms) {
+      if (film.total_circuits === 1 && film.circuit_name) {
+        const list = byCircuit.get(film.circuit_name) || [];
+        list.push(film);
+        byCircuit.set(film.circuit_name, list);
+      } else {
+        multiCircuit.push(film);
+      }
+    }
+
+    return { multiCircuit, byCircuit };
+  }, [filteredFilms, circuitFilter]);
 
   // Calculate summary stats
   const summaryStats = useMemo(() => ({
@@ -345,41 +619,31 @@ export function PresaleTrackingPage() {
     };
   }, [trajectory]);
 
-  // Alert handlers
-  const handleCreateAlert = useCallback(() => {
-    const alert: PresaleAlert = {
-      id: `alert-${Date.now()}`,
+  // Alert handlers (API-backed)
+  const handleCreateAlert = () => {
+    createWatch.mutate({
       film_title: newAlert.film_title || selectedFilm || 'All Films',
       alert_type: newAlert.alert_type,
       threshold: newAlert.threshold,
-      enabled: true,
-      created_at: new Date().toISOString(),
-      trigger_count: 0,
-    };
-    setAlerts(prev => [...prev, alert]);
+    });
     setShowCreateAlertDialog(false);
     setNewAlert({ film_title: '', alert_type: 'velocity_drop', threshold: 10 });
-  }, [newAlert, selectedFilm]);
+  };
 
-  const handleDeleteAlert = useCallback((alertId: string) => {
-    setAlerts(prev => prev.filter(a => a.id !== alertId));
-  }, []);
+  const handleDeleteAlert = (alertId: number) => {
+    deleteWatch.mutate(alertId);
+  };
 
-  const handleToggleAlert = useCallback((alertId: string) => {
-    setAlerts(prev => prev.map(a =>
-      a.id === alertId ? { ...a, enabled: !a.enabled } : a
-    ));
-  }, []);
+  const handleToggleAlert = (alertId: number) => {
+    const watch = watches.find(w => w.id === alertId);
+    if (watch) {
+      updateWatch.mutate({ id: alertId, enabled: !watch.enabled });
+    }
+  };
 
-  const handleMarkNotificationRead = useCallback((notificationId: string) => {
-    setNotifications(prev => prev.map(n =>
-      n.id === notificationId ? { ...n, is_read: true } : n
-    ));
-  }, []);
-
-  const handleClearNotifications = useCallback(() => {
-    setNotifications([]);
-  }, []);
+  const handleMarkNotificationRead = (notificationId: number) => {
+    markRead.mutate(notificationId);
+  };
 
   const unreadNotifications = notifications.filter(n => !n.is_read);
 
@@ -493,7 +757,7 @@ export function PresaleTrackingPage() {
   };
 
   // Get alert type display info
-  const getAlertTypeInfo = (type: PresaleAlert['alert_type']) => {
+  const getAlertTypeInfo = (type: PresaleWatch['alert_type']) => {
     switch (type) {
       case 'velocity_drop':
         return { label: 'Velocity Drop', icon: TrendingDown, color: 'text-red-500' };
@@ -526,6 +790,31 @@ export function PresaleTrackingPage() {
           </p>
         </div>
         <div className="flex items-center gap-2">
+          {/* Market scope toggle */}
+          <div className="flex items-center rounded-lg border bg-muted p-0.5 mr-2">
+            <button
+              className={`px-3 py-1.5 text-sm font-medium rounded-md transition-colors ${
+                marketScope === 'our_markets'
+                  ? 'bg-background text-foreground shadow-sm'
+                  : 'text-muted-foreground hover:text-foreground'
+              }`}
+              onClick={() => setMarketScope('our_markets')}
+            >
+              <MapPin className="inline h-3.5 w-3.5 mr-1 -mt-0.5" />
+              Our Markets
+            </button>
+            <button
+              className={`px-3 py-1.5 text-sm font-medium rounded-md transition-colors ${
+                marketScope === 'full'
+                  ? 'bg-background text-foreground shadow-sm'
+                  : 'text-muted-foreground hover:text-foreground'
+              }`}
+              onClick={() => setMarketScope('full')}
+            >
+              National
+            </button>
+          </div>
+
           {/* Auto-refresh toggle */}
           <div className="flex items-center gap-2 mr-4">
             <Switch
@@ -758,6 +1047,10 @@ export function PresaleTrackingPage() {
             <TrendingUp className="h-4 w-4 mr-1" />
             Velocity Trends
           </TabsTrigger>
+          <TabsTrigger value="compliance">
+            <Target className="h-4 w-4 mr-1" />
+            Compliance
+          </TabsTrigger>
           <TabsTrigger value="alerts" className="relative">
             <Bell className="h-4 w-4 mr-1" />
             Alerts
@@ -776,16 +1069,51 @@ export function PresaleTrackingPage() {
               <div className="flex items-center justify-between">
                 <div>
                   <CardTitle>Tracked Films</CardTitle>
-                  <CardDescription>Monitor presale activity and velocity</CardDescription>
+                  <CardDescription>
+                    {circuitFilter !== '__all__'
+                      ? `Showing films for ${circuitFilter}`
+                      : `${filteredFilms.length} films with presale data`}
+                  </CardDescription>
                 </div>
-                <div className="relative w-64">
-                  <Search className="absolute left-2 top-2.5 h-4 w-4 text-muted-foreground" />
-                  <Input
-                    placeholder="Search films..."
-                    value={searchQuery}
-                    onChange={(e) => setSearchQuery(e.target.value)}
-                    className="pl-8"
-                  />
+                <div className="flex items-center gap-2">
+                  {/* Circuit filter */}
+                  <Select value={circuitFilter} onValueChange={(v) => { setCircuitFilter(v); setSelectedFilm(null); }}>
+                    <SelectTrigger className="w-[220px] h-9">
+                      <Building2 className="h-3.5 w-3.5 mr-1.5 text-muted-foreground" />
+                      <SelectValue placeholder="All Circuits" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="__all__">All Circuits</SelectItem>
+                      {circuits?.map((c) => (
+                        <SelectItem key={c.circuit_name} value={c.circuit_name}>
+                          {c.circuit_name} ({c.total_films})
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+
+                  {/* Sort */}
+                  <Select value={sortField} onValueChange={(v) => setSortField(v as SortField)}>
+                    <SelectTrigger className="w-[160px] h-9">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="release_date">Release Date</SelectItem>
+                      <SelectItem value="title">Title A-Z</SelectItem>
+                      <SelectItem value="tickets">Tickets Sold</SelectItem>
+                    </SelectContent>
+                  </Select>
+
+                  {/* Search */}
+                  <div className="relative w-48">
+                    <Search className="absolute left-2 top-2 h-4 w-4 text-muted-foreground" />
+                    <Input
+                      placeholder="Search films..."
+                      value={searchQuery}
+                      onChange={(e) => setSearchQuery(e.target.value)}
+                      className="pl-8 h-9"
+                    />
+                  </div>
                 </div>
               </div>
             </CardHeader>
@@ -794,65 +1122,50 @@ export function PresaleTrackingPage() {
                 <p className="text-center text-muted-foreground py-8">
                   No presale data available. Sync from EntTelligence to load data.
                 </p>
-              ) : (
-                <div className="space-y-4">
+              ) : circuitFilter !== '__all__' || !groupedByCircuit ? (
+                /* Flat list when filtering to a specific circuit */
+                <div className="space-y-2 max-h-[600px] overflow-y-auto">
                   {filteredFilms.map((film) => (
-                    <div
+                    <FilmRow
                       key={film.film_title}
-                      className={`flex items-center justify-between p-4 border rounded-lg cursor-pointer transition-colors ${
-                        selectedFilm === film.film_title
-                          ? 'border-primary bg-primary/5'
-                          : 'hover:bg-muted/50'
-                      }`}
-                      onClick={() => setSelectedFilm(film.film_title)}
-                    >
-                      <div className="flex items-center gap-4">
-                        <div className="w-64">
-                          <div className="flex items-center gap-2">
-                            <Star className="h-4 w-4 text-yellow-500" />
-                            <span className="font-medium">{film.film_title}</span>
-                          </div>
-                          <Badge
-                            className={
-                              film.days_until_release <= 0
-                                ? 'bg-gray-500/10 text-gray-500'
-                                : film.days_until_release <= 7
-                                ? 'bg-red-500/10 text-red-500'
-                                : 'bg-green-500/10 text-green-500'
-                            }
-                          >
-                            {film.days_until_release <= 0
-                              ? 'Released'
-                              : `${film.days_until_release} days out`}
-                          </Badge>
-                        </div>
-                        <div className="text-sm">
-                          <div className="flex items-center gap-1 text-muted-foreground">
-                            <Calendar className="h-3 w-3" />
-                            Release: {film.release_date}
-                          </div>
-                          <div className="flex items-center gap-1 text-muted-foreground">
-                            <Building2 className="h-3 w-3" />
-                            {film.total_circuits} circuits
-                          </div>
-                        </div>
-                      </div>
-
-                      <div className="flex items-center gap-6">
-                        <div className="text-center">
-                          <p className="text-2xl font-bold">
-                            {film.current_tickets.toLocaleString()}
-                          </p>
-                          <p className="text-xs text-muted-foreground">tickets</p>
-                        </div>
-                        <div className="text-center">
-                          <p className="text-2xl font-bold">
-                            ${film.current_revenue.toLocaleString()}
-                          </p>
-                          <p className="text-xs text-muted-foreground">revenue</p>
-                        </div>
-                      </div>
+                      film={film}
+                      isSelected={selectedFilm === film.film_title}
+                      onSelect={setSelectedFilm}
+                    />
+                  ))}
+                </div>
+              ) : (
+                /* Grouped view: multi-circuit films first, then single-circuit grouped by circuit */
+                <div className="space-y-4 max-h-[600px] overflow-y-auto">
+                  {/* Multi-circuit films (shown individually) */}
+                  {groupedByCircuit.multiCircuit.length > 0 && (
+                    <div className="space-y-2">
+                      <h4 className="text-sm font-semibold text-muted-foreground uppercase tracking-wider px-1">
+                        Multi-Circuit Films ({groupedByCircuit.multiCircuit.length})
+                      </h4>
+                      {groupedByCircuit.multiCircuit.map((film) => (
+                        <FilmRow
+                          key={film.film_title}
+                          film={film}
+                          isSelected={selectedFilm === film.film_title}
+                          onSelect={setSelectedFilm}
+                        />
+                      ))}
                     </div>
+                  )}
+
+                  {/* Single-circuit films grouped by circuit */}
+                  {Array.from(groupedByCircuit.byCircuit.entries())
+                    .sort(([, a], [, b]) => b.reduce((s, f) => s + f.current_tickets, 0) - a.reduce((s, f) => s + f.current_tickets, 0))
+                    .map(([circuit, circuitFilms]) => (
+                    <CircuitGroup
+                      key={circuit}
+                      circuitName={circuit}
+                      films={circuitFilms}
+                      selectedFilm={selectedFilm}
+                      onSelectFilm={setSelectedFilm}
+                      isMarcus={circuit.toLowerCase().includes('marcus') || circuit.toLowerCase().includes('movie tavern')}
+                    />
                   ))}
                 </div>
               )}
@@ -973,25 +1286,34 @@ export function PresaleTrackingPage() {
                     </Card>
                   )}
 
-                  {/* Visual trajectory bars */}
+                  {/* Visual trajectory bars - Marcus only */}
                   {trajectory.snapshots.length > 0 && (
                     <div className="space-y-4">
-                      <h4 className="font-medium">Ticket Buildup Over Time</h4>
+                      <div className="flex items-center gap-2">
+                        <h4 className="font-medium">Marcus Ticket Buildup</h4>
+                        <Badge variant="outline" className="text-[10px]">
+                          {trajectory.snapshots.length} days tracked
+                        </Badge>
+                      </div>
                       <div className="space-y-2">
                         {trajectory.snapshots.slice(-14).map((snapshot) => {
                           const maxTickets = Math.max(...trajectory.snapshots.map(s => s.total_tickets_sold));
                           const pct = maxTickets > 0 ? (snapshot.total_tickets_sold / maxTickets * 100) : 0;
-                          
+
                           // Find events for this date
-                          const eventsOnThisDay = marketEvents?.filter(e => 
+                          const eventsOnThisDay = marketEvents?.filter(e =>
                             snapshot.snapshot_date >= e.start_date && snapshot.snapshot_date <= e.end_date
                           );
+
+                          // Format date for display (show date AND days out for context)
+                          const dateLabel = snapshot.snapshot_date.slice(5); // MM-DD format
 
                           return (
                             <div key={snapshot.id} className="group relative">
                               <div className="flex items-center gap-3">
-                                <div className="w-20 text-sm text-muted-foreground">
-                                  {snapshot.days_before_release}d out
+                                <div className="w-24 text-sm text-muted-foreground flex justify-between">
+                                  <span>{dateLabel}</span>
+                                  <span className="text-xs opacity-60">{snapshot.days_before_release}d</span>
                                 </div>
                                 <div className="flex-1 h-6 bg-muted rounded overflow-hidden relative">
                                   <div
@@ -1080,6 +1402,104 @@ export function PresaleTrackingPage() {
                         </Table>
                       </div>
                     </div>
+                  )}
+                </div>
+              )}
+
+              {/* Theater Heatmap for selected film */}
+              {selectedFilm && (
+                <div className="mt-6 space-y-4">
+                  <div className="flex items-center gap-2">
+                    <MapPin className="h-5 w-5 text-blue-500" />
+                    <h4 className="font-medium">Theater Map</h4>
+                    <span className="text-sm text-muted-foreground">
+                      Presale activity for {selectedFilm}
+                    </span>
+                  </div>
+
+                  {heatmapLoading ? (
+                    <div className="h-[400px] flex items-center justify-center border rounded-lg">
+                      <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
+                    </div>
+                  ) : !heatmapData || heatmapData.theaters.length === 0 ? (
+                    <div className="h-[200px] flex flex-col items-center justify-center text-center border rounded-lg">
+                      <MapPin className="h-8 w-8 text-slate-300 mb-2" />
+                      <p className="text-sm text-muted-foreground">No geographic data for this film</p>
+                    </div>
+                  ) : (
+                    <>
+                      {/* Summary */}
+                      <div className="grid grid-cols-4 gap-3">
+                        <div className="p-3 border rounded-lg">
+                          <div className="text-xs text-muted-foreground">Theaters</div>
+                          <div className="text-xl font-bold">{heatmapData.theaters_with_data}</div>
+                        </div>
+                        <div className="p-3 border rounded-lg">
+                          <div className="text-xs text-muted-foreground">Showtimes</div>
+                          <div className="text-xl font-bold">
+                            {heatmapData.theaters.reduce((s, t) => s + t.total_showtimes, 0).toLocaleString()}
+                          </div>
+                        </div>
+                        <div className="p-3 border rounded-lg">
+                          <div className="text-xs text-muted-foreground">Tickets Sold</div>
+                          <div className="text-xl font-bold">
+                            {heatmapData.theaters.reduce((s, t) => s + t.total_tickets_sold, 0).toLocaleString()}
+                          </div>
+                        </div>
+                        <div className="p-3 border rounded-lg">
+                          <div className="text-xs text-muted-foreground">Avg Fill Rate</div>
+                          <div className="text-xl font-bold">
+                            {(heatmapData.theaters.reduce((s, t) => s + t.fill_rate_pct, 0) / (heatmapData.theaters.length || 1)).toFixed(1)}%
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Map */}
+                      <Card className="overflow-hidden">
+                        <CardContent className="p-0 relative">
+                          <PresaleHeatmapMap theaters={heatmapData.theaters} />
+                        </CardContent>
+                      </Card>
+
+                      {/* Top theaters table */}
+                      <div className="max-h-[300px] overflow-y-auto border rounded-lg">
+                        <Table>
+                          <TableHeader>
+                            <TableRow>
+                              <TableHead>Theater</TableHead>
+                              <TableHead>Circuit</TableHead>
+                              <TableHead className="text-right">Sold</TableHead>
+                              <TableHead className="text-right">Fill Rate</TableHead>
+                              <TableHead className="text-right">Avg Price</TableHead>
+                            </TableRow>
+                          </TableHeader>
+                          <TableBody>
+                            {[...heatmapData.theaters]
+                              .sort((a, b) => b.total_tickets_sold - a.total_tickets_sold)
+                              .slice(0, 30)
+                              .map((t) => (
+                              <TableRow key={t.theater_name}>
+                                <TableCell className="font-medium text-sm">
+                                  {t.theater_name}
+                                  {t.is_marcus && <Badge variant="secondary" className="ml-1 text-[9px]">Marcus</Badge>}
+                                </TableCell>
+                                <TableCell className="text-xs">{t.circuit_name || '-'}</TableCell>
+                                <TableCell className="text-right text-sm">{t.total_tickets_sold.toLocaleString()}</TableCell>
+                                <TableCell className="text-right text-sm">
+                                  <span className={
+                                    t.fill_rate_pct > 70 ? 'text-red-600 font-medium' :
+                                    t.fill_rate_pct > 40 ? 'text-orange-600' : ''
+                                  }>{t.fill_rate_pct.toFixed(1)}%</span>
+                                </TableCell>
+                                <TableCell className="text-right text-sm">
+                                  {t.avg_price ? `$${t.avg_price.toFixed(2)}` : '-'}
+                                </TableCell>
+                              </TableRow>
+                            ))}
+                          </TableBody>
+                        </Table>
+                      </div>
+                    </>
                   )}
                 </div>
               )}
@@ -1418,6 +1838,222 @@ export function PresaleTrackingPage() {
           </Card>
         </TabsContent>
 
+        {/* Compliance Tab */}
+        <TabsContent value="compliance">
+          <div className="space-y-4">
+            <Card>
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2">
+                  <Target className="h-5 w-5 text-blue-500" />
+                  Presale Posting Compliance
+                </CardTitle>
+                <CardDescription>
+                  How far in advance is Marcus posting showtimes vs. competitors?
+                  A higher "days ahead" means tickets are available for purchase earlier.
+                </CardDescription>
+              </CardHeader>
+              <CardContent>
+                {complianceData?.films?.length ? (
+                  <div className="space-y-6">
+                    {/* Upcoming films where Marcus is behind */}
+                    {(() => {
+                      const upcoming = complianceData.films.filter(
+                        (f) => f.days_until_release > 0
+                      );
+                      const behind = upcoming.filter(
+                        (f) => f.marcus_delta !== null && f.marcus_delta < 0
+                      );
+                      const notPosting = upcoming.filter(
+                        (f) => f.marcus_rank === null && f.total_circuits >= 3
+                      );
+
+                      return (
+                        <>
+                          {/* Summary Cards */}
+                          <div className="grid gap-4 md:grid-cols-4">
+                            <Card>
+                              <CardHeader className="pb-2">
+                                <CardTitle className="text-sm font-medium">Upcoming Films</CardTitle>
+                              </CardHeader>
+                              <CardContent>
+                                <div className="text-2xl font-bold">{upcoming.length}</div>
+                                <p className="text-xs text-muted-foreground">with presale data</p>
+                              </CardContent>
+                            </Card>
+                            <Card>
+                              <CardHeader className="pb-2">
+                                <CardTitle className="text-sm font-medium">Marcus Behind</CardTitle>
+                              </CardHeader>
+                              <CardContent>
+                                <div className="text-2xl font-bold text-red-500">{behind.length}</div>
+                                <p className="text-xs text-muted-foreground">posting later than average</p>
+                              </CardContent>
+                            </Card>
+                            <Card>
+                              <CardHeader className="pb-2">
+                                <CardTitle className="text-sm font-medium">Not Posting</CardTitle>
+                              </CardHeader>
+                              <CardContent>
+                                <div className="text-2xl font-bold text-amber-500">{notPosting.length}</div>
+                                <p className="text-xs text-muted-foreground">films others are showing</p>
+                              </CardContent>
+                            </Card>
+                            <Card>
+                              <CardHeader className="pb-2">
+                                <CardTitle className="text-sm font-medium">All Films Tracked</CardTitle>
+                              </CardHeader>
+                              <CardContent>
+                                <div className="text-2xl font-bold">{complianceData.total_films}</div>
+                                <p className="text-xs text-muted-foreground">including released</p>
+                              </CardContent>
+                            </Card>
+                          </div>
+
+                          {/* Films Table */}
+                          <div className="rounded-md border max-h-[600px] overflow-auto">
+                            <Table>
+                              <TableHeader>
+                                <TableRow>
+                                  <TableHead>Film</TableHead>
+                                  <TableHead className="text-right">Release</TableHead>
+                                  <TableHead className="text-right">Days Out</TableHead>
+                                  <TableHead className="text-right">Circuits</TableHead>
+                                  <TableHead className="text-right">Marcus Rank</TableHead>
+                                  <TableHead className="text-right">Marcus Days Ahead</TableHead>
+                                  <TableHead className="text-right">Avg Days Ahead</TableHead>
+                                  <TableHead className="text-right">Delta</TableHead>
+                                </TableRow>
+                              </TableHeader>
+                              <TableBody>
+                                {complianceData.films
+                                  .filter((f) => f.days_until_release >= -7)
+                                  .sort((a, b) => a.days_until_release - b.days_until_release)
+                                  .map((film) => {
+                                    const deltaColor =
+                                      film.marcus_delta === null
+                                        ? 'text-amber-500'
+                                        : film.marcus_delta >= 0
+                                        ? 'text-green-600'
+                                        : film.marcus_delta < -3
+                                        ? 'text-red-600 font-medium'
+                                        : 'text-red-500';
+
+                                    return (
+                                      <TableRow key={film.film_title}>
+                                        <TableCell className="font-medium max-w-[200px] truncate">
+                                          {film.film_title}
+                                        </TableCell>
+                                        <TableCell className="text-right text-sm">
+                                          {film.release_date}
+                                        </TableCell>
+                                        <TableCell className="text-right">
+                                          <Badge
+                                            variant={film.days_until_release > 0 ? 'default' : 'secondary'}
+                                            className={
+                                              film.days_until_release > 14
+                                                ? 'bg-blue-100 text-blue-800'
+                                                : film.days_until_release > 0
+                                                ? 'bg-amber-100 text-amber-800'
+                                                : ''
+                                            }
+                                          >
+                                            {film.days_until_release > 0
+                                              ? `${film.days_until_release}d`
+                                              : 'Released'}
+                                          </Badge>
+                                        </TableCell>
+                                        <TableCell className="text-right">{film.total_circuits}</TableCell>
+                                        <TableCell className="text-right">
+                                          {film.marcus_rank !== null ? (
+                                            <span className={film.marcus_rank <= 3 ? 'text-green-600 font-medium' : ''}>
+                                              #{film.marcus_rank}/{film.total_circuits}
+                                            </span>
+                                          ) : (
+                                            <Badge variant="outline" className="text-amber-600 border-amber-300">
+                                              Not Posting
+                                            </Badge>
+                                          )}
+                                        </TableCell>
+                                        <TableCell className="text-right font-mono">
+                                          {film.marcus_days_ahead !== null ? `${film.marcus_days_ahead}d` : '—'}
+                                        </TableCell>
+                                        <TableCell className="text-right font-mono text-muted-foreground">
+                                          {film.avg_days_ahead}d
+                                        </TableCell>
+                                        <TableCell className={`text-right font-mono ${deltaColor}`}>
+                                          {film.marcus_delta !== null
+                                            ? `${film.marcus_delta > 0 ? '+' : ''}${film.marcus_delta}d`
+                                            : '—'}
+                                        </TableCell>
+                                      </TableRow>
+                                    );
+                                  })}
+                              </TableBody>
+                            </Table>
+                          </div>
+
+                          {/* Top Circuits Leaderboard */}
+                          {upcoming.length > 0 && (
+                            <Card>
+                              <CardHeader>
+                                <CardTitle className="text-sm font-medium">
+                                  Top Circuits by Presale Posting (Next Film)
+                                </CardTitle>
+                              </CardHeader>
+                              <CardContent>
+                                {(() => {
+                                  const nextFilm = upcoming[0];
+                                  return (
+                                    <div className="space-y-2">
+                                      <p className="text-sm text-muted-foreground mb-3">
+                                        <span className="font-medium">{nextFilm.film_title}</span>
+                                        {' '}&mdash; releasing {nextFilm.release_date}
+                                      </p>
+                                      {nextFilm.circuit_ranking.slice(0, 10).map(([circuit, days], i) => {
+                                        const isM = circuit.toLowerCase().includes('marcus') ||
+                                                    circuit.toLowerCase().includes('movie tavern');
+                                        return (
+                                          <div
+                                            key={circuit}
+                                            className={`flex items-center justify-between text-sm py-1 px-2 rounded ${
+                                              isM ? 'bg-blue-50 dark:bg-blue-950/30 font-medium' : ''
+                                            }`}
+                                          >
+                                            <span>
+                                              <span className="text-muted-foreground mr-2">#{i + 1}</span>
+                                              {circuit}
+                                              {isM && (
+                                                <Badge variant="outline" className="ml-2 text-xs">Marcus</Badge>
+                                              )}
+                                            </span>
+                                            <span className="font-mono">{days}d ahead</span>
+                                          </div>
+                                        );
+                                      })}
+                                    </div>
+                                  );
+                                })()}
+                              </CardContent>
+                            </Card>
+                          )}
+                        </>
+                      );
+                    })()}
+                  </div>
+                ) : (
+                  <div className="text-center py-12 text-muted-foreground">
+                    <Target className="h-12 w-12 mx-auto mb-4 opacity-50" />
+                    <p className="font-medium">No Compliance Data Yet</p>
+                    <p className="text-sm">
+                      Run an EntTelligence sync to populate presale posting data.
+                    </p>
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+          </div>
+        </TabsContent>
+
         {/* Alerts Tab */}
         <TabsContent value="alerts">
           <div className="grid grid-cols-2 gap-6">
@@ -1441,7 +2077,7 @@ export function PresaleTrackingPage() {
                 </div>
               </CardHeader>
               <CardContent>
-                {alerts.length === 0 ? (
+                {watches.length === 0 ? (
                   <div className="text-center py-8">
                     <Bell className="h-12 w-12 mx-auto text-muted-foreground mb-4" />
                     <p className="text-muted-foreground mb-4">
@@ -1450,39 +2086,39 @@ export function PresaleTrackingPage() {
                   </div>
                 ) : (
                   <div className="space-y-3">
-                    {alerts.map((alert) => {
-                      const typeInfo = getAlertTypeInfo(alert.alert_type);
+                    {watches.map((watch) => {
+                      const typeInfo = getAlertTypeInfo(watch.alert_type);
                       return (
                         <div
-                          key={alert.id}
+                          key={watch.id}
                           className={`flex items-center justify-between p-3 border rounded-lg ${
-                            alert.enabled ? '' : 'opacity-50'
+                            watch.enabled ? '' : 'opacity-50'
                           }`}
                         >
                           <div className="flex items-center gap-3">
                             <typeInfo.icon className={`h-5 w-5 ${typeInfo.color}`} />
                             <div>
-                              <p className="font-medium">{alert.film_title}</p>
+                              <p className="font-medium">{watch.film_title}</p>
                               <p className="text-sm text-muted-foreground">
-                                {typeInfo.label}: {alert.threshold}
-                                {alert.alert_type === 'velocity_drop' || alert.alert_type === 'velocity_spike' || alert.alert_type === 'market_share' ? '%' : ''}
-                                {alert.alert_type === 'milestone' ? ' tickets' : ''}
-                                {alert.alert_type === 'days_out' ? ' days' : ''}
+                                {typeInfo.label}: {watch.threshold}
+                                {watch.alert_type === 'velocity_drop' || watch.alert_type === 'velocity_spike' || watch.alert_type === 'market_share' ? '%' : ''}
+                                {watch.alert_type === 'milestone' ? ' tickets' : ''}
+                                {watch.alert_type === 'days_out' ? ' days' : ''}
                               </p>
                             </div>
                           </div>
                           <div className="flex items-center gap-2">
-                            {alert.trigger_count > 0 && (
-                              <Badge variant="outline">{alert.trigger_count} triggers</Badge>
+                            {watch.trigger_count > 0 && (
+                              <Badge variant="outline">{watch.trigger_count} triggers</Badge>
                             )}
                             <Switch
-                              checked={alert.enabled}
-                              onCheckedChange={() => handleToggleAlert(alert.id)}
+                              checked={watch.enabled}
+                              onCheckedChange={() => handleToggleAlert(watch.id)}
                             />
                             <Button
                               variant="ghost"
                               size="sm"
-                              onClick={() => handleDeleteAlert(alert.id)}
+                              onClick={() => handleDeleteAlert(watch.id)}
                             >
                               <Trash2 className="h-4 w-4 text-red-500" />
                             </Button>
@@ -1508,10 +2144,8 @@ export function PresaleTrackingPage() {
                       Recent alert triggers
                     </CardDescription>
                   </div>
-                  {notifications.length > 0 && (
-                    <Button variant="outline" size="sm" onClick={handleClearNotifications}>
-                      Clear All
-                    </Button>
+                  {unreadNotifications.length > 0 && (
+                    <Badge variant="secondary">{unreadNotifications.length} unread</Badge>
                   )}
                 </div>
               </CardHeader>
@@ -1595,7 +2229,7 @@ export function PresaleTrackingPage() {
               <Label htmlFor="alert-type">Alert Type</Label>
               <Select
                 value={newAlert.alert_type}
-                onValueChange={(v) => setNewAlert({ ...newAlert, alert_type: v as PresaleAlert['alert_type'] })}
+                onValueChange={(v) => setNewAlert({ ...newAlert, alert_type: v as PresaleWatch['alert_type'] })}
               >
                 <SelectTrigger id="alert-type" className="mt-1">
                   <SelectValue />

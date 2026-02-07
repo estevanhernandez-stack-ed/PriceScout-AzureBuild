@@ -37,6 +37,7 @@ from api.routers import scrape_sources, price_checks, price_alerts, price_tiers
 from api.routers import circuit_benchmarks, presales, analytics
 from api.routers import admin, cache, enttelligence, schedule_monitor, system, market_context, films
 from api.routers import theater_amenities, company_profiles, theater_onboarding, alternative_content
+from api.routers import settings
 from api import metrics
 from app.rate_limit import RateLimitMiddleware
 
@@ -55,6 +56,7 @@ from app.config import (
     APP_NAME,
     APP_VERSION,
     DEBUG,
+    DEFAULT_COMPANY_ID,
     is_production
 )
 
@@ -199,30 +201,51 @@ Key business entities:
         }
     ],
     openapi_tags=[
-        {
-            "name": "reports",
-            "description": "Generate PDF and Excel reports for market analysis"
-        },
-        {
-            "name": "resources",
-            "description": "Access theaters, films, showtimes, and pricing data"
-        },
-        {
-            "name": "Price Data",
-            "description": "Query pricing history and trends"
-        },
-        {
-            "name": "Scrapes",
-            "description": "Manage web scraping operations"
-        },
-        {
-            "name": "Auth",
-            "description": "Authentication and token management"
-        },
-        {
-            "name": "Users",
-            "description": "User management and profile operations"
-        }
+        # Core Operations
+        {"name": "reports", "description": "Generate PDF, Excel, and HTML reports for market analysis"},
+        {"name": "resources", "description": "Access theaters, films, showtimes, and pricing data"},
+        {"name": "Price Data", "description": "Query pricing history and trends"},
+        {"name": "Scrapes", "description": "Manage web scraping operations and job status"},
+        {"name": "Scrape Sources", "description": "Configure and manage scrape source definitions"},
+        # Authentication & Users
+        {"name": "Auth", "description": "Authentication and token management"},
+        {"name": "Users", "description": "User management and profile operations"},
+        {"name": "Admin", "description": "User administration and audit logs"},
+        # Price Alerts & Monitoring
+        {"name": "Price Alerts", "description": "Price change alerts and surge detection"},
+        {"name": "Surge Scanner", "description": "Advance and new-film surge price detection"},
+        {"name": "Schedule Alerts", "description": "Schedule change monitoring and alerts"},
+        # Baselines
+        {"name": "Price Baselines", "description": "Baseline price management and discovery"},
+        {"name": "EntTelligence Baselines", "description": "EntTelligence data source baseline analysis"},
+        {"name": "Fandango Baselines", "description": "Fandango data source baseline analysis"},
+        {"name": "Market Baselines", "description": "Market-level baseline scrapes and stats"},
+        {"name": "Baseline Browser", "description": "Browse baselines by market, theater, source"},
+        {"name": "Baseline Analysis", "description": "Cross-source baseline comparison and tax estimation"},
+        {"name": "Baseline Maintenance", "description": "Deduplication and cleanup operations"},
+        {"name": "Coverage Gaps", "description": "Baseline coverage gap analysis and remediation"},
+        # Presales & Demand
+        {"name": "Presales", "description": "Presale tracking, demand lookup, and compliance"},
+        {"name": "Circuit Benchmarks", "description": "Circuit-level pricing benchmarks from EntTelligence"},
+        # Company & Circuit Configuration
+        {"name": "Company Profiles", "description": "Circuit pricing profile and discount day discovery"},
+        {"name": "Discount Programs", "description": "Circuit discount day program management"},
+        {"name": "Price Tiers", "description": "Pricing tier discovery and discount detection"},
+        # Theater Management
+        {"name": "Theaters", "description": "Theater matching, discovery, and configuration"},
+        {"name": "Theater Onboarding", "description": "Theater onboarding workflow and status"},
+        {"name": "Theater Amenities", "description": "Theater amenity and premium format data"},
+        # Cache & System
+        {"name": "Cache", "description": "Theater cache status and refresh operations"},
+        {"name": "Cache Maintenance", "description": "Cache health monitoring and repair"},
+        {"name": "Repair Queue", "description": "Failed theater URL repair queue management"},
+        {"name": "System", "description": "System health checks and maintenance"},
+        # Content & Context
+        {"name": "Films", "description": "Film metadata and enrichment"},
+        {"name": "Alternative Content", "description": "Alternative content and special event tracking"},
+        {"name": "Market Context", "description": "Theater metadata, market events, and heatmaps"},
+        # Settings
+        {"name": "Settings", "description": "Tax configuration and application settings"},
     ]
 )
 
@@ -231,15 +254,15 @@ Key business entities:
 # OPENTELEMETRY / APPLICATION INSIGHTS
 # ============================================================================
 
-if APPLICATIONINSIGHTS_CONNECTION_STRING:
-    try:
-        from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-        FastAPIInstrumentor.instrument_app(app)
-        logger.info("Application Insights instrumentation enabled")
-    except ImportError:
-        logger.warning("OpenTelemetry not available - instrumentation disabled")
-    except Exception as e:
-        logger.warning(f"Failed to initialize Application Insights: {e}")
+# Configure distributed tracing with Azure Monitor exporter
+# This sets up: TracerProvider, W3C Trace Context propagation, RequestID middleware
+try:
+    from api.telemetry import configure_telemetry
+    configure_telemetry(app)
+except ImportError:
+    logger.warning("Telemetry module not available - instrumentation disabled")
+except Exception as e:
+    logger.warning(f"Failed to initialize telemetry: {e}")
 
 
 # ============================================================================
@@ -536,6 +559,9 @@ app.include_router(analytics.router, prefix="/api/v1", tags=["Analytics"])
 
 # Films - film metadata and posters
 app.include_router(films.router, prefix="/api/v1", tags=["Films"])
+
+# Settings (tax config, company preferences)
+app.include_router(settings.router, prefix="/api/v1", tags=["Settings"])
 
 # Prometheus metrics endpoint
 app.include_router(metrics.router, tags=["Metrics"])
@@ -895,37 +921,58 @@ async def startup_event():
     except Exception as e:
         logger.error(f"Failed to initialize database: {e}")
 
-    # Auto-sync logic (Simulating deployment background work)
+    # Auto-sync logic: fetch today + 7 days from EntTelligence in background
+    # Runs in a thread so the API server starts accepting requests immediately.
     from app import config
     if config.AUTO_SYNC_ON_STARTUP and not _is_testing:
-        try:
-            from api.services.enttelligence_cache_service import get_cache_service
-            from datetime import date
-            
-            cache_service = get_cache_service()
-            today = date.today().isoformat()
-            
-            logger.info(f"PriceScout: Triggering automatic EntTelligence sync for {today}")
-            
-            # Note: In production this would be a Celery task or Azure Function.
-            # Here we run it during startup to ensure fresh data for the dev session.
-            # We use a simple background check to avoid blocking the API server if it's already fresh.
-            stats = cache_service.get_cache_stats(company_id=1)
-            
-            if stats["fresh_entries"] < 100 or not stats["last_fetch"]:
-                logger.info("Cache appears empty or stale. Synchronizing now...")
-                # We do this synchronously or in a separate thread. 
-                # For dev, we'll just call it since the first request will hit it anyway.
-                cache_service.sync_prices_for_dates(
-                    company_id=1,
-                    start_date=today
-                )
-                logger.info("Automatic sync completed.")
-            else:
-                logger.info(f"Cache is already fresh ({stats['fresh_entries']} entries). Skipping auto-sync.")
-                
-        except Exception as e:
-            logger.warning(f"PriceScout: Automatic startup sync failed: {e}")
+        import threading
+        from datetime import date, timedelta
+
+        def _background_sync():
+            try:
+                from api.services.enttelligence_cache_service import get_cache_service
+
+                cache_service = get_cache_service()
+                today = date.today()
+
+                stats = cache_service.get_cache_stats(company_id=DEFAULT_COMPANY_ID)
+
+                if stats["fresh_entries"] < 100 or not stats["last_fetch"]:
+                    logger.info(f"[AutoSync] Cache stale/empty. Syncing today + 7 days in background...")
+                    # Sync day-by-day — the EntTelligence API handles single-day
+                    # requests reliably and each returns ~120K national showtimes.
+                    for offset in range(8):
+                        target = today + timedelta(days=offset)
+                        target_str = target.isoformat()
+                        logger.info(f"[AutoSync] Syncing {target_str}...")
+                        cache_service.sync_prices_for_dates(
+                            company_id=DEFAULT_COMPANY_ID,
+                            start_date=target_str,
+                            end_date=target_str
+                        )
+                    logger.info("[AutoSync] Background sync completed (8 days).")
+
+                    # Auto-refresh EntTelligence baselines after sync
+                    try:
+                        from app.baseline_guard import trigger_post_scrape_refresh
+                        refresh = trigger_post_scrape_refresh(1, source="enttelligence")
+                        logger.info(
+                            f"[AutoSync] Baseline auto-refresh: "
+                            f"{refresh.get('applied', 0)} updated, "
+                            f"{refresh.get('new', 0)} new, "
+                            f"{refresh.get('flagged', 0)} flagged"
+                        )
+                    except Exception as refresh_err:
+                        logger.warning(f"[AutoSync] Baseline auto-refresh failed: {refresh_err}")
+                else:
+                    logger.info(f"[AutoSync] Cache fresh ({stats['fresh_entries']} entries). Skipping.")
+
+            except Exception as e:
+                logger.warning(f"[AutoSync] Background sync failed: {e}")
+
+        sync_thread = threading.Thread(target=_background_sync, daemon=True, name="ent-auto-sync")
+        sync_thread.start()
+        logger.info("PriceScout: EntTelligence auto-sync started in background thread (today + 7 days)")
 
 
 @app.on_event("shutdown")

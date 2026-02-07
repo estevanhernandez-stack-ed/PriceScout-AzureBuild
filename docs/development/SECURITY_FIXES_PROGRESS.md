@@ -353,40 +353,6 @@ Added detailed security comments explaining:
 - `app/database.py` - Added security comments to 2 locations
 
 ---
-**Priority:** 🟡 Medium  
-**Time:** 4 hours  
-**Status:** ⏸️ PENDING  
-**Depends On:** 1.2 (security_config.py)
-
-**Actions:**
-- [ ] Add `validate_uploaded_file()` to security_config.py
-- [ ] Implement file size limits (50MB)
-- [ ] Add JSON depth validation (max 10 levels)
-- [ ] Add SQLite magic byte validation
-- [ ] Update all file upload points
-
-**Files to Modify:**
-- `app/security_config.py` - Add validation functions
-- `app/data_management_v2.py` - Add validation to uploads
-- `app/theater_matching_tool.py` - Add validation to uploads
-
----
-
-### 3.2 Add SQL Query Security Comments
-**Priority:** 🟡 Medium  
-**Time:** 1 hour  
-**Status:** ⏸️ PENDING
-
-**Actions:**
-- [ ] Add security comment to `database.py:316`
-- [ ] Add security comment to `database.py:1425`
-- [ ] Document parameterization pattern
-- [ ] Add unit test confirming safety
-
-**Files to Modify:**
-- `app/database.py` - Add comments explaining f-string safety
-
----
 
 ## Phase 4: Logging & Monitoring (Day 5) ✅ COMPLETE
 
@@ -822,163 +788,40 @@ The Price Scout application has undergone a comprehensive security enhancement, 
 
 ---
 
-**End of Security Implementation Plan**  
-**Date Completed:** January 2025  
-**Prepared by:** GitHub Copilot  
+**End of Security Implementation Plan**
+**Original Completed:** January 2025
+**Last Updated:** February 2026 (Entra ID SSO additions)
 **Application:** Price Scout v27.0+
-       ↓
-     4.2 Security Monitoring
-       ↓
-     5.1 Streamlit Config
-       ↓
-     5.2 Nginx Config
-       ↓
-     6.1 Security Testing
-       ↓
-     6.2 Documentation
-```
+
+## February 2026: OAuth/SSO Security Enhancements
+
+The following Entra ID SSO security features were added to complement the core security implementation:
+
+| Security Control | Status | Reference |
+|-----------------|--------|-----------|
+| JWKS Token Signature Verification | ✅ Complete | SEC-001 |
+| CSRF State Parameter | ✅ Complete | SEC-002 |
+| Open Redirect Prevention | ✅ Complete | SEC-003 |
+| Auth Code Exchange Pattern | ✅ Complete | SEC-004 |
+| Tenant Validation | ✅ Complete | SEC-005 |
+| Audience Validation | ✅ Complete | SEC-006 |
+| Thread-Safe Initialization | ✅ Complete | SEC-007 |
+| Request ID Validation | ✅ Complete | SEC-008 |
+| PKCE Implementation | ⏸️ Deferred (P2) | SEC-009 |
+| Nonce for ID Token Replay | ⏸️ Deferred (P2) | SEC-010 |
+
+**Implementation Files:**
+- `api/entra_auth.py` - Full MSAL OAuth2 implementation
+- `api/telemetry.py` - OpenTelemetry with request ID validation
+
+**Documentation Updated:**
+- `docs/SECURITY_CONTROLS_REPORT.md` - Section 2.4 Entra ID SSO Security
+- `docs/OPERATIONS_RUNBOOK.md` - Entra ID troubleshooting
+- `docs/API_REFERENCE.md` - Entra ID endpoints
+- `docs/development/SECURITY_CHECKLIST.md` - OAuth/SSO checklist items
+
+See `docs/SECURITY_REMEDIATION_PLAN.md` for detailed implementation notes.
 
 ---
 
-## Current Focus: Phase 1.1 - Pin Dependencies
-
-### Step-by-Step Instructions
-
-1. **Capture current environment:**
-   ```bash
-   pip freeze > requirements_frozen.txt
-   ```
-
-2. **Review current requirements.txt:**
-   ```
-   streamlit
-   pandas
-   playwright
-   beautifulsoup4
-   httpx
-   thefuzz[speedup]
-   bcrypt
-   pytz
-   openpyxl
-   xlsxwriter
-   pytest
-   APScheduler
-   ```
-
-3. **Run security audit:**
-   ```bash
-   pip install pip-audit safety
-   pip-audit --desc
-   safety check --json
-   ```
-
-4. **Update requirements.txt with pinned versions:**
-   - Keep exact versions from freeze
-   - Add security audit results as comments
-   - Document any known vulnerabilities
-
-5. **Test installation:**
-   ```bash
-   pip install -r requirements.txt
-   pytest tests/ -v
-   ```
-
----
-
-## Daily Standup Notes
-
-### Day 1 (Oct 26, 2025) - ✅ COMPLETE
-- **Completed:** Phase 1 - Foundation
-  - ✅ Pinned all dependencies with exact versions
-  - ✅ Ran pip-audit (found pip 25.2 vulnerability)
-  - ✅ Removed smolagents dependency
-  - ✅ Created security_config.py module (300+ lines)
-- **Next:** Phase 2 - Authentication & Session Security
-- **Blockers:** None
-
----
-
-## Risk Register
-
-| Risk | Impact | Probability | Mitigation |
-|------|--------|-------------|------------|
-| Breaking changes in dependencies | High | Medium | Pin exact versions, test thoroughly |
-| Rate limiting breaks legitimate use | Medium | Low | Set threshold to 5 attempts, 15min timeout |
-| Session timeout loses user work | Medium | Medium | Add auto-save, warn before timeout |
-| File validation rejects valid files | Low | Low | Test with production data samples |
-
----
-
-## Rollback Plan
-
-If any security fix causes issues:
-
-1. **Immediate Rollback:**
-   ```bash
-   git revert <commit-hash>
-   git push origin main
-   ```
-
-2. **Feature Flags:** (Future enhancement)
-   - Add environment variables to enable/disable security features
-   - Example: `ENABLE_RATE_LIMITING=false`
-
-3. **Staged Deployment:**
-   - Test in development environment first
-   - Deploy to staging for 24 hours
-   - Monitor logs before production deploy
-
----
-
-## Success Criteria
-
-### Phase 1 Complete When:
-- [x] All dependencies have exact version numbers
-- [x] pip-audit run (1 low-severity vulnerability documented)
-- [x] safety check run (no critical/high vulnerabilities)
-- [x] All tests passing with new versions
-
-### Phase 2 Complete When:
-- [x] 5+ failed logins trigger account lockout
-- [x] Account unlocks after 15 minutes
-- [x] Session expires after 30 min idle
-- [x] Default admin password cannot be used
-
-### Phase 3 Complete When:
-- [x] Files >50MB rejected
-- [x] Invalid JSON rejected (depth, structure)
-- [x] Invalid .db files rejected
-- [x] SQL queries have security comments
-
-### Phase 4 Complete When:
-- [x] No passwords/API keys in logs (sanitization added)
-- [x] LOG_LEVEL=INFO in production (.streamlit/config.toml)
-- [x] Security events logged (via security_config.log_security_event)
-- [x] Log review script created (scripts/security_monitor.py)
-
-### Phase 5 Complete When:
-- [x] Streamlit config created (.streamlit/config.toml)
-- [x] Nginx config template created (deploy/nginx.conf)
-- [x] HTTPS enforced via nginx redirect
-- [x] Security headers present (HSTS, CSP, X-Frame-Options, etc.)
-- [x] Environment variables documented (.env.example)
-- [x] Deployment guide created (deploy/DEPLOYMENT_GUIDE.md)
-
-### Phase 6 Complete When:
-- [ ] All security tests passing
-- [ ] Documentation updated
-- [ ] Deployment guide complete
-- [ ] Security checklist 100% complete
-
----
-
-## References
-
-- **Security Audit:** `docs/SECURITY_AUDIT_REPORT.md`
-- **Security Policy:** `SECURITY.md`
-- **Deployment Checklist:** `dev_docs/SECURITY_CHECKLIST.md`
-- **OWASP Top 10:** https://owasp.org/Top10/
-
----
-
-**Last Updated:** October 26, 2025 - ✅ Phase 5 Complete (12 of 22 tasks finished)
+**Last Updated:** February 2026

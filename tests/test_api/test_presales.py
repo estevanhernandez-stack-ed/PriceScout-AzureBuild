@@ -12,7 +12,7 @@ class TestPresalesListEndpoints:
     """Tests for /api/v1/presales endpoint."""
 
     @patch('api.routers.presales.get_db_connection')
-    def test_list_presales_success(self, mock_db, test_client_as_user):
+    def test_list_presales_success(self, mock_db, test_client_as_admin):
         """Test successful presale listing."""
         mock_cursor = MagicMock()
         mock_conn = MagicMock()
@@ -47,14 +47,14 @@ class TestPresalesListEndpoints:
 
         mock_cursor.fetchall.return_value = [mock_row]
 
-        response = test_client_as_user.get("/api/v1/presales")
+        response = test_client_as_admin.get("/api/v1/presales")
 
         assert response.status_code == 200
         data = response.json()
         assert isinstance(data, list)
 
     @patch('api.routers.presales.get_db_connection')
-    def test_list_presales_with_filters(self, mock_db, test_client_as_user):
+    def test_list_presales_with_filters(self, mock_db, test_client_as_admin):
         """Test presale listing with filters."""
         mock_cursor = MagicMock()
         mock_conn = MagicMock()
@@ -63,7 +63,7 @@ class TestPresalesListEndpoints:
 
         mock_cursor.fetchall.return_value = []
 
-        response = test_client_as_user.get(
+        response = test_client_as_admin.get(
             "/api/v1/presales",
             params={
                 "film_title": "Avatar",
@@ -78,7 +78,7 @@ class TestPresalesListEndpoints:
         assert data == []
 
     @patch('api.routers.presales.get_db_connection')
-    def test_list_presales_table_not_exists(self, mock_db, test_client_as_user):
+    def test_list_presales_table_not_exists(self, mock_db, test_client_as_admin):
         """Test listing when table doesn't exist."""
         mock_cursor = MagicMock()
         mock_conn = MagicMock()
@@ -87,7 +87,7 @@ class TestPresalesListEndpoints:
 
         mock_cursor.execute.side_effect = sqlite3.OperationalError("no such table: circuit_presales")
 
-        response = test_client_as_user.get("/api/v1/presales")
+        response = test_client_as_admin.get("/api/v1/presales")
 
         assert response.status_code == 200
         assert response.json() == []
@@ -97,7 +97,7 @@ class TestPresaleFilmsEndpoint:
     """Tests for /api/v1/presales/films endpoint."""
 
     @patch('api.routers.presales.get_db_connection')
-    def test_list_films_success(self, mock_db, test_client_as_user):
+    def test_list_films_success(self, mock_db, test_client_as_admin):
         """Test successful film listing."""
         mock_cursor = MagicMock()
         mock_conn = MagicMock()
@@ -131,7 +131,7 @@ class TestPresaleFilmsEndpoint:
 
         mock_cursor.fetchall.return_value = mock_rows
 
-        response = test_client_as_user.get("/api/v1/presales/films")
+        response = test_client_as_admin.get("/api/v1/presales/films")
 
         assert response.status_code == 200
         data = response.json()
@@ -139,7 +139,7 @@ class TestPresaleFilmsEndpoint:
         assert len(data) == 2
 
     @patch('api.routers.presales.get_db_connection')
-    def test_list_films_empty(self, mock_db, test_client_as_user):
+    def test_list_films_empty(self, mock_db, test_client_as_admin):
         """Test film listing when no data exists."""
         mock_cursor = MagicMock()
         mock_conn = MagicMock()
@@ -148,7 +148,7 @@ class TestPresaleFilmsEndpoint:
 
         mock_cursor.fetchall.return_value = []
 
-        response = test_client_as_user.get("/api/v1/presales/films")
+        response = test_client_as_admin.get("/api/v1/presales/films")
 
         assert response.status_code == 200
         assert response.json() == []
@@ -158,7 +158,7 @@ class TestFilmTrajectoryEndpoint:
     """Tests for /api/v1/presales/{film_title} endpoint."""
 
     @patch('api.routers.presales.get_db_connection')
-    def test_get_trajectory_success(self, mock_db, test_client_as_user):
+    def test_get_trajectory_success(self, mock_db, test_client_as_admin):
         """Test successful trajectory retrieval."""
         mock_cursor = MagicMock()
         mock_conn = MagicMock()
@@ -238,7 +238,7 @@ class TestFilmTrajectoryEndpoint:
 
         mock_cursor.fetchall.return_value = mock_rows
 
-        response = test_client_as_user.get("/api/v1/presales/Avatar%203")
+        response = test_client_as_admin.get("/api/v1/presales/Avatar%203")
 
         assert response.status_code == 200
         data = response.json()
@@ -248,7 +248,7 @@ class TestFilmTrajectoryEndpoint:
         assert "current_tickets" in data
 
     @patch('api.routers.presales.get_db_connection')
-    def test_get_trajectory_not_found(self, mock_db, test_client_as_user):
+    def test_get_trajectory_not_found(self, mock_db, test_client_as_admin):
         """Test trajectory for non-existent film."""
         mock_cursor = MagicMock()
         mock_conn = MagicMock()
@@ -257,13 +257,13 @@ class TestFilmTrajectoryEndpoint:
 
         mock_cursor.fetchall.return_value = []
 
-        response = test_client_as_user.get("/api/v1/presales/NonExistentFilm")
+        response = test_client_as_admin.get("/api/v1/presales/NonExistentFilm")
 
         assert response.status_code == 404
         assert "No presale data" in response.json().get("detail", "")
 
     @patch('api.routers.presales.get_db_connection')
-    def test_get_trajectory_with_circuit_filter(self, mock_db, test_client_as_user):
+    def test_get_trajectory_with_circuit_filter(self, mock_db, test_client_as_admin):
         """Test trajectory filtered by circuit."""
         mock_cursor = MagicMock()
         mock_conn = MagicMock()
@@ -272,7 +272,7 @@ class TestFilmTrajectoryEndpoint:
 
         mock_cursor.fetchall.return_value = []
 
-        response = test_client_as_user.get(
+        response = test_client_as_admin.get(
             "/api/v1/presales/Avatar%203",
             params={"circuit_name": "Marcus"}
         )
@@ -285,7 +285,7 @@ class TestVelocityMetricsEndpoint:
     """Tests for /api/v1/presales/velocity/{film_title} endpoint."""
 
     @patch('api.routers.presales.get_db_connection')
-    def test_get_velocity_success(self, mock_db, test_client_as_user):
+    def test_get_velocity_success(self, mock_db, test_client_as_admin):
         """Test successful velocity metrics retrieval."""
         mock_cursor = MagicMock()
         mock_conn = MagicMock()
@@ -317,14 +317,14 @@ class TestVelocityMetricsEndpoint:
 
         mock_cursor.fetchall.return_value = mock_rows
 
-        response = test_client_as_user.get("/api/v1/presales/velocity/Avatar%203")
+        response = test_client_as_admin.get("/api/v1/presales/velocity/Avatar%203")
 
         assert response.status_code == 200
         data = response.json()
         assert isinstance(data, list)
 
     @patch('api.routers.presales.get_db_connection')
-    def test_get_velocity_not_found(self, mock_db, test_client_as_user):
+    def test_get_velocity_not_found(self, mock_db, test_client_as_admin):
         """Test velocity for non-existent film."""
         mock_cursor = MagicMock()
         mock_conn = MagicMock()
@@ -333,7 +333,7 @@ class TestVelocityMetricsEndpoint:
 
         mock_cursor.fetchall.return_value = []
 
-        response = test_client_as_user.get("/api/v1/presales/velocity/NonExistentFilm")
+        response = test_client_as_admin.get("/api/v1/presales/velocity/NonExistentFilm")
 
         assert response.status_code == 404
 
@@ -344,7 +344,7 @@ class TestCircuitCompareEndpoint:
     @pytest.mark.skip(reason="Test requires full database mock - endpoint directly calls sqlite3.connect")
     @patch('api.routers.presales.config')
     @patch('api.routers.presales.get_db_connection')
-    def test_compare_circuits_success(self, mock_db, mock_config, test_client_as_user):
+    def test_compare_circuits_success(self, mock_db, mock_config, test_client_as_admin):
         """Test successful circuit comparison."""
         mock_config.DB_FILE = ":memory:"
 
@@ -378,7 +378,7 @@ class TestCircuitCompareEndpoint:
 
         mock_cursor.fetchall.return_value = mock_rows
 
-        response = test_client_as_user.get(
+        response = test_client_as_admin.get(
             "/api/v1/presales/compare",
             params={"film_title": "Avatar 3"}
         )
@@ -392,7 +392,7 @@ class TestCircuitCompareEndpoint:
             pytest.skip("Presales compare endpoint requires full database mock")
 
     @patch('api.routers.presales.get_db_connection')
-    def test_compare_circuits_with_filter(self, mock_db, test_client_as_user):
+    def test_compare_circuits_with_filter(self, mock_db, test_client_as_admin):
         """Test circuit comparison with circuit filter."""
         mock_cursor = MagicMock()
         mock_conn = MagicMock()
@@ -401,7 +401,7 @@ class TestCircuitCompareEndpoint:
 
         mock_cursor.fetchall.return_value = []
 
-        response = test_client_as_user.get(
+        response = test_client_as_admin.get(
             "/api/v1/presales/compare",
             params={"film_title": "Avatar 3", "circuits": "Marcus,AMC"}
         )
@@ -409,11 +409,11 @@ class TestCircuitCompareEndpoint:
         assert response.status_code == 404  # No data
 
     @patch('api.routers.presales.config')
-    def test_compare_circuits_missing_film(self, mock_config, test_client_as_user):
+    def test_compare_circuits_missing_film(self, mock_config, test_client_as_admin):
         """Test compare without required film_title."""
         mock_config.DB_FILE = ":memory:"
 
-        response = test_client_as_user.get("/api/v1/presales/compare")
+        response = test_client_as_admin.get("/api/v1/presales/compare")
 
         # Either 400 (application validation), 404 (not found), 422 (FastAPI validation), or 500 (DB error)
         assert response.status_code in (400, 404, 422, 500)

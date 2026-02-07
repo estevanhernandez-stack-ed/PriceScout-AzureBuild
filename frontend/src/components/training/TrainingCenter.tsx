@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { 
   GraduationCap, 
@@ -92,7 +92,7 @@ export function TrainingCenter({
 }: { 
   open: boolean, 
   onOpenChange: (open: boolean) => void,
-  user: any
+  user: { username?: string; role?: string } | null
 }) {
   const [activeTour, setActiveTour] = useState(false);
   const [activeAutomated, setActiveAutomated] = useState(false);
@@ -103,11 +103,11 @@ export function TrainingCenter({
   const isAdmin = user?.role === 'admin';
   const isOperator = user?.role === 'operator' || user?.role === 'manager';
 
-  const steps = [
+  const steps = useMemo(() => [
     ...COMMON_STEPS,
     ...(isOperator ? OPERATOR_STEPS : []),
     ...(isAdmin ? [...DATA_OPS_STEPS, ...SECURITY_STEPS] : [])
-  ];
+  ], [isOperator, isAdmin]);
 
   // Automated Fly-By Timer Logic
   useEffect(() => {

@@ -4,25 +4,25 @@ Script to find user information by username
 """
 import sqlite3
 import sys
+import os
+
+# Add project root to path for imports
+script_dir = os.path.dirname(os.path.abspath(__file__))
+project_dir = os.path.dirname(script_dir)
+sys.path.insert(0, project_dir)
+
+from app import config
+
 
 def find_user_by_username(username):
     """Find user by username and display their information"""
 
-    db_paths = ['users.db', 'app/users.db']
-
-    db_path = None
-    for path in db_paths:
-        try:
-            conn = sqlite3.connect(path)
-            db_path = path
-            break
-        except:
-            continue
-
-    if db_path is None:
-        print("[X] Could not find users.db database")
+    db_path = config.USER_DB_FILE
+    if not os.path.exists(db_path):
+        print(f"[X] Could not find users database at: {db_path}")
         return
 
+    conn = sqlite3.connect(db_path)
     print(f"[OK] Connected to database: {db_path}\n")
 
     cursor = conn.cursor()
@@ -80,6 +80,7 @@ def find_user_by_username(username):
         print("=" * 70)
 
     conn.close()
+
 
 if __name__ == "__main__":
     username = "102702"

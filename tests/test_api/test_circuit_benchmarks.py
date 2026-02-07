@@ -12,7 +12,7 @@ class TestCircuitBenchmarksEndpoints:
     """Tests for /api/v1/circuit-benchmarks/* endpoints."""
 
     @patch('api.routers.circuit_benchmarks.get_db_connection')
-    def test_list_benchmarks_success(self, mock_db, test_client_as_user):
+    def test_list_benchmarks_success(self, mock_db, test_client_as_admin):
         """Test successful benchmark listing."""
         # Create mock cursor and connection
         mock_cursor = MagicMock()
@@ -67,7 +67,7 @@ class TestCircuitBenchmarksEndpoints:
             [('2026-01-02',), ('2025-12-26',)]  # Second fetchall for weeks
         ]
 
-        response = test_client_as_user.get("/api/v1/circuit-benchmarks")
+        response = test_client_as_admin.get("/api/v1/circuit-benchmarks")
 
         assert response.status_code == 200
         data = response.json()
@@ -76,7 +76,7 @@ class TestCircuitBenchmarksEndpoints:
         assert "available_weeks" in data
 
     @patch('api.routers.circuit_benchmarks.get_db_connection')
-    def test_list_benchmarks_with_filters(self, mock_db, test_client_as_user):
+    def test_list_benchmarks_with_filters(self, mock_db, test_client_as_admin):
         """Test benchmark listing with filters."""
         mock_cursor = MagicMock()
         mock_conn = MagicMock()
@@ -86,7 +86,7 @@ class TestCircuitBenchmarksEndpoints:
         mock_cursor.fetchone.return_value = [0]
         mock_cursor.fetchall.side_effect = [[], []]
 
-        response = test_client_as_user.get(
+        response = test_client_as_admin.get(
             "/api/v1/circuit-benchmarks",
             params={
                 "week_ending_date": "2026-01-02",
@@ -102,7 +102,7 @@ class TestCircuitBenchmarksEndpoints:
         assert data["benchmarks"] == []
 
     @patch('api.routers.circuit_benchmarks.get_db_connection')
-    def test_list_benchmarks_table_not_exists(self, mock_db, test_client_as_user):
+    def test_list_benchmarks_table_not_exists(self, mock_db, test_client_as_admin):
         """Test listing when table doesn't exist."""
         mock_cursor = MagicMock()
         mock_conn = MagicMock()
@@ -112,7 +112,7 @@ class TestCircuitBenchmarksEndpoints:
         # Simulate table not existing
         mock_cursor.execute.side_effect = sqlite3.OperationalError("no such table: circuit_benchmarks")
 
-        response = test_client_as_user.get("/api/v1/circuit-benchmarks")
+        response = test_client_as_admin.get("/api/v1/circuit-benchmarks")
 
         assert response.status_code == 200
         data = response.json()
@@ -120,7 +120,7 @@ class TestCircuitBenchmarksEndpoints:
         assert data["total_count"] == 0
 
     @patch('api.routers.circuit_benchmarks.get_db_connection')
-    def test_list_available_weeks(self, mock_db, test_client_as_user):
+    def test_list_available_weeks(self, mock_db, test_client_as_admin):
         """Test listing available weeks."""
         mock_cursor = MagicMock()
         mock_conn = MagicMock()
@@ -151,14 +151,14 @@ class TestCircuitBenchmarksEndpoints:
 
         mock_cursor.fetchall.return_value = mock_rows
 
-        response = test_client_as_user.get("/api/v1/circuit-benchmarks/weeks")
+        response = test_client_as_admin.get("/api/v1/circuit-benchmarks/weeks")
 
         assert response.status_code == 200
         data = response.json()
         assert isinstance(data, list)
 
     @patch('api.routers.circuit_benchmarks.get_db_connection')
-    def test_get_week_benchmarks_success(self, mock_db, test_client_as_user):
+    def test_get_week_benchmarks_success(self, mock_db, test_client_as_admin):
         """Test getting benchmarks for specific week."""
         mock_cursor = MagicMock()
         mock_conn = MagicMock()
@@ -186,7 +186,7 @@ class TestCircuitBenchmarksEndpoints:
 
         mock_cursor.fetchall.return_value = mock_rows
 
-        response = test_client_as_user.get("/api/v1/circuit-benchmarks/2026-01-02")
+        response = test_client_as_admin.get("/api/v1/circuit-benchmarks/2026-01-02")
 
         assert response.status_code == 200
         data = response.json()
@@ -195,7 +195,7 @@ class TestCircuitBenchmarksEndpoints:
         assert "benchmarks" in data
 
     @patch('api.routers.circuit_benchmarks.get_db_connection')
-    def test_get_week_benchmarks_not_found(self, mock_db, test_client_as_user):
+    def test_get_week_benchmarks_not_found(self, mock_db, test_client_as_admin):
         """Test getting benchmarks for non-existent week."""
         mock_cursor = MagicMock()
         mock_conn = MagicMock()
@@ -204,7 +204,7 @@ class TestCircuitBenchmarksEndpoints:
 
         mock_cursor.fetchall.return_value = []
 
-        response = test_client_as_user.get("/api/v1/circuit-benchmarks/2099-01-01")
+        response = test_client_as_admin.get("/api/v1/circuit-benchmarks/2099-01-01")
 
         assert response.status_code == 404
         assert "No data for week" in response.json().get("detail", "")
@@ -216,7 +216,7 @@ class TestCircuitCompareEndpoints:
     @pytest.mark.skip(reason="Test requires full database mock - endpoint directly calls sqlite3.connect")
     @patch('api.routers.circuit_benchmarks.config')
     @patch('api.routers.circuit_benchmarks.get_db_connection')
-    def test_compare_circuits_success(self, mock_db, mock_config, test_client_as_user):
+    def test_compare_circuits_success(self, mock_db, mock_config, test_client_as_admin):
         """Test successful circuit comparison."""
         # Mock config to provide DB_FILE
         mock_config.DB_FILE = ":memory:"
@@ -250,7 +250,7 @@ class TestCircuitCompareEndpoints:
 
         mock_cursor.fetchall.return_value = mock_rows
 
-        response = test_client_as_user.get(
+        response = test_client_as_admin.get(
             "/api/v1/circuit-benchmarks/compare",
             params={"circuits": "Marcus,AMC"}
         )
@@ -265,11 +265,11 @@ class TestCircuitCompareEndpoints:
             pytest.skip("Circuit compare endpoint requires full database mock")
 
     @patch('api.routers.circuit_benchmarks.config')
-    def test_compare_circuits_requires_two(self, mock_config, test_client_as_user):
+    def test_compare_circuits_requires_two(self, mock_config, test_client_as_admin):
         """Test that comparison requires at least 2 circuits."""
         mock_config.DB_FILE = ":memory:"
 
-        response = test_client_as_user.get(
+        response = test_client_as_admin.get(
             "/api/v1/circuit-benchmarks/compare",
             params={"circuits": "Marcus"}
         )
@@ -304,8 +304,9 @@ class TestCircuitBenchmarksSyncEndpoint:
         assert response.status_code == 400
         assert "credentials" in response.json().get("detail", "").lower()
 
+    @patch('api.routers.circuit_benchmarks.run_circuit_sync')
     @patch('api.routers.circuit_benchmarks.config')
-    def test_sync_started(self, mock_config, test_client_as_admin):
+    def test_sync_started(self, mock_config, mock_sync, test_client_as_admin):
         """Test successful sync start."""
         mock_config.USE_CELERY = False
         mock_config.ENTTELLIGENCE_ENABLED = True

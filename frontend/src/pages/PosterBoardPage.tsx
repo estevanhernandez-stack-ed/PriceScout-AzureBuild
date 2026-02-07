@@ -313,8 +313,8 @@ export function PosterBoardPage() {
         // Walk the hierarchy to find the URL
         Object.values(hierarchyData).forEach(directors => {
           Object.values(directors).forEach(markets => {
-            Object.values(markets).forEach((market: any) => {
-              const found = market.theaters?.find((t: any) => t.name === name);
+            Object.values(markets).forEach((market: { theaters?: { name: string; url: string }[] }) => {
+              const found = market.theaters?.find((t) => t.name === name);
               if (found) url = found.url;
             });
           });

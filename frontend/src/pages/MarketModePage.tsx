@@ -1,6 +1,6 @@
 import { useState, useMemo, useEffect } from 'react';
 import { useMarketsHierarchy, useTheaterCache } from '@/hooks/api/useMarkets';
-import { useTriggerScrape, useScrapeStatus, useFetchShowtimes, useEstimateScrapeTime, useLiveScrapeJobs, useCompareShowtimeCounts, type Showing, type ScrapeConflictError, type TheaterCountComparison } from '@/hooks/api/useScrapes';
+import { useTriggerScrape, useScrapeStatus, useFetchShowtimes, useEstimateScrapeTime, useLiveScrapeJobs, useCompareShowtimeCounts, useCompareShowtimes, useTriggerVerification, type Showing, type ScrapeConflictError, type TheaterCountComparison, type VerificationResponse, type CompareShowtimesResponse } from '@/hooks/api/useScrapes';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
@@ -15,19 +15,43 @@ import {
   Download,
   CheckCircle2,
   Clock,
-  Calendar,
+  Calendar as CalendarIcon,
+  CalendarPlus,
   Users,
   ChevronDown,
   ChevronRight,
   Timer,
+  AlertTriangle,
+  Layers,
+  Scale,
+  Zap,
+  Shield,
+  XCircle,
+  TrendingUp,
+  BarChart3,
 } from 'lucide-react';
-import { format, addDays } from 'date-fns';
+import { format, addDays, isSameDay } from 'date-fns';
+import { Calendar } from '@/components/ui/calendar';
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { cn } from '@/lib/utils';
 import { useAuthStore } from '@/stores/authStore';
+import { useBackgroundJobsStore } from '@/stores/backgroundJobsStore';
 import { useToast } from '@/hooks/use-toast';
 import { AxiosError } from 'axios';
 import { useTheaterMetadata, useMarketEvents, useSyncMarketContext } from '@/hooks/api/useMarketContext';
+import { useMarketCoverage, getCoverageColor, type TheaterCoverageDetail } from '@/hooks/api/useCoverageGaps';
+import { useZeroShowtimeAnalysis, type ZeroShowtimeTheater } from '@/hooks/api/useZeroShowtimes';
 import { MarketHeatmap } from '@/components/market/MarketHeatmap';
+import {
+  useDemandLookup,
+  buildDemandMap,
+  computeDemandSummary,
+  getFillRateColor,
+  getFillRateBadgeVariant,
+  demandKey,
+  type DemandMetric,
+  type DemandSummary,
+} from '@/hooks/api/useDemandLookup';
 
 
 type WorkflowStep = 'select-director' | 'select-market' | 'select-theaters' | 'select-dates' | 'select-showtimes' | 'running' | 'results';
@@ -174,6 +198,7 @@ void _parseShowtimeKey; // Marked as intentionally unused for future use
 
 export function MarketModePage() {
   const { user, setSuppressAutoLogout, pendingAuthIssue, clearPendingAuthIssue } = useAuthStore();
+  const { backgroundJobIds, sendToBackground } = useBackgroundJobsStore();
   const { toast } = useToast();
   const selectedCompany = user?.company || 'Marcus Theatres';
 
@@ -202,13 +227,18 @@ export function MarketModePage() {
   const [scrapeStartTime, setScrapeStartTime] = useState<number | null>(null);
   const [elapsedSeconds, setElapsedSeconds] = useState<number>(0);
 
-  // Scrape mode: false = Fresh Scrape (always Fandango), true = Quick Check (use cache)
-  const [useCache, setUseCache] = useState(false);
+  // Scrape mode: enttelligence (default), fandango (fresh), or verification (spot-check)
+  type ScrapeMode = 'enttelligence' | 'fandango' | 'verification';
+  const [scrapeMode, setScrapeMode] = useState<ScrapeMode>('enttelligence');
 
   // Weather/closure monitoring: compare showtime counts vs previous scrape
   const [showCountComparison, setShowCountComparison] = useState(false);
   const [countComparisons, setCountComparisons] = useState<Record<string, TheaterCountComparison>>({});
   const [comparisonLoading, setComparisonLoading] = useState(false);
+
+  // Showtime verification (Fandango vs EntTelligence cache)
+  const [verificationResult, setVerificationResult] = useState<CompareShowtimesResponse | null>(null);
+  const [verificationLoading, setVerificationLoading] = useState(false);
 
   // Polling control - separate from step to ensure React Query picks up interval correctly
   const [isScraping, setIsScraping] = useState(false);
@@ -217,9 +247,18 @@ export function MarketModePage() {
   const { data: marketsData, isLoading: marketsLoading, error: marketsError, refetch: refetchMarkets } = useMarketsHierarchy();
   const { data: cacheData, isLoading: cacheLoading, error: cacheError, refetch: refetchCache } = useTheaterCache();
   const triggerScrape = useTriggerScrape();
+  const triggerVerification = useTriggerVerification();
   const fetchShowtimes = useFetchShowtimes();
   const estimateTime = useEstimateScrapeTime();
   const compareShowtimeCounts = useCompareShowtimeCounts();
+  const compareShowtimes = useCompareShowtimes();
+
+  // Coverage data for theaters in the selected market
+  const { data: marketCoverage } = useMarketCoverage(
+    selectedDirector || null,
+    selectedMarket || null,
+    { lookbackDays: 90 }
+  );
 
   // Check for running scrapes (used to restore state on page load)
   const { data: liveScrapeJobs } = useLiveScrapeJobs();
@@ -261,7 +300,7 @@ export function MarketModePage() {
   useEffect(() => {
     if (scrapeStatusError && scrapeJobId) {
       // Check if it's a 404 error (job not found)
-      const isNotFound = (scrapeStatusError as any)?.response?.status === 404;
+      const isNotFound = scrapeStatusError instanceof AxiosError && scrapeStatusError.response?.status === 404;
       if (isNotFound) {
         console.log('[MarketMode] Job not found (server may have restarted), clearing stale job ID:', scrapeJobId);
         localStorage.removeItem(SCRAPE_JOB_STORAGE_KEY);
@@ -306,6 +345,13 @@ export function MarketModePage() {
     if (savedJobId) {
       const jobId = parseInt(savedJobId, 10);
       if (!isNaN(jobId)) {
+        // Don't reconnect to jobs the user intentionally sent to background
+        if (backgroundJobIds.includes(jobId)) {
+          console.log('[MarketMode] Job is backgrounded, skipping restoration:', jobId);
+          localStorage.removeItem(SCRAPE_JOB_STORAGE_KEY);
+          setRestorationAttempted(true);
+          return;
+        }
         console.log('[MarketMode] Restoring job ID from localStorage:', jobId);
         setScrapeJobId(jobId);
         setStep('running'); // Will transition to 'results' if job is completed
@@ -319,7 +365,7 @@ export function MarketModePage() {
       }
     }
     setRestorationAttempted(true);
-  }, [restorationAttempted, toast]);
+  }, [restorationAttempted, toast, backgroundJobIds]);
 
   // Check API for running scrapes (fallback if localStorage is empty)
   useEffect(() => {
@@ -327,8 +373,11 @@ export function MarketModePage() {
     if (scrapeJobId) return; // Already have a job
 
     if (liveScrapeJobs && liveScrapeJobs.length > 0) {
-      // Find the most recent running or pending job
-      const activeJob = liveScrapeJobs.find(j => j.status === 'running' || j.status === 'pending');
+      // Find the most recent running or pending job that isn't backgrounded
+      const activeJob = liveScrapeJobs.find(
+        j => (j.status === 'running' || j.status === 'pending') &&
+             !backgroundJobIds.includes(j.job_id)
+      );
       if (activeJob) {
         console.log('[MarketMode] Found active job from API:', activeJob.job_id);
         setScrapeJobId(activeJob.job_id);
@@ -341,7 +390,7 @@ export function MarketModePage() {
         });
       }
     }
-  }, [restorationAttempted, scrapeJobId, liveScrapeJobs, toast]);
+  }, [restorationAttempted, scrapeJobId, liveScrapeJobs, toast, backgroundJobIds]);
 
   // Save job ID to localStorage when it changes
   useEffect(() => {
@@ -371,6 +420,31 @@ export function MarketModePage() {
   const endDate = selectedDates[selectedDates.length - 1] ? format(selectedDates[selectedDates.length - 1], 'yyyy-MM-dd') : startDate;
   const { data: marketEvents } = useMarketEvents(startDate, endDate, selectedMarket || undefined);
 
+  // Demand Intel: fetch per-showtime sales data for scraped theaters
+  const hasResults = step === 'results' && !!scrapeStatus?.results && scrapeStatus.results.length > 0;
+  const demandDates = useMemo(() => {
+    if (!hasResults) return { from: '', to: '' };
+    return { from: startDate, to: endDate };
+  }, [hasResults, startDate, endDate]);
+
+  const { data: demandData, isLoading: demandLoading } = useDemandLookup(
+    selectedTheaters,
+    demandDates.from,
+    demandDates.to,
+    undefined,
+    hasResults && selectedTheaters.length > 0,
+  );
+
+  const demandMap = useMemo(() => {
+    if (!demandData || demandData.length === 0) return new Map<string, DemandMetric>();
+    return buildDemandMap(demandData);
+  }, [demandData]);
+
+  const demandSummary = useMemo(() => {
+    if (!demandData || demandData.length === 0) return null;
+    return computeDemandSummary(demandData);
+  }, [demandData]);
+
   // Sync theater metadata for the selected market
   const handleSyncMarket = async () => {
     const marketTheaters = theatersInMarket.map(t => t.name);
@@ -386,7 +460,7 @@ export function MarketModePage() {
         title: 'Sync Complete',
         description: 'Theater coordinates and market data updated.',
       });
-    } catch (error) {
+    } catch {
       toast({
         title: 'Sync Failed',
         description: 'Could not sync theater metadata from EntTelligence.',
@@ -446,6 +520,32 @@ export function MarketModePage() {
       };
     });
   }, [companyData, selectedDirector, selectedMarket, cacheData]);
+
+  // Zero showtime analysis for theaters in the selected market
+  const theatersForZeroAnalysis = useMemo(() =>
+    theatersInMarket.map(t => t.name),
+    [theatersInMarket]
+  );
+  const { data: zeroShowtimeData } = useZeroShowtimeAnalysis(
+    selectedMarket ? theatersForZeroAnalysis : null
+  );
+
+  // Coverage and zero-showtime lookup maps
+  const coverageLookup = useMemo(() => {
+    const map = new Map<string, TheaterCoverageDetail>();
+    if (marketCoverage?.theaters) {
+      marketCoverage.theaters.forEach(t => map.set(t.theater_name, t));
+    }
+    return map;
+  }, [marketCoverage]);
+
+  const zeroShowtimeLookup = useMemo(() => {
+    const map = new Map<string, ZeroShowtimeTheater>();
+    if (zeroShowtimeData?.theaters) {
+      zeroShowtimeData.theaters.forEach(t => map.set(t.theater_name, t));
+    }
+    return map;
+  }, [zeroShowtimeData]);
 
   // Helper to extract company from theater name
   function extractCompany(name: string): string {
@@ -588,7 +688,7 @@ export function MarketModePage() {
     // Get theater objects with URLs
     const theaters = allTheatersInDirector
       .filter((t) => selectedTheaters.includes(t.name) && t.url)
-      .map((t) => ({ name: t.name, url: t.url! }));
+      .map((t) => ({ name: t.name, url: t.url ?? '' }));
 
     // Check if any selected theaters are missing URLs
     const theatersWithoutUrls = allTheatersInDirector
@@ -624,6 +724,23 @@ export function MarketModePage() {
       setShowtimesFetched(true);
       // Expand all theaters by default
       setExpandedTheaters(new Set(selectedTheaters));
+
+      // Auto-compare against EntTelligence cache (non-blocking)
+      setVerificationLoading(true);
+      setVerificationResult(null);
+      try {
+        const comparisonResult = await compareShowtimes.mutateAsync({
+          theaters: selectedTheaters,
+          play_dates: selectedDates.map((d) => format(d, 'yyyy-MM-dd')),
+          fandango_showtimes: result.showtimes,
+        });
+        setVerificationResult(comparisonResult);
+      } catch (err) {
+        console.error('Showtime verification failed (non-blocking):', err);
+        // Non-blocking: user can still proceed with showtimes
+      } finally {
+        setVerificationLoading(false);
+      }
 
       // Check if we got any showtimes
       const totalShowtimes = Object.values(result.showtimes).reduce((sum, dateData) => {
@@ -679,13 +796,23 @@ export function MarketModePage() {
     return Array.from(films).sort();
   }, [showtimesData]);
 
+  // Build lookup set for cached showtimes (for green dot indicators)
+  const cachedShowtimeKeys = useMemo(() => {
+    if (!verificationResult) return new Set<string>();
+    return new Set(
+      verificationResult.matches
+        .filter((m) => m.status === 'cached')
+        .map((m) => `${m.date}|${m.theater_name}|${m.film_title}|${m.showtime}`)
+    );
+  }, [verificationResult]);
+
   // Compute heatmap data from scrape results
   const heatmapData = useMemo(() => {
     if (!scrapeStatus?.results) return [];
     const theaterAggregation: Record<string, { total: number; count: number }> = {};
-    scrapeStatus.results.forEach((r: any) => {
-      const theater = r.theater_name;
-      const price = parseFloat(r.price?.replace('$', '') || '0');
+    scrapeStatus.results.forEach((r: Record<string, unknown>) => {
+      const theater = r.theater_name as string;
+      const price = parseFloat(((r.price as string)?.replace('$', '') || '0'));
       if (!price) return;
 
       if (!theaterAggregation[theater]) {
@@ -867,9 +994,11 @@ export function MarketModePage() {
           if (!formatCounts.has(fmt)) {
             formatCounts.set(fmt, { count: 0, selectedCount: 0, emoji: getFormatEmoji(fmt) });
           }
-          const data = formatCounts.get(fmt)!;
-          data.count++;
-          if (isSelected) data.selectedCount++;
+          const data = formatCounts.get(fmt);
+          if (data) {
+            data.count++;
+            if (isSelected) data.selectedCount++;
+          }
         });
       });
     });
@@ -1052,21 +1181,36 @@ export function MarketModePage() {
     // Get theater objects with URLs from cache
     const theaters = allTheatersInDirector
       .filter((t) => selectedTheaters.includes(t.name) && t.url)
-      .map((t) => ({ name: t.name, url: t.url! }));
+      .map((t) => ({ name: t.name, url: t.url ?? '' }));
 
     try {
       setStep('running');
       setScrapeStartTime(Date.now()); // Start countdown timer
       setElapsedSeconds(0);
-      const result = await triggerScrape.mutateAsync({
-        mode: 'market',
-        market: selectedMarket || selectedDirector,
-        theaters,
-        dates: selectedDates.map((d) => format(d, 'yyyy-MM-dd')),
-        selected_showtimes: Array.from(selectedShowtimes),
-        use_cache: useCache,
-        cache_max_age_hours: 6,
-      });
+
+      let result: { job_id: number };
+
+      if (scrapeMode === 'verification') {
+        // Fandango verification mode: scrape Fandango, compare against EntTelligence + tax
+        result = await triggerVerification.mutateAsync({
+          theaters,
+          dates: selectedDates.map((d) => format(d, 'yyyy-MM-dd')),
+          selected_showtimes: Array.from(selectedShowtimes),
+          market: selectedMarket || selectedDirector,
+        });
+      } else {
+        // EntTelligence or Fresh Fandango mode
+        result = await triggerScrape.mutateAsync({
+          mode: 'market',
+          market: selectedMarket || selectedDirector,
+          theaters,
+          dates: selectedDates.map((d) => format(d, 'yyyy-MM-dd')),
+          selected_showtimes: Array.from(selectedShowtimes),
+          use_cache: scrapeMode === 'enttelligence',
+          cache_max_age_hours: 6,
+        });
+      }
+
       setScrapeJobId(result.job_id);
       setIsScraping(true); // Start polling after we have a job ID
     } catch (error) {
@@ -1111,11 +1255,146 @@ export function MarketModePage() {
     setSelectedFilms(new Set());
     setTimeEstimate(null);
     setShowConfirmDialog(false);
-    setUseCache(false);
+    setScrapeMode('enttelligence');
     setIsScraping(false);
+    setVerificationResult(null);
+    setVerificationLoading(false);
     // Clear localStorage
     localStorage.removeItem(SCRAPE_JOB_STORAGE_KEY);
     console.log('[MarketMode] Cleared job ID from localStorage (user reset)');
+  };
+
+  const handleSendToBackground = () => {
+    if (!scrapeJobId) return;
+    sendToBackground(scrapeJobId);
+    // Reset MarketMode UI without cancelling the job
+    setScrapeJobId(null);
+    setStep('select-director');
+    setIsScraping(false);
+    setScrapeStartTime(null);
+    setElapsedSeconds(0);
+    localStorage.removeItem(SCRAPE_JOB_STORAGE_KEY);
+    toast({
+      title: 'Scrape Moved to Background',
+      description: `Job #${scrapeJobId} is running in the background. Track progress in the jobs panel.`,
+    });
+    console.log('[MarketMode] Sent job to background:', scrapeJobId);
+  };
+
+  // ---- Download Handlers ----
+
+  const triggerBlobDownload = (blob: Blob, filename: string) => {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  const handleDownloadCsv = () => {
+    if (!scrapeStatus?.results?.length) return;
+    const results = scrapeStatus.results as Record<string, unknown>[];
+
+    // Use snake_case field names for the CSV columns
+    const columns = [
+      'theater_name', 'film_title', 'play_date', 'showtime', 'format',
+      'ticket_type', 'price', 'source',
+    ];
+    // Add tax columns if present in any row
+    const hasTax = results.some(r => r.price_estimated_with_tax != null);
+    if (hasTax) {
+      columns.push('price_estimated_with_tax', 'tax_rate');
+    }
+
+    const escCsv = (val: unknown) => {
+      const s = val == null ? '' : String(val);
+      return s.includes(',') || s.includes('"') || s.includes('\n')
+        ? `"${s.replace(/"/g, '""')}"`
+        : s;
+    };
+
+    const header = columns.join(',');
+    const rows = results.map(r =>
+      columns.map(col => escCsv(r[col])).join(',')
+    );
+    const csv = [header, ...rows].join('\n');
+
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+    const market = selectedMarket || 'market';
+    const dateStr = format(new Date(), 'yyyy-MM-dd_HHmm');
+    triggerBlobDownload(blob, `PriceScout_${market.replace(/\s+/g, '_')}_${dateStr}.csv`);
+
+    toast({ title: 'CSV Downloaded', description: `${results.length} rows exported.` });
+  };
+
+  const handleDownloadExcel = () => {
+    if (!scrapeStatus?.results?.length) return;
+    const results = scrapeStatus.results as Record<string, unknown>[];
+
+    const columns = [
+      'theater_name', 'film_title', 'play_date', 'showtime', 'format',
+      'ticket_type', 'price', 'source',
+    ];
+    const hasTax = results.some(r => r.price_estimated_with_tax != null);
+    if (hasTax) {
+      columns.push('price_estimated_with_tax', 'tax_rate');
+    }
+
+    const escCsv = (val: unknown) => {
+      const s = val == null ? '' : String(val);
+      return s.includes(',') || s.includes('"') || s.includes('\n')
+        ? `"${s.replace(/"/g, '""')}"`
+        : s;
+    };
+
+    // Tab-separated values with BOM for Excel Unicode support
+    const header = columns.join('\t');
+    const rows = results.map(r =>
+      columns.map(col => escCsv(r[col])).join('\t')
+    );
+    const tsv = '\uFEFF' + [header, ...rows].join('\n');
+
+    const blob = new Blob([tsv], { type: 'application/vnd.ms-excel;charset=utf-8' });
+    const market = selectedMarket || 'market';
+    const dateStr = format(new Date(), 'yyyy-MM-dd_HHmm');
+    triggerBlobDownload(blob, `PriceScout_${market.replace(/\s+/g, '_')}_${dateStr}.xls`);
+
+    toast({ title: 'Excel Downloaded', description: `${results.length} rows exported.` });
+  };
+
+  const handleDownloadPdf = async () => {
+    if (!scrapeStatus?.results?.length) return;
+    const results = scrapeStatus.results as Record<string, unknown>[];
+
+    try {
+      const response = await fetch('/api/v1/reports/scrape-results/pdf', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          results,
+          market_name: selectedMarket || 'Market Report',
+          generated_at: new Date().toISOString(),
+        }),
+      });
+
+      if (!response.ok) throw new Error(`PDF generation failed: ${response.status}`);
+      const blob = await response.blob();
+      const market = selectedMarket || 'market';
+      const dateStr = format(new Date(), 'yyyy-MM-dd_HHmm');
+      triggerBlobDownload(blob, `PriceScout_${market.replace(/\s+/g, '_')}_${dateStr}.pdf`);
+
+      toast({ title: 'PDF Downloaded', description: 'Summary report generated.' });
+    } catch (err) {
+      console.error('[MarketMode] PDF generation error:', err);
+      toast({
+        title: 'PDF Generation Failed',
+        description: 'Could not generate PDF. Try downloading as CSV instead.',
+        variant: 'destructive',
+      });
+    }
   };
 
   // Check if scrape completed or failed - stop polling
@@ -1380,13 +1659,31 @@ export function MarketModePage() {
                   {selectedTheaters.length} theaters selected
                 </CardDescription>
               </div>
-              <Button
-                variant={allInMarketSelected ? 'toggleActive' : 'toggle'}
-                size="sm"
-                onClick={handleSelectAllInMarket}
-              >
-                {allInMarketSelected ? 'Deselect All' : 'Select All'}
-              </Button>
+              <div className="flex gap-2">
+                <Button
+                  variant={allInMarketSelected ? 'toggleActive' : 'toggle'}
+                  size="sm"
+                  onClick={handleSelectAllInMarket}
+                >
+                  {allInMarketSelected ? 'Deselect All' : 'Select All'}
+                </Button>
+                {marketCoverage && marketCoverage.theaters_with_gaps > 0 && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      const gapTheaters = (marketCoverage.theaters || [])
+                        .filter(t => t.coverage_score < 70)
+                        .map(t => t.theater_name)
+                        .filter(name => getScrapeable(theatersInMarket).some(t => t.name === name));
+                      setSelectedTheaters(prev => [...new Set([...prev, ...gapTheaters])]);
+                    }}
+                  >
+                    <AlertTriangle className="h-3 w-3 mr-1" />
+                    Select Theaters with Gaps ({marketCoverage.theaters_with_gaps})
+                  </Button>
+                )}
+              </div>
             </div>
           </CardHeader>
           <CardContent>
@@ -1395,6 +1692,9 @@ export function MarketModePage() {
                 const isSelected = selectedTheaters.includes(theater.name);
                 const isClosed = theater.status === 'Permanently Closed';
                 const noFandango = theater.not_on_fandango;
+                const coverage = coverageLookup.get(theater.name);
+                const zeroInfo = zeroShowtimeLookup.get(theater.name);
+                const isLikelyOff = zeroInfo?.classification === 'likely_off_fandango';
 
                 return (
                   <Button
@@ -1402,14 +1702,14 @@ export function MarketModePage() {
                     variant={isSelected ? 'toggleActive' : 'toggle'}
                     size="sm"
                     className={cn(
-                      'w-full justify-start',
+                      'w-full justify-between',
                       isClosed && 'opacity-50 cursor-not-allowed',
-                      noFandango && 'opacity-70'
+                      noFandango && 'opacity-70',
+                      isLikelyOff && !noFandango && 'border-orange-400 border-dashed'
                     )}
                     disabled={isClosed}
                     onClick={() => {
                       if (noFandango && theater.url) {
-                        // Open non-Fandango theater URL in new tab for manual use
                         window.open(theater.url, '_blank');
                       } else if (!noFandango) {
                         handleTheaterToggle(theater.name);
@@ -1421,10 +1721,44 @@ export function MarketModePage() {
                       {isClosed && ' (Closed)'}
                       {noFandango && ' (No Fandango - click to open)'}
                     </span>
+                    <span className="flex items-center gap-1 ml-1 shrink-0">
+                      {isLikelyOff && !noFandango && (
+                        <Badge variant="outline" className="text-orange-600 border-orange-300 text-[10px] px-1 py-0">
+                          0 shows
+                        </Badge>
+                      )}
+                      {coverage && (
+                        <span className={cn('text-[10px] font-bold', getCoverageColor(coverage.coverage_score))}>
+                          {Math.round(coverage.coverage_score)}%
+                        </span>
+                      )}
+                    </span>
                   </Button>
                 );
               })}
             </div>
+
+            {/* Market coverage summary */}
+            {marketCoverage && (
+              <div className="mt-3 p-3 bg-muted/50 rounded-lg">
+                <div className="flex items-center justify-between text-sm">
+                  <span className="text-muted-foreground">
+                    Market Coverage:{' '}
+                    <span className={cn('font-bold', getCoverageColor(marketCoverage.avg_coverage_score))}>
+                      {Math.round(marketCoverage.avg_coverage_score)}%
+                    </span>
+                    <span className="ml-2">
+                      ({marketCoverage.theaters_with_gaps} of {marketCoverage.total_theaters} theaters have gaps)
+                    </span>
+                  </span>
+                  {zeroShowtimeData && zeroShowtimeData.summary.likely_off_fandango > 0 && (
+                    <span className="text-orange-600 text-xs">
+                      {zeroShowtimeData.summary.likely_off_fandango} theater(s) returning 0 showtimes
+                    </span>
+                  )}
+                </div>
+              </div>
+            )}
 
             {selectedTheaters.length > 0 && (
               <div className="mt-4 flex justify-end">
@@ -1442,7 +1776,7 @@ export function MarketModePage() {
         <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
-              <Calendar className="h-5 w-5" />
+              <CalendarIcon className="h-5 w-5" />
               Step 4: Select Dates
             </CardTitle>
             <CardDescription>
@@ -1450,38 +1784,102 @@ export function MarketModePage() {
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
-            <div className="flex flex-wrap gap-2 mb-4">
-              {[0, 1, 2, 3, 4, 5, 6].map((offset) => {
-                const date = addDays(new Date(), offset);
-                const isSelected = selectedDates.some(
-                  (d) => format(d, 'yyyy-MM-dd') === format(date, 'yyyy-MM-dd')
-                );
-                return (
-                  <Button
-                    key={offset}
-                    variant={isSelected ? 'toggleActive' : 'toggle'}
-                    size="sm"
-                    onClick={() => {
-                      if (isSelected) {
-                        setSelectedDates((prev) =>
-                          prev.filter(
-                            (d) => format(d, 'yyyy-MM-dd') !== format(date, 'yyyy-MM-dd')
-                          )
-                        );
-                      } else {
-                        setSelectedDates((prev) => [...prev, date]);
-                      }
-                    }}
-                  >
-                    {offset === 0
-                      ? 'Today'
-                      : offset === 1
-                      ? 'Tomorrow'
-                      : format(date, 'EEE, MMM d')}
-                  </Button>
-                );
-              })}
+            {/* Quick select buttons for the next 7 days */}
+            <div>
+              <p className="text-sm text-muted-foreground mb-2">Quick select (next 7 days)</p>
+              <div className="flex flex-wrap gap-2">
+                {[0, 1, 2, 3, 4, 5, 6].map((offset) => {
+                  const date = addDays(new Date(), offset);
+                  const isSelected = selectedDates.some(
+                    (d) => format(d, 'yyyy-MM-dd') === format(date, 'yyyy-MM-dd')
+                  );
+                  return (
+                    <Button
+                      key={offset}
+                      variant={isSelected ? 'toggleActive' : 'toggle'}
+                      size="sm"
+                      onClick={() => {
+                        if (isSelected) {
+                          setSelectedDates((prev) =>
+                            prev.filter(
+                              (d) => format(d, 'yyyy-MM-dd') !== format(date, 'yyyy-MM-dd')
+                            )
+                          );
+                        } else {
+                          setSelectedDates((prev) => [...prev, date]);
+                        }
+                      }}
+                    >
+                      {offset === 0
+                        ? 'Today'
+                        : offset === 1
+                        ? 'Tomorrow'
+                        : format(date, 'EEE, MMM d')}
+                    </Button>
+                  );
+                })}
+              </div>
             </div>
+
+            {/* Calendar picker for advance dates */}
+            <div>
+              <Popover>
+                <PopoverTrigger asChild>
+                  <Button variant="outline" size="sm" className="gap-2">
+                    <CalendarPlus className="h-4 w-4" />
+                    Pick Advance Dates
+                    {selectedDates.some(d => d > addDays(new Date(), 6)) && (
+                      <Badge variant="secondary" className="ml-1">
+                        {selectedDates.filter(d => d > addDays(new Date(), 6)).length} advance
+                      </Badge>
+                    )}
+                  </Button>
+                </PopoverTrigger>
+                <PopoverContent className="w-auto p-0" align="start">
+                  <Calendar
+                    mode="multiple"
+                    selected={selectedDates}
+                    onSelect={(dates) => {
+                      setSelectedDates(dates || []);
+                    }}
+                    disabled={{ before: new Date() }}
+                    defaultMonth={new Date()}
+                    numberOfMonths={2}
+                  />
+                </PopoverContent>
+              </Popover>
+            </div>
+
+            {/* Show selected advance dates if any */}
+            {selectedDates.some(d => d > addDays(new Date(), 6)) && (
+              <div className="bg-blue-500/10 border border-blue-500/30 rounded-lg p-3">
+                <p className="text-sm font-medium text-blue-700 dark:text-blue-300 mb-2">
+                  Advance Dates Selected
+                </p>
+                <div className="flex flex-wrap gap-1.5">
+                  {selectedDates
+                    .filter(d => d > addDays(new Date(), 6))
+                    .sort((a, b) => a.getTime() - b.getTime())
+                    .map((date) => (
+                      <Badge
+                        key={format(date, 'yyyy-MM-dd')}
+                        variant="secondary"
+                        className="cursor-pointer hover:bg-destructive hover:text-destructive-foreground"
+                        onClick={() => {
+                          setSelectedDates((prev) =>
+                            prev.filter((d) => !isSameDay(d, date))
+                          );
+                        }}
+                      >
+                        {format(date, 'EEE, MMM d')} &times;
+                      </Badge>
+                    ))}
+                </div>
+                <p className="text-xs text-muted-foreground mt-2">
+                  Advance dates use Fandango for showtimes. Cache data may not be available yet.
+                </p>
+              </div>
+            )}
 
             <div className="bg-muted/50 rounded-lg p-4">
               <h4 className="font-medium mb-2">Scrape Summary</h4>
@@ -1546,6 +1944,74 @@ export function MarketModePage() {
             </div>
           ) : null}
 
+          {/* Cache Verification Summary */}
+          {(verificationLoading || verificationResult) && showtimesFetched && (
+            <Card className="border-l-4 border-l-blue-500">
+              <CardHeader className="pb-2">
+                <CardTitle className="text-sm flex items-center gap-2">
+                  <Shield className="h-4 w-4" />
+                  Cache Verification
+                  {verificationLoading && <RefreshCw className="h-3 w-3 animate-spin" />}
+                </CardTitle>
+              </CardHeader>
+              <CardContent>
+                {verificationLoading && (
+                  <p className="text-sm text-muted-foreground">Comparing against pricing cache...</p>
+                )}
+                {verificationResult && (
+                  <div className="space-y-3">
+                    {/* Overall Summary Row */}
+                    <div className="grid grid-cols-3 gap-4 text-sm">
+                      <div className="flex items-center gap-2">
+                        <CheckCircle2 className="h-4 w-4 text-green-500" />
+                        <div>
+                          <p className="font-medium">{verificationResult.summary.cached} cached</p>
+                          <p className="text-xs text-muted-foreground">No scrape needed</p>
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <AlertTriangle className="h-4 w-4 text-yellow-500" />
+                        <div>
+                          <p className="font-medium">{verificationResult.summary.new} new</p>
+                          <p className="text-xs text-muted-foreground">Need Fandango scrape</p>
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <XCircle className="h-4 w-4 text-red-500" />
+                        <div>
+                          <p className="font-medium">{verificationResult.summary.missing} missing</p>
+                          <p className="text-xs text-muted-foreground">Not on Fandango</p>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Closure Warnings */}
+                    {verificationResult.summary.closure_warnings > 0 && (
+                      <div className="bg-red-500/10 border border-red-500/30 rounded p-2 text-sm">
+                        <p className="font-medium text-red-500">
+                          Possible Closure/Cancellation ({verificationResult.summary.closure_warnings} theater{verificationResult.summary.closure_warnings > 1 ? 's' : ''})
+                        </p>
+                        {verificationResult.by_theater
+                          .filter((t) => t.closure_warning)
+                          .map((t) => (
+                            <p key={t.theater_name} className="text-xs text-muted-foreground mt-1">
+                              {t.theater_name}: {t.closure_reason}
+                            </p>
+                          ))}
+                      </div>
+                    )}
+
+                    {verificationResult.cache_freshness && (
+                      <p className="text-xs text-muted-foreground">
+                        Cache freshness: {verificationResult.cache_freshness}
+                      </p>
+                    )}
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+          )}
+
           {/* Showtime Selection */}
           <Card>
             <CardHeader className="pb-3">
@@ -1560,7 +2026,27 @@ export function MarketModePage() {
             <CardContent className="space-y-4">
               {/* Step 1: Film Selection */}
               <div>
-                <h4 className="text-sm font-medium mb-2">Step 1: Select Films <span className="text-xs font-normal text-muted-foreground">(click to select/deselect, dayparts apply to selected films)</span></h4>
+                <div className="flex items-center justify-between mb-2">
+                  <h4 className="text-sm font-medium">Step 1: Select Films <span className="text-xs font-normal text-muted-foreground">(click to select/deselect, dayparts apply to selected films)</span></h4>
+                  <div className="flex gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => setSelectedFilms(new Set(availableFilms))}
+                      disabled={availableFilms.length === 0}
+                    >
+                      Select All ({availableFilms.length})
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => setSelectedFilms(new Set())}
+                      disabled={selectedFilms.size === 0}
+                    >
+                      Clear
+                    </Button>
+                  </div>
+                </div>
                 <div className="flex flex-wrap gap-2">
                   {availableFilms.map((film) => {
                     const filmKeys: ShowtimeKey[] = [];
@@ -1605,10 +2091,7 @@ export function MarketModePage() {
                 </div>
                 {selectedFilms.size > 0 && (
                   <p className="text-xs text-muted-foreground mt-2">
-                    Selected: <span className="font-medium text-foreground">{Array.from(selectedFilms).join(', ')}</span>
-                    <Button variant="link" size="sm" className="h-auto p-0 ml-2" onClick={() => setSelectedFilms(new Set())}>
-                      (clear)
-                    </Button>
+                    Selected ({selectedFilms.size}): <span className="font-medium text-foreground">{Array.from(selectedFilms).join(', ')}</span>
                   </p>
                 )}
               </div>
@@ -1890,6 +2373,7 @@ export function MarketModePage() {
                                         const key = makeShowtimeKey(dateStr, theaterName, s.film_title, s.showtime, s.format);
                                         const isSelected = selectedShowtimes.has(key);
                                         const emoji = getFormatEmoji(s.format);
+                                        const isCached = cachedShowtimeKeys.has(`${dateStr}|${theaterName}|${s.film_title}|${s.showtime}`);
 
                                         return (
                                           <Button
@@ -1899,6 +2383,9 @@ export function MarketModePage() {
                                             className="text-xs h-7"
                                             onClick={() => handleShowtimeToggle(key)}
                                           >
+                                            {isCached && (
+                                              <span className="mr-1 w-1.5 h-1.5 rounded-full bg-green-500 inline-block flex-shrink-0" title="Cached pricing available" />
+                                            )}
                                             {emoji && <span className="mr-1">{emoji}</span>}
                                             {s.showtime}
                                             {s.format !== 'Standard' && (
@@ -2012,33 +2499,46 @@ export function MarketModePage() {
                 </div>
               </div>
 
-              {/* Scrape Mode Toggle */}
+              {/* Scrape Mode Selector */}
               <div className="space-y-2">
                 <p className="text-sm font-medium">Scrape Mode</p>
-                <div className="grid grid-cols-2 gap-2">
+                <div className="grid grid-cols-3 gap-2">
                   <Button
-                    variant={!useCache ? 'default' : 'outline'}
+                    variant={scrapeMode === 'enttelligence' ? 'default' : 'outline'}
                     size="sm"
-                    onClick={() => setUseCache(false)}
+                    onClick={() => setScrapeMode('enttelligence')}
+                    className="w-full"
+                  >
+                    <Zap className="mr-2 h-4 w-4" />
+                    EntTelligence
+                  </Button>
+                  <Button
+                    variant={scrapeMode === 'fandango' ? 'default' : 'outline'}
+                    size="sm"
+                    onClick={() => setScrapeMode('fandango')}
                     className="w-full"
                   >
                     <RefreshCw className="mr-2 h-4 w-4" />
-                    Fresh Scrape
+                    Fresh Fandango
                   </Button>
                   <Button
-                    variant={useCache ? 'default' : 'outline'}
+                    variant={scrapeMode === 'verification' ? 'default' : 'outline'}
                     size="sm"
-                    onClick={() => setUseCache(true)}
+                    onClick={() => setScrapeMode('verification')}
                     className="w-full"
                   >
-                    <Clock className="mr-2 h-4 w-4" />
-                    Quick Check
+                    <Shield className="mr-2 h-4 w-4" />
+                    Verify Prices
                   </Button>
                 </div>
                 <p className="text-xs text-muted-foreground">
-                  {useCache
-                    ? 'Uses cached EntTelligence data when fresh (faster, may be up to 6 hours old)'
-                    : 'Always scrapes live Fandango data (slower, most accurate)'}
+                  {scrapeMode === 'enttelligence'
+                    ? verificationResult
+                      ? `${verificationResult.summary.cached} of ${verificationResult.summary.cached + verificationResult.summary.new} showtimes are cached. Only ${verificationResult.summary.new} need scraping.`
+                      : 'Uses cached pricing with tax estimation. Fast, covers Adult/Child/Senior.'
+                    : scrapeMode === 'fandango'
+                    ? 'Live Fandango scrape for actual consumer-facing prices. Slower but ground truth.'
+                    : 'Spot-check: scrapes Fandango, then compares against cached pricing + tax to validate rates.'}
                 </p>
               </div>
 
@@ -2142,6 +2642,18 @@ export function MarketModePage() {
                 return null;
               })()}
             </div>
+
+            {/* Action buttons */}
+            <div className="flex justify-end gap-2 pt-2 border-t">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={handleSendToBackground}
+              >
+                <Layers className="mr-2 h-4 w-4" />
+                Send to Background
+              </Button>
+            </div>
           </CardContent>
         </Card>
       )}
@@ -2153,12 +2665,21 @@ export function MarketModePage() {
           <div className="bg-green-500/10 border border-green-500/30 rounded-lg p-4">
             <p className="text-green-400 font-medium flex items-center gap-2">
               <CheckCircle2 className="h-5 w-5" />
-              Report Complete! (Took {formatDuration(scrapeStatus.duration_seconds ?? 0)})
+              {scrapeMode === 'verification' ? 'Verification Complete!' : 'Report Complete!'} (Took {formatDuration(scrapeStatus.duration_seconds ?? 0)})
             </p>
             <p className="text-sm text-muted-foreground mt-1">
-              Data has been successfully saved to the database.
+              {scrapeMode === 'verification'
+                ? 'Fandango prices compared against EntTelligence + tax estimation.'
+                : 'Data has been successfully saved to the database.'}
             </p>
           </div>
+
+          {/* Verification Results (only for verification mode) */}
+          {scrapeMode === 'verification' && scrapeStatus.verification_results && (
+            <VerificationResultsPanel
+              verification={scrapeStatus.verification_results}
+            />
+          )}
 
           {/* Stats */}
           <Card>
@@ -2193,12 +2714,12 @@ export function MarketModePage() {
                 </div>
               </div>
 
-              {/* Cache Stats (if cache was used) */}
+              {/* Cache Stats (if EntTelligence cache was used) */}
               {scrapeStatus.use_cache && (scrapeStatus.cache_hits !== undefined || scrapeStatus.cache_misses !== undefined) && (
                 <div className="bg-blue-500/10 border border-blue-500/30 rounded-lg p-4">
                   <h4 className="font-medium mb-3 flex items-center gap-2">
-                    <Clock className="h-4 w-4" />
-                    Cache Performance (Quick Check Mode)
+                    <Zap className="h-4 w-4" />
+                    EntTelligence Cache Performance
                   </h4>
                   <div className="grid grid-cols-3 gap-4 text-sm">
                     <div className="text-center">
@@ -2233,15 +2754,15 @@ export function MarketModePage() {
             </CardHeader>
             <CardContent>
               <div className="flex gap-2">
-                <Button variant="outline">
+                <Button variant="outline" onClick={handleDownloadCsv}>
                   <Download className="mr-2 h-4 w-4" />
                   Download as CSV
                 </Button>
-                <Button variant="outline">
+                <Button variant="outline" onClick={handleDownloadExcel}>
                   <Download className="mr-2 h-4 w-4" />
                   Download as Excel
                 </Button>
-                <Button variant="default">
+                <Button variant="default" onClick={handleDownloadPdf}>
                   <Download className="mr-2 h-4 w-4" />
                   Generate Summary PDF
                 </Button>
@@ -2263,7 +2784,7 @@ export function MarketModePage() {
                   <div className="flex gap-2">
                     {marketEvents.map(event => (
                       <Badge key={event.id} variant="secondary" className="gap-1">
-                        <Calendar className="h-3 w-3" />
+                        <CalendarIcon className="h-3 w-3" />
                         {event.event_name}
                       </Badge>
                     ))}
@@ -2278,6 +2799,16 @@ export function MarketModePage() {
                     <TabsTrigger value="by-theater">By Theater</TabsTrigger>
                     <TabsTrigger value="by-film">By Film</TabsTrigger>
                     <TabsTrigger value="heatmap">Market Map</TabsTrigger>
+                    {demandData && demandData.length > 0 && (
+                      <TabsTrigger value="demand-intel">
+                        Demand Intel
+                        {demandSummary && demandSummary.highDemandCount > 0 && (
+                          <Badge variant="destructive" className="ml-1.5 h-5 px-1.5 text-[10px]">
+                            {demandSummary.highDemandCount}
+                          </Badge>
+                        )}
+                      </TabsTrigger>
+                    )}
                     <TabsTrigger value="raw">Raw Data</TabsTrigger>
                   </TabsList>
                   
@@ -2303,11 +2834,21 @@ export function MarketModePage() {
                   />
                 </TabsContent>
 
+                {demandData && demandData.length > 0 && (
+                  <TabsContent value="demand-intel" className="mt-0">
+                    <DemandIntelPanel
+                      demandData={demandData}
+                      demandSummary={demandSummary}
+                      demandLoading={demandLoading}
+                    />
+                  </TabsContent>
+                )}
+
                 <TabsContent value="by-theater" className="mt-0">
-                  <CollapsibleTheaterResults results={scrapeStatus.results} />
+                  <CollapsibleTheaterResults results={scrapeStatus.results} demandMap={demandMap} />
                 </TabsContent>
                 <TabsContent value="by-film" className="mt-0">
-                  <FilmResults results={scrapeStatus.results} />
+                  <FilmResults results={scrapeStatus.results} demandMap={demandMap} />
                 </TabsContent>
                 <TabsContent value="raw" className="mt-4">
                   <div className="overflow-auto max-h-96">
@@ -2338,9 +2879,10 @@ interface ShowingGroup {
 
 interface CollapsibleTheaterResultsProps {
   results: Record<string, unknown>[];
+  demandMap?: Map<string, DemandMetric>;
 }
 
-function CollapsibleTheaterResults({ results }: CollapsibleTheaterResultsProps) {
+function CollapsibleTheaterResults({ results, demandMap }: CollapsibleTheaterResultsProps) {
   const [expandedTheaters, setExpandedTheaters] = useState<Set<string>>(new Set());
 
   // Group results by theater, then by showing (film + showtime + format)
@@ -2551,9 +3093,10 @@ function CollapsibleTheaterResults({ results }: CollapsibleTheaterResultsProps) 
                 <div className="divide-y">
                   {showings.map((showing, i) => {
                     const isStandardFormat = !showing.format || showing.format.toLowerCase() === 'standard';
+                    const dm = demandMap?.get(demandKey(theater, showing.film_title, showing.showtime));
 
                     return (
-                      <div key={i} className="p-3 hover:bg-muted/30">
+                      <div key={i} className={cn("p-3 hover:bg-muted/30", dm && dm.fill_rate_pct >= 75 && "border-l-2 border-l-red-500")}>
                         {/* Film title and showtime row */}
                         <div className="flex items-start justify-between gap-2 mb-2">
                           <div className="flex-1 min-w-0">
@@ -2564,9 +3107,16 @@ function CollapsibleTheaterResults({ results }: CollapsibleTheaterResultsProps) 
                               </span>
                             )}
                           </div>
-                          <span className="text-sm font-mono text-muted-foreground whitespace-nowrap">
-                            {showing.showtime}
-                          </span>
+                          <div className="flex items-center gap-2">
+                            {dm && (
+                              <Badge variant={getFillRateBadgeVariant(dm.fill_rate_pct)} className="text-[10px] font-mono px-1.5">
+                                {dm.tickets_sold}/{dm.capacity} ({dm.fill_rate_pct.toFixed(0)}%)
+                              </Badge>
+                            )}
+                            <span className="text-sm font-mono text-muted-foreground whitespace-nowrap">
+                              {showing.showtime}
+                            </span>
+                          </div>
                         </div>
 
                         {/* Ticket prices row */}
@@ -2597,9 +3147,10 @@ function CollapsibleTheaterResults({ results }: CollapsibleTheaterResultsProps) 
 
 interface FilmResultsProps {
   results: Record<string, unknown>[];
+  demandMap?: Map<string, DemandMetric>;
 }
 
-function FilmResults({ results }: FilmResultsProps) {
+function FilmResults({ results, demandMap }: FilmResultsProps) {
   const [expandedFilms, setExpandedFilms] = useState<Set<string>>(new Set());
 
   // Group results by film, then by theater
@@ -2790,9 +3341,10 @@ function FilmResults({ results }: FilmResultsProps) {
                     <div className="divide-y">
                       {showings.map((showing, si) => {
                         const isStandardFormat = !showing.format || showing.format.toLowerCase() === 'standard';
+                        const dm = demandMap?.get(demandKey(theater, showing.film_title, showing.showtime));
 
                         return (
-                          <div key={si} className="px-3 py-2 pl-6 hover:bg-muted/20">
+                          <div key={si} className={cn("px-3 py-2 pl-6 hover:bg-muted/20", dm && dm.fill_rate_pct >= 75 && "border-l-2 border-l-red-500")}>
                             <div className="flex items-center justify-between gap-2 mb-1">
                               <div className="flex items-center gap-2">
                                 <span className="font-mono text-sm">{showing.showtime}</span>
@@ -2802,6 +3354,11 @@ function FilmResults({ results }: FilmResultsProps) {
                                   </span>
                                 )}
                               </div>
+                              {dm && (
+                                <Badge variant={getFillRateBadgeVariant(dm.fill_rate_pct)} className="text-[10px] font-mono px-1.5">
+                                  {dm.tickets_sold}/{dm.capacity} ({dm.fill_rate_pct.toFixed(0)}%)
+                                </Badge>
+                              )}
                             </div>
                             <div className="flex flex-wrap gap-3 text-sm">
                               {showing.prices.map((price, pi) => (
@@ -2822,6 +3379,360 @@ function FilmResults({ results }: FilmResultsProps) {
           </div>
         );
       })}
+    </div>
+  );
+}
+
+// =============================================================================
+// VERIFICATION RESULTS PANEL
+// =============================================================================
+
+interface VerificationResultsPanelProps {
+  verification: VerificationResponse;
+}
+
+function VerificationResultsPanel({ verification }: VerificationResultsPanelProps) {
+  const { summary, comparisons = [], fandango_only = 0 } = verification;
+
+  if (!summary) return null;
+
+  const getMatchBadge = (status: string) => {
+    switch (status) {
+      case 'exact':
+        return <Badge className="bg-green-600 text-white">Exact</Badge>;
+      case 'close':
+        return <Badge className="bg-yellow-500 text-black">Close</Badge>;
+      case 'divergent':
+        return <Badge variant="destructive">Divergent</Badge>;
+      default:
+        return <Badge variant="outline">{status}</Badge>;
+    }
+  };
+
+  return (
+    <div className="space-y-4">
+      {/* Summary Cards */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Scale className="h-5 w-5 text-purple-500" />
+            Verification Summary
+          </CardTitle>
+          <CardDescription>
+            EntTelligence + Tax vs Fandango price comparison
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <div className="grid grid-cols-5 gap-4 text-center">
+            <div className="bg-muted/50 rounded-lg p-3">
+              <p className="text-2xl font-bold">{summary.total_verified}</p>
+              <p className="text-xs text-muted-foreground">Total Compared</p>
+            </div>
+            <div className="bg-green-500/10 rounded-lg p-3">
+              <p className="text-2xl font-bold text-green-600">{summary.exact_matches}</p>
+              <p className="text-xs text-muted-foreground">Exact Match</p>
+              <p className="text-xs text-muted-foreground">(&lt; $0.01)</p>
+            </div>
+            <div className="bg-yellow-500/10 rounded-lg p-3">
+              <p className="text-2xl font-bold text-yellow-600">{summary.close_matches}</p>
+              <p className="text-xs text-muted-foreground">Close Match</p>
+              <p className="text-xs text-muted-foreground">(&lt; 2%)</p>
+            </div>
+            <div className="bg-red-500/10 rounded-lg p-3">
+              <p className="text-2xl font-bold text-red-600">{summary.divergent}</p>
+              <p className="text-xs text-muted-foreground">Divergent</p>
+              <p className="text-xs text-muted-foreground">(&gt; 2%)</p>
+            </div>
+            <div className="bg-muted/50 rounded-lg p-3">
+              <p className="text-2xl font-bold">{summary.avg_difference_percent}%</p>
+              <p className="text-xs text-muted-foreground">Avg Difference</p>
+            </div>
+          </div>
+
+          {fandango_only > 0 && (
+            <p className="text-xs text-muted-foreground mt-3">
+              {fandango_only} Fandango prices had no matching EntTelligence cache entry.
+            </p>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* Comparison Table */}
+      {comparisons.length > 0 && (
+        <Card>
+          <CardHeader>
+            <CardTitle>Price Comparison Details</CardTitle>
+            <CardDescription>
+              {comparisons.length} price points compared
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <div className="rounded-md border max-h-[500px] overflow-auto">
+              <table className="w-full text-sm">
+                <thead className="sticky top-0 bg-muted">
+                  <tr>
+                    <th className="text-left p-2">Theater</th>
+                    <th className="text-left p-2">Film</th>
+                    <th className="text-left p-2">Time</th>
+                    <th className="text-left p-2">Type</th>
+                    <th className="text-right p-2">Fandango</th>
+                    <th className="text-right p-2">Ent+Tax</th>
+                    <th className="text-right p-2">Diff</th>
+                    <th className="text-center p-2">Status</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y">
+                  {comparisons.map((item, i) => (
+                    <tr key={i} className="hover:bg-muted/30">
+                      <td className="p-2 max-w-[150px] truncate font-medium">
+                        {item.theater_name}
+                      </td>
+                      <td className="p-2 max-w-[150px] truncate">
+                        {item.film_title}
+                      </td>
+                      <td className="p-2 font-mono text-xs">
+                        {item.showtime}
+                      </td>
+                      <td className="p-2 text-xs">
+                        {item.ticket_type}
+                      </td>
+                      <td className="p-2 text-right font-mono font-bold">
+                        ${item.fandango_price.toFixed(2)}
+                      </td>
+                      <td className="p-2 text-right font-mono">
+                        ${item.enttelligence_with_tax.toFixed(2)}
+                        {item.tax_rate > 0 && (
+                          <span className="text-xs text-muted-foreground ml-1">
+                            ({(item.tax_rate * 100).toFixed(1)}%)
+                          </span>
+                        )}
+                      </td>
+                      <td className="p-2 text-right">
+                        <span className={
+                          item.match_status === 'exact' ? 'text-green-600' :
+                          item.match_status === 'close' ? 'text-yellow-600' :
+                          'text-red-600 font-medium'
+                        }>
+                          {item.difference > 0 ? '+' : ''}
+                          {item.difference_percent.toFixed(1)}%
+                        </span>
+                      </td>
+                      <td className="p-2 text-center">
+                        {getMatchBadge(item.match_status)}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </CardContent>
+        </Card>
+      )}
+    </div>
+  );
+}
+
+// =============================================================================
+// DEMAND INTEL PANEL
+// =============================================================================
+
+interface DemandIntelPanelProps {
+  demandData: DemandMetric[];
+  demandSummary: DemandSummary | null;
+  demandLoading: boolean;
+}
+
+function DemandIntelPanel({ demandData, demandSummary, demandLoading }: DemandIntelPanelProps) {
+  const [sortField, setSortField] = useState<'fill_rate' | 'tickets_sold' | 'theater' | 'film'>('fill_rate');
+  const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc');
+
+  // Group by theater for the theater-centric view
+  const theaterGrouped = useMemo(() => {
+    const groups: Record<string, DemandMetric[]> = {};
+    for (const m of demandData) {
+      if (!groups[m.theater_name]) groups[m.theater_name] = [];
+      groups[m.theater_name].push(m);
+    }
+    return Object.entries(groups)
+      .map(([theater, metrics]) => {
+        const avgFill = metrics.reduce((s, m) => s + m.fill_rate_pct, 0) / metrics.length;
+        const totalSold = metrics.reduce((s, m) => s + m.tickets_sold, 0);
+        return { theater, metrics, avgFill, totalSold };
+      })
+      .sort((a, b) => b.avgFill - a.avgFill);
+  }, [demandData]);
+
+  // Sorted flat list for the table
+  const sortedData = useMemo(() => {
+    const sorted = [...demandData];
+    sorted.sort((a, b) => {
+      let cmp = 0;
+      switch (sortField) {
+        case 'fill_rate': cmp = a.fill_rate_pct - b.fill_rate_pct; break;
+        case 'tickets_sold': cmp = a.tickets_sold - b.tickets_sold; break;
+        case 'theater': cmp = a.theater_name.localeCompare(b.theater_name); break;
+        case 'film': cmp = a.film_title.localeCompare(b.film_title); break;
+      }
+      return sortDir === 'desc' ? -cmp : cmp;
+    });
+    return sorted;
+  }, [demandData, sortField, sortDir]);
+
+  const handleSort = (field: typeof sortField) => {
+    if (sortField === field) {
+      setSortDir(d => d === 'desc' ? 'asc' : 'desc');
+    } else {
+      setSortField(field);
+      setSortDir('desc');
+    }
+  };
+
+  const sortArrow = (field: typeof sortField) => {
+    if (sortField !== field) return '';
+    return sortDir === 'desc' ? ' \u2193' : ' \u2191';
+  };
+
+  if (demandLoading) {
+    return (
+      <div className="flex items-center justify-center py-12 text-muted-foreground">
+        <RefreshCw className="h-5 w-5 animate-spin mr-2" />
+        Loading demand data...
+      </div>
+    );
+  }
+
+  if (!demandData || demandData.length === 0) {
+    return (
+      <div className="text-center py-8 text-muted-foreground">
+        No demand data available for the scraped theaters and dates.
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-4">
+      {/* Summary Cards */}
+      {demandSummary && (
+        <div className="grid grid-cols-4 gap-4">
+          <div className="bg-muted/50 rounded-lg p-3 text-center">
+            <p className="text-2xl font-bold">{demandSummary.totalShowtimes}</p>
+            <p className="text-xs text-muted-foreground">Showtimes with Data</p>
+          </div>
+          <div className="bg-blue-500/10 rounded-lg p-3 text-center">
+            <p className="text-2xl font-bold text-blue-600">{demandSummary.showtimesWithSales}</p>
+            <p className="text-xs text-muted-foreground">With Ticket Sales</p>
+          </div>
+          <div className="bg-muted/50 rounded-lg p-3 text-center">
+            <p className="text-2xl font-bold">{demandSummary.avgFillRate}%</p>
+            <p className="text-xs text-muted-foreground">Avg Fill Rate</p>
+          </div>
+          <div className={cn(
+            "rounded-lg p-3 text-center",
+            demandSummary.highDemandCount > 0 ? "bg-red-500/10" : "bg-green-500/10"
+          )}>
+            <p className={cn(
+              "text-2xl font-bold",
+              demandSummary.highDemandCount > 0 ? "text-red-600" : "text-green-600"
+            )}>
+              {demandSummary.highDemandCount}
+            </p>
+            <p className="text-xs text-muted-foreground">High Demand (&gt;70%)</p>
+          </div>
+        </div>
+      )}
+
+      {/* Theater Breakdown */}
+      <Card>
+        <CardHeader className="pb-3">
+          <CardTitle className="text-base flex items-center gap-2">
+            <BarChart3 className="h-4 w-4" />
+            Theater Fill Rates
+          </CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="space-y-3">
+            {theaterGrouped.map(({ theater, metrics, avgFill, totalSold }) => (
+              <div key={theater} className="space-y-1">
+                <div className="flex items-center justify-between text-sm">
+                  <span className="font-medium truncate max-w-[250px]">{theater}</span>
+                  <div className="flex items-center gap-3 text-xs text-muted-foreground">
+                    <span>{metrics.length} showtimes</span>
+                    <span>{totalSold} sold</span>
+                    <span className={cn("font-mono font-medium", getFillRateColor(avgFill))}>
+                      {avgFill.toFixed(1)}%
+                    </span>
+                  </div>
+                </div>
+                <Progress value={avgFill} className="h-2" />
+              </div>
+            ))}
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* Detailed Table */}
+      <Card>
+        <CardHeader className="pb-3">
+          <CardTitle className="text-base flex items-center gap-2">
+            <TrendingUp className="h-4 w-4" />
+            Per-Showtime Demand
+          </CardTitle>
+          <CardDescription>
+            {sortedData.length} showtimes sorted by {sortField.replace('_', ' ')}
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <div className="rounded-md border max-h-[500px] overflow-auto">
+            <table className="w-full text-sm">
+              <thead className="sticky top-0 bg-muted">
+                <tr>
+                  <th className="text-left p-2 cursor-pointer hover:text-foreground" onClick={() => handleSort('theater')}>
+                    Theater{sortArrow('theater')}
+                  </th>
+                  <th className="text-left p-2 cursor-pointer hover:text-foreground" onClick={() => handleSort('film')}>
+                    Film{sortArrow('film')}
+                  </th>
+                  <th className="text-left p-2">Time</th>
+                  <th className="text-left p-2">Format</th>
+                  <th className="text-right p-2">Price</th>
+                  <th className="text-right p-2 cursor-pointer hover:text-foreground" onClick={() => handleSort('tickets_sold')}>
+                    Sold{sortArrow('tickets_sold')}
+                  </th>
+                  <th className="text-right p-2">Capacity</th>
+                  <th className="text-right p-2 cursor-pointer hover:text-foreground" onClick={() => handleSort('fill_rate')}>
+                    Fill Rate{sortArrow('fill_rate')}
+                  </th>
+                </tr>
+              </thead>
+              <tbody className="divide-y">
+                {sortedData.map((m, i) => (
+                  <tr
+                    key={i}
+                    className={cn(
+                      "hover:bg-muted/30",
+                      m.fill_rate_pct >= 75 && "bg-red-500/5",
+                      m.fill_rate_pct >= 50 && m.fill_rate_pct < 75 && "bg-yellow-500/5",
+                    )}
+                  >
+                    <td className="p-2 max-w-[160px] truncate font-medium">{m.theater_name}</td>
+                    <td className="p-2 max-w-[160px] truncate">{m.film_title}</td>
+                    <td className="p-2 font-mono text-xs whitespace-nowrap">{m.showtime}</td>
+                    <td className="p-2 text-xs">{m.format || 'Standard'}</td>
+                    <td className="p-2 text-right font-mono">${m.price.toFixed(2)}</td>
+                    <td className="p-2 text-right font-mono font-medium">{m.tickets_sold}</td>
+                    <td className="p-2 text-right font-mono text-muted-foreground">{m.capacity}</td>
+                    <td className="p-2 text-right">
+                      <Badge variant={getFillRateBadgeVariant(m.fill_rate_pct)} className="font-mono text-xs">
+                        {m.fill_rate_pct.toFixed(1)}%
+                      </Badge>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </CardContent>
+      </Card>
     </div>
   );
 }

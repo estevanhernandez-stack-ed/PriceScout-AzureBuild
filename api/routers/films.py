@@ -1,3 +1,15 @@
+"""
+Films API Router
+
+Endpoints for film metadata lookup and enrichment via OMDb and Fandango.
+
+Endpoints:
+    GET    /api/v1/films                        - List all films with metadata
+    GET    /api/v1/films/{film_title}            - Get metadata for a specific film
+    POST   /api/v1/films/{film_title}/enrich     - Enrich film with OMDb metadata
+    POST   /api/v1/films/discover/fandango       - Discover films from Fandango
+"""
+
 from fastapi import APIRouter, Security, HTTPException, Query, BackgroundTasks
 from api.routers.auth import get_current_user, User
 from app import db_adapter as database

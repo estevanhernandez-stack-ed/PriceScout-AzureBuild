@@ -41,6 +41,7 @@ from sqlalchemy.orm import Session
 
 from app.db_session import get_session
 from app.db_models import Price, Showing, PriceBaseline
+from app.simplified_baseline_service import normalize_daypart, normalize_ticket_type
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +54,7 @@ PREMIUM_FORMATS = {
     'IMAX', 'IMAX 3D', 'IMAX with Laser', 'IMAX HFR 3D',
     'Dolby Cinema', 'Dolby Atmos', 'Dolby Vision',
     '3D', 'RealD 3D', 'Digital 3D',
-    'PLF', 'Premium Large Format', 'XD', 'RPX', 'BigD',
+    'PLF', 'Premium Large Format', 'Premium Format', 'XD', 'RPX', 'BigD',
     '4DX', 'D-BOX', 'ScreenX', 'MX4D',
     'Laser IMAX', 'GTX', 'UltraAVX',
 }
@@ -149,6 +150,10 @@ class FandangoBaselineDiscoveryService:
 
             for row in query.all():
                 theater_name, ticket_type, format_type, daypart, play_date, film_title, price = row
+
+                # Normalize format: "Standard" → "2D" (same thing, different label)
+                if format_type and format_type.lower() == 'standard':
+                    format_type = '2D'
 
                 # Skip premium formats if requested
                 if exclude_premium and self.is_premium_format(format_type):
@@ -481,6 +486,10 @@ class FandangoBaselineDiscoveryService:
 
         with get_session() as session:
             for baseline_data in baselines:
+                # Normalize in-place before filter so overwrite matches existing canonical values
+                baseline_data['ticket_type'] = normalize_ticket_type(baseline_data['ticket_type']) or baseline_data['ticket_type']
+                baseline_data['daypart'] = normalize_daypart(baseline_data.get('daypart'))
+
                 # Build filter for existing baseline
                 filters = [
                     PriceBaseline.company_id == self.company_id,
@@ -517,6 +526,7 @@ class FandangoBaselineDiscoveryService:
                         continue
 
                 # Create new baseline
+                # Fandango prices are already tax-inclusive (customer-facing)
                 new_baseline = PriceBaseline(
                     company_id=self.company_id,
                     theater_name=baseline_data['theater_name'],
@@ -527,7 +537,10 @@ class FandangoBaselineDiscoveryService:
                     day_of_week=baseline_data.get('day_of_week'),
                     baseline_price=Decimal(str(baseline_data['baseline_price'])),
                     effective_from=effective_from,
-                    effective_to=None  # Active
+                    effective_to=None,  # Active
+                    source='fandango',
+                    tax_status='inclusive',
+                    sample_count=baseline_data.get('sample_count'),
                 )
                 session.add(new_baseline)
                 saved_count += 1

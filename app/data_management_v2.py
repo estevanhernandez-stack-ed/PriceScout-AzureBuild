@@ -724,7 +724,7 @@ def merge_external_db(uploaded_file):
                                         print(f"Error inserting price for run {new_run_id}: {e}")
                     
                     if 'operating_hours' in source_tables:
-                        op_hours_df = pd.read_sql_query(f"SELECT * FROM operating_hours WHERE run_id = {old_run_id}", source_conn)
+                        op_hours_df = pd.read_sql_query("SELECT * FROM operating_hours WHERE run_id = ?", source_conn, params=(old_run_id,))
                         if not op_hours_df.empty:
                             op_hours_df['run_id'] = new_run_id
                             if 'operating_hours_id' in op_hours_df.columns:

@@ -18,6 +18,7 @@ from api.routers.auth import get_current_user, require_operator
 from app.db_session import get_session
 from app.company_profile_discovery import CompanyProfileDiscoveryService
 from app.db_models import CompanyProfile, DiscountDayProgram, CompanyProfileGap
+from app.simplified_baseline_service import normalize_daypart, normalize_ticket_type
 from sqlalchemy import and_, or_, distinct
 from decimal import Decimal
 import logging
@@ -883,9 +884,9 @@ async def create_discount_program(
             # Update existing
             existing.discount_type = request.discount_type
             existing.discount_value = Decimal(str(request.discount_value))
-            existing.applicable_ticket_types_list = request.applicable_ticket_types
+            existing.applicable_ticket_types_list = [normalize_ticket_type(t) or t for t in request.applicable_ticket_types] if request.applicable_ticket_types else request.applicable_ticket_types
             existing.applicable_formats_list = request.applicable_formats
-            existing.applicable_dayparts_list = request.applicable_dayparts
+            existing.applicable_dayparts_list = [normalize_daypart(d) or d for d in request.applicable_dayparts] if request.applicable_dayparts else request.applicable_dayparts
             existing.is_active = True
             existing.source = "manual"
             existing.last_verified_at = datetime.now(UTC)
@@ -908,11 +909,11 @@ async def create_discount_program(
         )
 
         if request.applicable_ticket_types:
-            program.applicable_ticket_types_list = request.applicable_ticket_types
+            program.applicable_ticket_types_list = [normalize_ticket_type(t) or t for t in request.applicable_ticket_types]
         if request.applicable_formats:
             program.applicable_formats_list = request.applicable_formats
         if request.applicable_dayparts:
-            program.applicable_dayparts_list = request.applicable_dayparts
+            program.applicable_dayparts_list = [normalize_daypart(d) or d for d in request.applicable_dayparts]
 
         session.add(program)
         session.commit()

@@ -21,6 +21,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app.config import CACHE_FILE, PROJECT_DIR
+from app.simplified_baseline_service import normalize_theater_name
 from api.routers.auth import get_current_user
 
 router = APIRouter()
@@ -376,8 +377,9 @@ async def match_theater(
         matched_name = None
         final_url = None
 
+        req_norm = normalize_theater_name(match_request.theater_name)
         for theater in market_data.get('theaters', []):
-            if theater.get('name') == match_request.theater_name:
+            if theater.get('name') == match_request.theater_name or normalize_theater_name(theater.get('name', '')) == req_norm:
                 theater_found = True
 
                 if match_request.mark_as_closed:
@@ -572,8 +574,9 @@ async def discover_theater_url(
 
                 # Check if theater already exists
                 theater_exists = False
+                disc_req_norm = normalize_theater_name(request.theater_name)
                 for theater in market_theaters:
-                    if theater.get('name') == request.theater_name:
+                    if theater.get('name') == request.theater_name or normalize_theater_name(theater.get('name', '')) == disc_req_norm:
                         # Update existing entry
                         theater['url'] = result["url"]
                         theater['name'] = result["theater_name"]  # Use Fandango's name

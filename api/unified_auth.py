@@ -19,6 +19,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from app.config import (
     API_KEY_AUTH_ENABLED,
     DB_AUTH_ENABLED,
+    ENTRA_ENABLED,
     SECRET_KEY,
     ALGORITHM
 )
@@ -86,7 +87,27 @@ async def require_auth(
         except (JWTError, Exception):
             # JWT validation failed, continue to try other methods
             pass
-    
+
+    # Try Entra ID token authentication
+    if ENTRA_ENABLED and authorization and authorization.scheme.lower() == "bearer":
+        try:
+            from api.entra_auth import validate_entra_token
+            entra_result = validate_entra_token(authorization.credentials)
+            if entra_result:
+                return AuthData(
+                    username=entra_result.get("preferred_username") or entra_result.get("email") or entra_result.get("oid"),
+                    auth_method="entra",
+                    is_admin=False,  # Entra users default to non-admin (can be enhanced with Azure AD groups)
+                    company=None,
+                    role=entra_result.get("role", "user")
+                )
+        except ImportError:
+            # Entra auth module not available
+            pass
+        except Exception:
+            # Entra token validation failed, continue to try other methods
+            pass
+
     # Try API key authentication
     if x_api_key and API_KEY_AUTH_ENABLED:
         api_key_valid = await verify_api_key(x_api_key)

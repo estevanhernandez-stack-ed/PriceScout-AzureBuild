@@ -87,8 +87,17 @@ async def debug_fandango_ticket_page(ticket_url):
                                 if 'seating' in data:
                                     seating_info = data['seating']
                                     print(f"\n[+] 'seating' key found!")
+                                    print(f"  ALL KEYS in seating: {list(seating_info.keys())}")
                                     print(f"  Total seats: {seating_info.get('totalSeats', 'N/A')}")
                                     print(f"  Available seats: {seating_info.get('availableSeats', 'N/A')}")
+                                    print(f"  Blocked seats: {seating_info.get('blockedSeats', seating_info.get('blocked', 'N/A'))}")
+                                    print(f"  Sold seats: {seating_info.get('soldSeats', seating_info.get('sold', 'N/A'))}")
+                                    print(f"  Reserved seats: {seating_info.get('reservedSeats', seating_info.get('reserved', 'N/A'))}")
+                                    print(f"  Held seats: {seating_info.get('heldSeats', seating_info.get('held', 'N/A'))}")
+                                    # Print full seating object for inspection
+                                    print(f"\n  Full seating object:")
+                                    for k, v in seating_info.items():
+                                        print(f"    {k}: {v}")
                                 else:
                                     print("\n[-] No 'seating' key found")
 
@@ -140,12 +149,22 @@ async def debug_fandango_ticket_page(ticket_url):
 
 
 if __name__ == "__main__":
+    import sys
+    import os
+    # Add project root to path for imports
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    project_dir = os.path.dirname(script_dir)
+    sys.path.insert(0, project_dir)
+
+    from app import config
+
     print("\n" + "="*80)
     print("AUTOMATED FANDANGO HTML DEBUG SCRIPT")
     print("="*80)
 
     # Get ticket URL from database
-    db_path = r"C:\Users\estev\Desktop\Price Scout\pricescout.db"
+    db_path = config.DB_FILE or os.path.join(config.PROJECT_DIR, 'pricescout.db')
+    print(f"Using database: {db_path}")
 
     try:
         conn = sqlite3.connect(db_path)

@@ -232,6 +232,8 @@ interface ScrapeStatusResponse {
   use_cache?: boolean;
   cache_hits?: number;
   cache_misses?: number;
+  // Verification results (populated for mode=verification)
+  verification_results?: VerificationResponse;
 }
 
 /**
@@ -556,5 +558,146 @@ export function useCompareShowtimeCounts() {
       );
       return response.data;
     },
+  });
+}
+
+// ============================================================================
+// Showtime Verification (Fandango Live vs EntTelligence Cache)
+// ============================================================================
+
+export interface ShowtimeMatchItem {
+  date: string;
+  theater_name: string;
+  film_title: string;
+  showtime: string;
+  format: string;
+  status: 'cached' | 'new' | 'missing_from_fandango';
+  cached_price?: number;
+  cache_age_minutes?: number;
+}
+
+export interface TheaterVerificationSummary {
+  theater_name: string;
+  cached_count: number;
+  new_count: number;
+  missing_count: number;
+  total_fandango: number;
+  total_cached: number;
+  closure_warning: boolean;
+  closure_reason?: string;
+}
+
+export interface CompareShowtimesResponse {
+  summary: {
+    cached: number;
+    new: number;
+    missing: number;
+    closure_warnings: number;
+  };
+  by_theater: TheaterVerificationSummary[];
+  matches: ShowtimeMatchItem[];
+  cache_freshness?: string;
+}
+
+interface CompareShowtimesRequest {
+  theaters: string[];
+  play_dates: string[];
+  fandango_showtimes: Record<string, Record<string, Showing[]>>;
+  company_id?: number;
+}
+
+export function useCompareShowtimes() {
+  return useMutation({
+    mutationFn: async (request: CompareShowtimesRequest) => {
+      const response = await api.post<CompareShowtimesResponse>(
+        '/scrapes/compare-showtimes',
+        request
+      );
+      return response.data;
+    },
+  });
+}
+
+// ============================================================================
+// Fandango Verification (Spot-Check EntTelligence + Tax vs Fandango)
+// ============================================================================
+
+export interface PriceVerificationItem {
+  theater_name: string;
+  film_title: string;
+  showtime: string;
+  format?: string;
+  ticket_type: string;
+  fandango_price: number;
+  enttelligence_price: number;
+  tax_rate: number;
+  enttelligence_with_tax: number;
+  difference: number;
+  difference_percent: number;
+  match_status: 'exact' | 'close' | 'divergent';
+}
+
+export interface VerificationSummary {
+  total_verified: number;
+  exact_matches: number;
+  close_matches: number;
+  divergent: number;
+  avg_difference_percent: number;
+}
+
+export interface VerificationResponse {
+  job_id: number;
+  status: string;
+  summary?: VerificationSummary;
+  comparisons?: PriceVerificationItem[];
+  fandango_only?: number;
+  error?: string;
+}
+
+interface TriggerVerificationRequest {
+  theaters: { name: string; url: string }[];
+  dates: string[];
+  selected_showtimes?: string[];
+  market?: string;
+}
+
+/**
+ * Trigger a Fandango verification scrape.
+ * Scrapes Fandango live and compares against EntTelligence + tax.
+ */
+export function useTriggerVerification() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async (request: TriggerVerificationRequest) => {
+      const response = await api.post<{ job_id: number; status: string; message: string }>(
+        '/scrapes/verify-prices',
+        request
+      );
+      return response.data;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.scrapeJobs.all });
+    },
+  });
+}
+
+/**
+ * Fetch verification results for a completed verification job
+ */
+export function useVerificationResults(
+  jobId: number,
+  options: { enabled?: boolean } = {}
+) {
+  return useQuery({
+    queryKey: ['verificationResults', jobId],
+    queryFn: async () => {
+      const response = await api.get<VerificationResponse>(
+        `/scrapes/${jobId}/verification`
+      );
+      return response.data;
+    },
+    enabled: options.enabled ?? !!jobId,
+    staleTime: 0,
   });
 }

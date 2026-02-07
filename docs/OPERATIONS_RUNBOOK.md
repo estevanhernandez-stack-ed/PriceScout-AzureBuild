@@ -514,14 +514,146 @@ systemctl restart pricescout-api
 
 ---
 
+---
+
+## Entra ID Authentication
+
+### Overview
+
+PriceScout supports Microsoft Entra ID (Azure AD) single sign-on alongside local username/password authentication. Entra ID provides enterprise SSO for Marcus Theatres employees.
+
+**Security Features (February 2026):**
+- JWKS signature verification for all tokens
+- CSRF protection via cryptographic state parameters
+- Redirect URL allowlist to prevent open redirects
+- Auth code exchange pattern (tokens not in URLs)
+
+### Check Entra ID Status
+
+**Via API:**
+```bash
+curl https://api.pricescout.com/api/v1/auth/entra/status
+```
+
+**Expected Response (enabled):**
+```json
+{
+  "enabled": true,
+  "available": true,
+  "configured": {
+    "client_id": true,
+    "tenant_id": true,
+    "client_secret": true,
+    "redirect_uri": true,
+    "allowed_redirect_domains": ["localhost", "127.0.0.1", "pricescout.marcus.com"]
+  },
+  "login_endpoint": "/api/v1/auth/entra/login"
+}
+```
+
+### Troubleshooting Entra ID
+
+**Issue: "Invalid or expired state parameter"**
+- Cause: User took too long to authenticate, or CSRF attack blocked
+- Resolution: User should restart login flow
+
+**Issue: "Token has invalid audience"**
+- Cause: `ENTRA_CLIENT_ID` doesn't match token audience
+- Resolution: Verify client ID in Azure Portal matches env var
+
+**Issue: "Token from unauthorized tenant"**
+- Cause: `ENTRA_TENANT_ID` doesn't match token tenant
+- Resolution: Verify tenant ID in Azure Portal matches env var
+
+**Issue: "Entra ID authentication is not enabled"**
+- Cause: `ENTRA_ENABLED=false` or missing configuration
+- Resolution: Set `ENTRA_ENABLED=true` and ensure all Entra env vars are set
+
+### Rotate Entra Client Secret
+
+1. Generate new secret in Azure Portal:
+   - App Registrations → Your App → Certificates & secrets → New client secret
+
+2. Update Key Vault:
+   ```powershell
+   az keyvault secret set --vault-name kv-pricescout-prod \
+     --name EntraClientSecret --value "<new-secret>"
+   ```
+
+3. Restart application:
+   ```powershell
+   az webapp restart --name app-pricescout-prod --resource-group rg-pricescout-prod
+   ```
+
+4. Verify login works, then delete old secret from Azure Portal
+
+---
+
+## Distributed Tracing
+
+### Overview
+
+PriceScout uses OpenTelemetry for distributed tracing with Azure Monitor (Application Insights). Every request gets a correlation ID for end-to-end debugging.
+
+### Request Headers
+
+| Header | Direction | Description |
+|--------|-----------|-------------|
+| `X-Request-ID` | Request | Optional client-provided correlation ID (must be valid UUID) |
+| `X-Request-ID` | Response | Correlation ID for the request |
+| `X-Trace-ID` | Response | OpenTelemetry trace ID (if tracing enabled) |
+
+**Security Note:** Request IDs are validated as UUIDs to prevent log injection attacks. Invalid IDs are replaced with new UUIDs.
+
+### Correlate Logs in App Insights
+
+**Find all logs for a request:**
+```kusto
+traces
+| where customDimensions["request_id"] == "abc123-..."
+| order by timestamp asc
+```
+
+**Find all spans in a trace:**
+```kusto
+dependencies
+| where operation_Id == "your-trace-id"
+| order by timestamp asc
+```
+
+**Find errors with trace context:**
+```kusto
+exceptions
+| where timestamp > ago(1h)
+| project timestamp, problemId, outerMessage, operation_Id
+| order by timestamp desc
+```
+
+### Inject Trace Context in Scripts
+
+When making API calls from scripts, preserve trace context:
+
+```python
+import httpx
+from api.telemetry import inject_trace_headers
+
+headers = {"Authorization": "Bearer <token>"}
+inject_trace_headers(headers)  # Adds traceparent, tracestate
+
+response = httpx.get("https://api.pricescout.com/...", headers=headers)
+```
+
+---
+
 ## Revision History
 
 | Version | Date | Author | Changes |
 |---------|------|--------|---------|
 | 1.0.0 | 2025-01 | Initial | First release |
+| 1.1.0 | 2026-02 | Security Update | Added Entra ID and distributed tracing sections |
 
 ---
 
-**Document Version:** 1.0.0
-**Last Updated:** January 2025
+**Document Version:** 1.1.0
+**Last Updated:** February 2026
 **Review Frequency:** Monthly

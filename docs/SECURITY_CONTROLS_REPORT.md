@@ -1,7 +1,7 @@
 # PriceScout Security Controls Report
 
-**Version:** 2.0.0
-**Date:** November 24, 2025
+**Version:** 2.1.0
+**Date:** February 5, 2026
 **Status:** Production Ready
 
 ---
@@ -91,6 +91,52 @@ PriceScout implements comprehensive security controls across authentication, aut
 | **URL-Based Persistence** | Session tokens stored in URL query parameters | `app/cookie_manager.py` |
 | **Token Lookup** | Server-side verification via database | `app/users.py:1012-1066` |
 | **Secure Token Handling** | Tokens never logged in plaintext | `app/security_config.py:342-373` |
+
+### 2.4 Entra ID SSO Security (February 2026)
+
+| Control | Implementation | Location |
+|---------|----------------|----------|
+| **JWKS Signature Validation** | Tokens validated against Microsoft's JWKS endpoint | `api/entra_auth.py:370-431` |
+| **CSRF State Parameter** | Cryptographic 32-byte state with 5-minute expiry | `api/entra_auth.py:192-254` |
+| **Redirect URL Allowlist** | Domain validation prevents open redirects | `api/entra_auth.py:329-363` |
+| **Auth Code Exchange** | Tokens delivered via short-lived auth codes, not URLs | `api/entra_auth.py:257-323` |
+| **Tenant Validation** | Tokens rejected if `tid` doesn't match configured tenant | `api/entra_auth.py:451-454` |
+| **Audience Validation** | Tokens rejected if `aud` doesn't match client ID | `api/entra_auth.py:389-399` |
+| **Thread-Safe Initialization** | MSAL client uses double-checked locking | `api/entra_auth.py:114-158` |
+
+**Entra ID OAuth2 Flow:**
+```
+1. Client → GET /auth/entra/login?redirect_url=...
+   - Server validates redirect_url against ALLOWED_REDIRECT_DOMAINS
+   - Server generates cryptographic state, stores with redirect_url
+   - Returns Microsoft authorization URL
+
+2. User authenticates with Microsoft, redirected back
+
+3. Microsoft → GET /auth/entra/callback?code=...&state=...
+   - Server validates state parameter (CSRF protection)
+   - Server exchanges code for tokens via MSAL
+   - Server validates token signature via JWKS
+   - Server creates short-lived auth code (not token in URL)
+   - Redirects to client with auth_code parameter
+
+4. Client → POST /auth/entra/exchange?auth_code=...
+   - Server exchanges auth code for session JWT
+   - Auth code is single-use, expires in 60 seconds
+```
+
+**Security Fixes Applied (SEC-001 through SEC-008):**
+
+| ID | Issue | Fix Applied |
+|----|-------|-------------|
+| SEC-001 | Token validation without signature verification | JWKS validation via PyJWKClient |
+| SEC-002 | Missing CSRF protection in OAuth flow | Cryptographic state parameter |
+| SEC-003 | Open redirect vulnerability | Domain allowlist validation |
+| SEC-004 | Token exposure in URL fragment | Auth code exchange pattern |
+| SEC-005 | Missing tenant ID validation | `tid` claim validation |
+| SEC-006 | Missing audience validation | `aud` claim validation |
+| SEC-007 | Global mutable state (thread safety) | Thread-safe initialization with locks |
+| SEC-008 | Request ID injection vulnerability | UUID format validation |
 
 ---
 
@@ -207,7 +253,17 @@ All security events are logged in structured JSON format:
 }
 ```
 
-### 5.2 Tracked Security Events
+### 5.2 Request ID Security (February 2026)
+
+| Control | Implementation | Location |
+|---------|----------------|----------|
+| **UUID Validation** | Request IDs must match UUID format | `api/telemetry.py:42-45` |
+| **Injection Prevention** | Malformed IDs replaced with new UUIDs | `api/telemetry.py:196-202` |
+| **Response Headers** | `X-Request-ID` and `X-Trace-ID` added to responses | `api/telemetry.py:216-218` |
+
+**Why This Matters:** Without validation, attackers could inject log entries by sending malicious `X-Request-ID` values like `"uuid\nINFO: Fake log entry"`. The UUID regex validation prevents this attack vector.
+
+### 5.3 Tracked Security Events
 
 | Event Type | Log Level | Trigger |
 |------------|-----------|---------|
@@ -380,11 +436,15 @@ config = get_security_config()
 | `app/security_config.py` | Security utilities, rate limiting, validation |
 | `app/cookie_manager.py` | Session token storage |
 | `app/config.py` | Application configuration |
+| `api/entra_auth.py` | Entra ID SSO implementation (February 2026) |
+| `api/telemetry.py` | Distributed tracing, request ID middleware |
+| `api/unified_auth.py` | Unified authentication handler |
 | `role_permissions.json` | RBAC permission definitions |
 | `docs/SECURITY_AUDIT_REPORT.md` | Historical security audit |
+| `docs/SECURITY_REMEDIATION_PLAN.md` | Feb 2026 security fixes |
 | `docs/RBAC_GUIDE.md` | Role-based access documentation |
 
 ---
 
-**Last Updated:** November 24, 2025
+**Last Updated:** February 5, 2026
 **Next Review:** As needed or after security-related changes

@@ -27,7 +27,7 @@ from decimal import Decimal
 import json
 import os
 
-# Schema prefix for unified database (default 'competitive' per platform standard)
+# Schema prefix for unified database (default 'pricescout' per Accords convention)
 # SQLite doesn't support schemas, so we set it to None for SQLite
 def _detect_db_type_for_schema():
     """Detect database type to determine if schema should be used."""
@@ -54,7 +54,7 @@ def _detect_db_type_for_schema():
     return 'sqlite'
 
 _db_type = _detect_db_type_for_schema()
-DB_SCHEMA = None if _db_type == 'sqlite' else os.getenv('DB_SCHEMA', 'competitive')
+DB_SCHEMA = None if _db_type == 'sqlite' else os.getenv('DB_SCHEMA', 'pricescout')
 
 # Create metadata with schema (None for SQLite, schema name for PostgreSQL/MSSQL)
 metadata = MetaData(schema=DB_SCHEMA)
@@ -161,7 +161,7 @@ class Company(Base):
         """Parse settings JSON string to dict"""
         try:
             return json.loads(self.settings) if isinstance(self.settings, str) else self.settings
-        except:
+        except Exception:
             return {}
     
     @settings_dict.setter
@@ -219,7 +219,7 @@ class User(Base):
         """Parse allowed_modes JSON to list"""
         try:
             return json.loads(self.allowed_modes) if isinstance(self.allowed_modes, str) else self.allowed_modes
-        except:
+        except Exception:
             return []
     
     @allowed_modes_list.setter
@@ -614,7 +614,7 @@ class PriceAlert(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "alert_type IN ('price_increase', 'price_decrease', 'surge_detected', 'new_offering', 'discontinued', 'significant_change')",
+            "alert_type IN ('price_increase', 'price_decrease', 'surge_detected', 'new_offering', 'discontinued', 'significant_change', 'discount_day_overcharge')",
             name='valid_alert_type'
         ),
         Index('idx_price_alerts_company', 'company_id'),
@@ -679,7 +679,7 @@ class AlertConfiguration(Base):
         """Parse theaters_filter JSON to list"""
         try:
             return json.loads(self.theaters_filter) if isinstance(self.theaters_filter, str) else self.theaters_filter or []
-        except:
+        except Exception:
             return []
 
     @property
@@ -687,7 +687,7 @@ class AlertConfiguration(Base):
         """Parse ticket_types_filter JSON to list"""
         try:
             return json.loads(self.ticket_types_filter) if isinstance(self.ticket_types_filter, str) else self.ticket_types_filter or []
-        except:
+        except Exception:
             return []
 
     @property
@@ -695,7 +695,7 @@ class AlertConfiguration(Base):
         """Parse formats_filter JSON to list"""
         try:
             return json.loads(self.formats_filter) if isinstance(self.formats_filter, str) else self.formats_filter or []
-        except:
+        except Exception:
             return []
 
 
@@ -905,6 +905,17 @@ class EntTelligencePriceCache(Base):
     circuit_name = Column(String(100))
     enttelligence_theater_id = Column(String(50))
 
+    # Capacity / sales data (from programming audit)
+    capacity = Column(Integer)       # Auditorium seat count
+    available = Column(Integer)      # Remaining seats
+    blocked = Column(Integer)        # Held/blocked seats
+
+    # Film metadata
+    release_date = Column(String(20))  # Film release date (YYYY-MM-DD)
+    imdb_id = Column(String(20))
+    movie_id = Column(String(20))
+    theater_id = Column(String(20))
+
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
 
     # Relationships
@@ -919,7 +930,18 @@ class EntTelligencePriceCache(Base):
         Index('idx_ent_cache_lookup', 'play_date', 'theater_name', 'film_title', 'showtime'),
         Index('idx_ent_cache_expires', 'expires_at'),
         Index('idx_ent_cache_circuit', 'circuit_name'),
+        Index('idx_ent_cache_theater_date', 'company_id', 'play_date', 'theater_name'),
+        Index('idx_ent_cache_release', 'release_date'),
     )
+
+    @property
+    def tickets_sold(self) -> int:
+        """Compute tickets sold: capacity - available.
+        EntTelligence invariant: blocked = capacity - available (always).
+        'blocked' IS the sold/reserved count, not a separate deduction."""
+        cap = self.capacity or 0
+        avail = self.available or 0
+        return max(0, cap - avail)
 
     def __repr__(self):
         return f"<EntTelligencePriceCache(theater='{self.theater_name}', film='{self.film_title}', price={self.price})>"
@@ -1055,7 +1077,7 @@ class ScheduleBaseline(Base):
         """Parse showtimes JSON string to list"""
         try:
             return json.loads(self.showtimes) if isinstance(self.showtimes, str) else self.showtimes or []
-        except:
+        except Exception:
             return []
 
     @showtimes_list.setter
@@ -1125,7 +1147,7 @@ class ScheduleAlert(Base):
         """Parse old_value JSON string to dict"""
         try:
             return json.loads(self.old_value) if isinstance(self.old_value, str) and self.old_value else None
-        except:
+        except Exception:
             return None
 
     @property
@@ -1133,7 +1155,7 @@ class ScheduleAlert(Base):
         """Parse new_value JSON string to dict"""
         try:
             return json.loads(self.new_value) if isinstance(self.new_value, str) and self.new_value else None
-        except:
+        except Exception:
             return None
 
 
@@ -1195,7 +1217,7 @@ class ScheduleMonitorConfig(Base):
         """Parse theaters_filter JSON to list"""
         try:
             return json.loads(self.theaters_filter) if isinstance(self.theaters_filter, str) else self.theaters_filter or []
-        except:
+        except Exception:
             return []
 
     @property
@@ -1203,7 +1225,7 @@ class ScheduleMonitorConfig(Base):
         """Parse films_filter JSON to list"""
         try:
             return json.loads(self.films_filter) if isinstance(self.films_filter, str) else self.films_filter or []
-        except:
+        except Exception:
             return []
 
     @property
@@ -1211,7 +1233,7 @@ class ScheduleMonitorConfig(Base):
         """Parse circuits_filter JSON to list"""
         try:
             return json.loads(self.circuits_filter) if isinstance(self.circuits_filter, str) else self.circuits_filter or []
-        except:
+        except Exception:
             return []
 
 
@@ -1297,7 +1319,7 @@ class CompanyProfile(Base):
         """Parse ticket_types JSON to list"""
         try:
             return json.loads(self.ticket_types) if isinstance(self.ticket_types, str) else self.ticket_types or []
-        except:
+        except Exception:
             return []
 
     @ticket_types_list.setter
@@ -1310,7 +1332,7 @@ class CompanyProfile(Base):
         """Parse discount_days JSON to list"""
         try:
             return json.loads(self.discount_days) if isinstance(self.discount_days, str) else self.discount_days or []
-        except:
+        except Exception:
             return []
 
     @discount_days_list.setter
@@ -1323,7 +1345,7 @@ class CompanyProfile(Base):
         """Parse premium_formats JSON to list"""
         try:
             return json.loads(self.premium_formats) if isinstance(self.premium_formats, str) else self.premium_formats or []
-        except:
+        except Exception:
             return []
 
     @premium_formats_list.setter
@@ -1336,7 +1358,7 @@ class CompanyProfile(Base):
         """Parse premium_surcharges JSON to dict"""
         try:
             return json.loads(self.premium_surcharges) if isinstance(self.premium_surcharges, str) else self.premium_surcharges or {}
-        except:
+        except Exception:
             return {}
 
     @premium_surcharges_dict.setter
@@ -1349,7 +1371,7 @@ class CompanyProfile(Base):
         """Parse daypart_boundaries JSON to dict"""
         try:
             return json.loads(self.daypart_boundaries) if isinstance(self.daypart_boundaries, str) else self.daypart_boundaries or {}
-        except:
+        except Exception:
             return {}
 
     @daypart_boundaries_dict.setter
@@ -1444,7 +1466,7 @@ class DiscountDayProgram(Base):
             if not self.applicable_ticket_types:
                 return None  # NULL = applies to all
             return json.loads(self.applicable_ticket_types) if isinstance(self.applicable_ticket_types, str) else self.applicable_ticket_types
-        except:
+        except Exception:
             return None
 
     @applicable_ticket_types_list.setter
@@ -1459,7 +1481,7 @@ class DiscountDayProgram(Base):
             if not self.applicable_formats:
                 return None  # NULL = applies to all
             return json.loads(self.applicable_formats) if isinstance(self.applicable_formats, str) else self.applicable_formats
-        except:
+        except Exception:
             return None
 
     @applicable_formats_list.setter
@@ -1474,7 +1496,7 @@ class DiscountDayProgram(Base):
             if not self.applicable_dayparts:
                 return None  # NULL = applies to all
             return json.loads(self.applicable_dayparts) if isinstance(self.applicable_dayparts, str) else self.applicable_dayparts
-        except:
+        except Exception:
             return None
 
     @applicable_dayparts_list.setter
@@ -1638,7 +1660,7 @@ class TheaterOnboardingStatus(Base):
         """Parse formats_discovered JSON to list"""
         try:
             return json.loads(self.formats_discovered) if isinstance(self.formats_discovered, str) else self.formats_discovered or []
-        except:
+        except Exception:
             return []
 
     @formats_discovered_list.setter
@@ -1651,7 +1673,7 @@ class TheaterOnboardingStatus(Base):
         """Parse ticket_types_discovered JSON to list"""
         try:
             return json.loads(self.ticket_types_discovered) if isinstance(self.ticket_types_discovered, str) else self.ticket_types_discovered or []
-        except:
+        except Exception:
             return []
 
     @ticket_types_discovered_list.setter
@@ -1664,7 +1686,7 @@ class TheaterOnboardingStatus(Base):
         """Parse dayparts_discovered JSON to list"""
         try:
             return json.loads(self.dayparts_discovered) if isinstance(self.dayparts_discovered, str) else self.dayparts_discovered or []
-        except:
+        except Exception:
             return []
 
     @dayparts_discovered_list.setter
@@ -2018,6 +2040,61 @@ class CircuitACPricing(Base):
 
 
 # ============================================================================
+# CIRCUIT PRESALES (Presale Tracking)
+# ============================================================================
+
+class CircuitPresale(Base):
+    """Daily presale snapshots aggregated by circuit and film"""
+    __tablename__ = 'circuit_presales'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    circuit_name = Column(String(255), nullable=False)
+    film_title = Column(String(500), nullable=False)
+    release_date = Column(Date, nullable=False)
+    snapshot_date = Column(Date, nullable=False)
+    days_before_release = Column(Integer, nullable=False)
+
+    # Volume metrics
+    total_tickets_sold = Column(Integer, default=0)
+    total_revenue = Column(Numeric(12, 2), default=0)
+    total_showtimes = Column(Integer, default=0)
+    total_theaters = Column(Integer, default=0)
+
+    # Performance metrics
+    avg_tickets_per_show = Column(Float, default=0.0)
+    avg_tickets_per_theater = Column(Float, default=0.0)
+    avg_ticket_price = Column(Numeric(6, 2), default=0.0)
+
+    # Format breakdown (tickets by format)
+    tickets_imax = Column(Integer, default=0)
+    tickets_dolby = Column(Integer, default=0)
+    tickets_3d = Column(Integer, default=0)
+    tickets_premium = Column(Integer, default=0)
+    tickets_standard = Column(Integer, default=0)
+
+    # Capacity metrics
+    total_capacity = Column(Integer, default=0)
+    total_available = Column(Integer, default=0)
+    fill_rate_percent = Column(Float, default=0.0)
+
+    # Metadata
+    data_source = Column(String(50), default='enttelligence')
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+
+    __table_args__ = (
+        UniqueConstraint('circuit_name', 'film_title', 'snapshot_date',
+                         name='uq_circuit_presale_snapshot'),
+        Index('idx_circuit_presales_circuit', 'circuit_name'),
+        Index('idx_circuit_presales_film', 'film_title', 'release_date'),
+        Index('idx_circuit_presales_snapshot', 'snapshot_date'),
+        Index('idx_circuit_presales_days_before', 'film_title', 'days_before_release'),
+    )
+
+    def __repr__(self):
+        return f"<CircuitPresale(circuit='{self.circuit_name}', film='{self.film_title}', date={self.snapshot_date})>"
+
+
+# ============================================================================
 # HELPER FUNCTIONS
 # ============================================================================
 
@@ -2060,6 +2137,8 @@ def get_table_classes():
         # Alternative content / special events
         'AlternativeContentFilm': AlternativeContentFilm,
         'CircuitACPricing': CircuitACPricing,
+        # Presale tracking
+        'CircuitPresale': CircuitPresale,
     }
 
 

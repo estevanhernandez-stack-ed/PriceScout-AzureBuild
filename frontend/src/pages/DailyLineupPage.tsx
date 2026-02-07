@@ -2,12 +2,15 @@ import React, { useState, useMemo, useEffect } from 'react';
 import { useMarketsHierarchy, useTheaterCache } from '@/hooks/api/useMarkets';
 import { useDailyLineup, useOperatingHours } from '@/hooks/api/useReports';
 import { useTriggerScrape, useScrapeStatus, useLiveScrapeJobs } from '@/hooks/api/useScrapes';
+import { useDemandLookup, buildDemandMap, computeDemandSummary, getFillRateColor, demandKey, type DemandMetric } from '@/hooks/api/useDemandLookup';
+import { useBoxOfficeBoard, downloadBoardHtml, downloadBoardImage, RESOLUTION_LABELS, type BoardResolution } from '@/hooks/api/useBoxOfficeBoard';
 import { api } from '@/lib/api';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { Progress } from '@/components/ui/progress';
 import { useToast } from '@/hooks/use-toast';
 import {
   Table,
@@ -32,7 +35,11 @@ import {
   FileSpreadsheet,
   Printer,
   AlertCircle,
-  Wand2
+  Wand2,
+  TrendingUp,
+  Flame,
+  Monitor,
+  Download,
 } from 'lucide-react';
 import { format, addDays } from 'date-fns';
 import { cn } from '@/lib/utils';
@@ -114,7 +121,7 @@ const formatShowtimeMinutes = (
     showAmPm?: boolean;
   }
 ) => {
-  let hours = Math.floor(totalMinutes / 60) % 24;
+  const hours = Math.floor(totalMinutes / 60) % 24;
   const minutes = totalMinutes % 60;
 
   if (options.useMilitaryTime) {
@@ -264,6 +271,11 @@ export function DailyLineupPage() {
   // View mode
   const [viewMode, setViewMode] = useState<'cards' | 'table'>('table');
 
+  // Box Office Board state
+  const [boardResolution, setBoardResolution] = useState<BoardResolution>('1080p');
+  const [boardDownloading, setBoardDownloading] = useState(false);
+  const [showBoard, setShowBoard] = useState(false);
+
   // Display options state
   const [compactTitles, setCompactTitles] = useState(true);
   const [removeArticles, setRemoveArticles] = useState(false);
@@ -292,7 +304,7 @@ export function DailyLineupPage() {
   // Handle stale job IDs (e.g., server restarted and job no longer exists)
   useEffect(() => {
     if (jobStatusError && activeJobId) {
-      const isNotFound = (jobStatusError as any)?.response?.status === 404;
+      const isNotFound = jobStatusError && 'response' in jobStatusError && (jobStatusError as { response?: { status?: number } }).response?.status === 404;
       if (isNotFound) {
         console.log('[DailyLineup] Job not found (server may have restarted), clearing stale job ID:', activeJobId);
         localStorage.removeItem(LINEUP_JOB_STORAGE_KEY);
@@ -386,18 +398,50 @@ export function DailyLineupPage() {
   const { data: ohData } = useOperatingHours({ limit: 1 });
   const dateRange = ohData?.date_range;
 
+  // Fetch demand data (EntTelligence capacity/sales) for the selected theater + date
+  const hasLineupData = !!(lineupData as { theater?: string; showtimes?: ShowtimeEntry[] } | undefined)?.showtimes?.length;
+  const { data: demandData } = useDemandLookup(
+    queryTheater ? [queryTheater] : [],
+    queryDate,
+    undefined,
+    undefined,
+    hasLineupData && !!queryTheater && !!queryDate,
+  );
+
+  // Build demand lookup map and summary
+  const demandMap = useMemo(() => {
+    if (!demandData || demandData.length === 0) return new Map<string, DemandMetric>();
+    return buildDemandMap(demandData);
+  }, [demandData]);
+
+  const demandSummary = useMemo(() => {
+    if (!demandData || demandData.length === 0) return null;
+    return computeDemandSummary(demandData);
+  }, [demandData]);
+
+  // Box Office Board HTML
+  const { data: boardHtml, isLoading: boardLoading } = useBoxOfficeBoard(
+    queryTheater,
+    queryDate,
+    boardResolution,
+    showBoard && hasLineupData && !!queryTheater && !!queryDate,
+  );
+
   // Stop scraping/polling when showtimes arrive
   React.useEffect(() => {
-    const data = lineupData as any;
-    if (data?.showtimes?.length > 0) {
+    const data = lineupData as { showtimes?: ShowtimeEntry[] } | undefined;
+    if (data?.showtimes && data.showtimes.length > 0) {
       setIsScraping(false);
     }
   }, [lineupData]);
 
+  type MarketEntry = { theaters?: { name: string; url: string }[] };
+  type HierarchyLevel = Record<string, Record<string, MarketEntry>>;
+
   // Get company-level data
   const companyData = useMemo(() => {
     if (!hierarchyData || !selectedCompany) return null;
-    return (hierarchyData as any)[selectedCompany] || null;
+    return (hierarchyData as Record<string, HierarchyLevel>)[selectedCompany] || null;
   }, [hierarchyData, selectedCompany]);
 
   // Helper to determine if a theater is company-owned
@@ -411,8 +455,8 @@ export function DailyLineupPage() {
     if (!companyData) return [];
     return Object.keys(companyData).filter(dir => {
       const directorEntry = companyData[dir];
-      return Object.values(directorEntry).some((marketEntry: any) => 
-        marketEntry.theaters?.some((t: any) => isCompanyTheater(t.name))
+      return Object.values(directorEntry).some((marketEntry: MarketEntry) =>
+        marketEntry.theaters?.some((t) => isCompanyTheater(t.name))
       );
     }).sort();
   }, [companyData]);
@@ -423,7 +467,7 @@ export function DailyLineupPage() {
     const directorEntry = companyData[selectedDirector] || {};
     return Object.keys(directorEntry).filter(mkt => {
       const marketEntry = directorEntry[mkt];
-      return marketEntry.theaters?.some((t: any) => isCompanyTheater(t.name));
+      return marketEntry.theaters?.some((t) => isCompanyTheater(t.name));
     }).sort();
   }, [companyData, selectedDirector]);
 
@@ -434,29 +478,29 @@ export function DailyLineupPage() {
     if (!marketEntry?.theaters) return [];
     
     return marketEntry.theaters
-      .filter((t: any) => isCompanyTheater(t.name))
-      .sort((a: any, b: any) => a.name.localeCompare(b.name));
+      .filter((t: { name: string }) => isCompanyTheater(t.name))
+      .sort((a: { name: string }, b: { name: string }) => a.name.localeCompare(b.name));
   }, [companyData, selectedDirector, selectedMarket]);
 
   // Process lineup data with out-times and sorting
   const processedShowtimes = useMemo(() => {
-    const data = lineupData as any;
+    const data = lineupData as { showtimes?: ShowtimeEntry[] } | undefined;
     if (!data?.showtimes) return [];
 
-    let showtimes = data.showtimes.map((show: any) => ({
+    let showtimes: ShowtimeEntry[] = data.showtimes.map((show) => ({
       ...show,
       showtime: formatShowtime(show.showtime, { useMilitaryTime, showAmPm }),
       out_time: showOutTime ? calculateOutTime(show.showtime, show.runtime, { useMilitaryTime, showAmPm, trailerTime }) : undefined,
     }));
 
     // Apply title compacting
-    showtimes = showtimes.map((show: any) => {
+    showtimes = showtimes.map((show) => {
       let title = compactFilmTitle(show.film_title, {
         removeYear: compactTitles,
         removeArticles,
         maxWords: maxWords > 0 ? maxWords : undefined
       });
-      
+
       // Append format if not standard/2D
       const displayFormat = normalizeFormatDisplay(show.format, show.is_plf);
       if (displayFormat) {
@@ -467,14 +511,14 @@ export function DailyLineupPage() {
     });
 
     // Sort chronologically by original showtime
-    showtimes.sort((a: any, b: any) => {
+    showtimes.sort((a, b) => {
       const timeA = parseShowtimeForSort(a.showtime);
       const timeB = parseShowtimeForSort(b.showtime);
       return timeA - timeB;
     });
 
-    return showtimes as ShowtimeEntry[];
-  }, [lineupData, compactTitles, removeArticles, maxWords, showOutTime, useMilitaryTime, showAmPm]);
+    return showtimes;
+  }, [lineupData, compactTitles, removeArticles, maxWords, showOutTime, useMilitaryTime, showAmPm, trailerTime]);
 
   // Group lineup by film
   const lineupByFilm = useMemo(() => {
@@ -482,7 +526,7 @@ export function DailyLineupPage() {
 
     const grouped: Record<string, { showtimes: ShowtimeEntry[]; format?: string; runtime?: number; is_plf?: boolean }> = {};
 
-    processedShowtimes.forEach((show: any) => {
+    processedShowtimes.forEach((show) => {
       const filmTitle = show.film_title;
       if (!grouped[filmTitle]) {
         grouped[filmTitle] = {
@@ -498,7 +542,8 @@ export function DailyLineupPage() {
     return grouped;
   }, [processedShowtimes]);
 
-  // Calculate operating hours
+  // Calculate operating hours (first showtime start → last showtime start)
+  // Note: Uses last showtime START, not end time with runtime added
   const operatingHours = useMemo(() => {
     if (!processedShowtimes.length) return null;
 
@@ -507,7 +552,7 @@ export function DailyLineupPage() {
 
     return {
       open: firstShow.showtime,
-      close: lastShow.out_time || lastShow.showtime,
+      close: lastShow.showtime,
     };
   }, [processedShowtimes]);
 
@@ -537,7 +582,7 @@ export function DailyLineupPage() {
     if (cacheData?.markets) {
       for (const marketName in cacheData.markets) {
         const t = cacheData.markets[marketName].theaters.find(
-          (theater: any) => theater.name === selectedTheater
+          (theater: { name: string; url: string }) => theater.name === selectedTheater
         );
         if (t) {
           theaterUrl = t.url;
@@ -930,7 +975,7 @@ export function DailyLineupPage() {
                 <CardDescription className="text-red-400/80">
                   {isScraping 
                     ? `Our robots are currently visiting Fandango to fetch the latest showtimes for ${queryTheater}. Results will appear automatically in a few moments...`
-                    : (error as any)?.response?.status === 404 
+                    : error && 'response' in error && (error as { response?: { status?: number } }).response?.status === 404 
                       ? `No showtimes were found for ${queryTheater} on ${format(new Date(selectedDate + 'T00:00:00'), 'MMM d, yyyy')}. This theater may not have been scraped for this date yet.`
                       : `Could not fetch showtimes for ${queryTheater}. Please try again later.`
                   }
@@ -972,7 +1017,7 @@ export function DailyLineupPage() {
                 <div className="flex items-center gap-3 flex-wrap">
                   <Badge variant="secondary" className="text-sm py-1 px-3">
                     <Building2 className="mr-1 h-3 w-3" />
-                    {(lineupData as any)?.theater || queryTheater}
+                    {(lineupData as { theater?: string; showtimes?: ShowtimeEntry[] } | undefined)?.theater || queryTheater}
                   </Badge>
                   <Badge variant="secondary" className="text-sm py-1 px-3">
                     <Calendar className="mr-1 h-3 w-3" />
@@ -990,6 +1035,18 @@ export function DailyLineupPage() {
                     <Badge className="text-sm py-1 px-3 bg-green-500/20 text-green-400 border-green-500/30">
                       <Clock className="mr-1 h-3 w-3" />
                       {operatingHours.open} - {operatingHours.close}
+                    </Badge>
+                  )}
+                  {demandSummary && demandSummary.highDemandCount > 0 && (
+                    <Badge className="text-sm py-1 px-3 bg-red-500/20 text-red-400 border-red-500/30 animate-pulse">
+                      <Flame className="mr-1 h-3 w-3" />
+                      {demandSummary.highDemandCount} high-demand showtime{demandSummary.highDemandCount !== 1 ? 's' : ''}
+                    </Badge>
+                  )}
+                  {demandSummary && demandSummary.highDemandCount === 0 && demandSummary.totalShowtimes > 0 && (
+                    <Badge className="text-sm py-1 px-3 bg-blue-500/20 text-blue-400 border-blue-500/30">
+                      <TrendingUp className="mr-1 h-3 w-3" />
+                      {demandSummary.avgFillRate}% avg fill
                     </Badge>
                   )}
                 </div>
@@ -1016,7 +1073,7 @@ export function DailyLineupPage() {
               {viewMode === 'cards' && (
                 <Card>
                   <CardHeader>
-                    <CardTitle>{(lineupData as any)?.theater || queryTheater}</CardTitle>
+                    <CardTitle>{(lineupData as { theater?: string; showtimes?: ShowtimeEntry[] } | undefined)?.theater || queryTheater}</CardTitle>
                     <CardDescription>
                       {Object.keys(lineupByFilm).length} films showing on {format(new Date(selectedDate + 'T00:00:00'), 'MMM d, yyyy')}
                     </CardDescription>
@@ -1032,9 +1089,20 @@ export function DailyLineupPage() {
                           const isExpanded = expandedFilms.has(filmTitle);
                           const formatEmoji = getFormatEmoji(data.format || '', data.is_plf);
                           const formatClass = getFormatBadgeClass(data.format, data.is_plf);
+                          // Check if any showtime for this film has high demand
+                          const filmDemandMetrics = data.showtimes
+                            .map(s => demandMap.get(demandKey(queryTheater, filmTitle, s.showtime)))
+                            .filter((d): d is DemandMetric => !!d);
+                          const maxFillRate = filmDemandMetrics.length > 0
+                            ? Math.max(...filmDemandMetrics.map(d => d.fill_rate_pct))
+                            : 0;
+                          const totalSold = filmDemandMetrics.reduce((sum, d) => sum + d.tickets_sold, 0);
 
                           return (
-                            <div key={filmTitle} className="border rounded-lg">
+                            <div key={filmTitle} className={cn(
+                              "border rounded-lg",
+                              maxFillRate >= 75 ? "border-red-500/30" : ""
+                            )}>
                               <button
                                 onClick={() => toggleFilmExpand(filmTitle)}
                                 className="w-full flex items-center justify-between p-4 hover:bg-muted/50"
@@ -1062,21 +1130,45 @@ export function DailyLineupPage() {
                                   <Badge variant="secondary" className="text-xs">
                                     {data.showtimes.length} showings
                                   </Badge>
+                                  {totalSold > 0 && (
+                                    <Badge className={cn("text-xs",
+                                      maxFillRate >= 75 ? "bg-red-500/20 text-red-400 border-red-500/30" :
+                                      maxFillRate >= 50 ? "bg-yellow-500/20 text-yellow-400 border-yellow-500/30" :
+                                      "bg-blue-500/20 text-blue-400 border-blue-500/30"
+                                    )}>
+                                      {maxFillRate >= 75 && <Flame className="mr-1 h-3 w-3" />}
+                                      {totalSold} sold
+                                    </Badge>
+                                  )}
                                 </div>
                               </button>
 
                               {isExpanded && (
                                 <div className="px-4 pb-4">
                                   <div className="flex flex-wrap gap-2 mt-4">
-                                    {data.showtimes.map((show, idx) => (
-                                      <div key={idx} className="flex flex-col items-center p-2 rounded-md bg-secondary/50 border border-border min-w-[100px]">
+                                    {data.showtimes.map((show, idx) => {
+                                      const demand = demandMap.get(demandKey(queryTheater, filmTitle, show.showtime));
+                                      return (
+                                      <div key={idx} className={cn(
+                                        "flex flex-col items-center p-2 rounded-md border min-w-[100px]",
+                                        demand && demand.fill_rate_pct >= 75
+                                          ? "bg-red-500/10 border-red-500/30"
+                                          : demand && demand.fill_rate_pct >= 50
+                                            ? "bg-yellow-500/10 border-yellow-500/30"
+                                            : "bg-secondary/50 border-border"
+                                      )}>
                                         <span className="text-sm font-bold">{show.showtime}</span>
                                         {show.out_time && showOutTime && (
                                           <span className="text-xs text-muted-foreground whitespace-nowrap">
                                             out: {show.out_time}
                                           </span>
                                         )}
-                                        {!show.out_time && showOutTime && show.runtime === undefined && (
+                                        {demand && (
+                                          <span className={cn("text-[10px] font-medium mt-0.5", getFillRateColor(demand.fill_rate_pct))}>
+                                            {demand.tickets_sold}/{demand.capacity} ({demand.fill_rate_pct}%)
+                                          </span>
+                                        )}
+                                        {!show.out_time && showOutTime && show.runtime === undefined && !demand && (
                                           <Button
                                             variant="ghost"
                                             size="sm"
@@ -1092,7 +1184,8 @@ export function DailyLineupPage() {
                                           </Button>
                                         )}
                                       </div>
-                                    ))}
+                                      );
+                                    })}
                                   </div>
                                 </div>
                               )}
@@ -1105,11 +1198,10 @@ export function DailyLineupPage() {
                 </Card>
               )}
 
-              {/* Table View (Print-Ready) */}
               {viewMode === 'table' && (
                 <Card className="print:shadow-none print:border-0">
                   <CardHeader className="print:pb-2">
-                    <CardTitle className="print:text-2xl">{(lineupData as any)?.theater || queryTheater}</CardTitle>
+                    <CardTitle className="print:text-2xl">{(lineupData as { theater?: string; showtimes?: ShowtimeEntry[] } | undefined)?.theater || queryTheater}</CardTitle>
                     <CardDescription className="print:text-lg print:text-black">
                       {format(new Date(selectedDate + 'T00:00:00'), 'EEEE, MMMM d, yyyy')}
                     </CardDescription>
@@ -1128,12 +1220,19 @@ export function DailyLineupPage() {
                             <TableHead className="w-24">Format</TableHead>
                             <TableHead className="w-24">In-Time</TableHead>
                             <TableHead className="w-24">Out-Time</TableHead>
+                            {demandData && demandData.length > 0 && (
+                              <TableHead className="w-28 print:hidden">Sold</TableHead>
+                            )}
                           </TableRow>
                         </TableHeader>
                         <TableBody>
                           {processedShowtimes.map((show, idx) => {
+                            const demand = demandMap.get(demandKey(queryTheater, show.film_title, show.showtime));
                             return (
-                              <TableRow key={idx}>
+                              <TableRow key={idx} className={cn(
+                                demand && demand.fill_rate_pct >= 75 ? "bg-red-500/5" :
+                                demand && demand.fill_rate_pct >= 50 ? "bg-yellow-500/5" : ""
+                              )}>
                                 <TableCell className="font-mono"></TableCell>
                                 <TableCell className="font-medium">{show.film_title}</TableCell>
                                 <TableCell className="font-mono">
@@ -1143,6 +1242,27 @@ export function DailyLineupPage() {
                                 <TableCell className="font-mono text-muted-foreground">
                                   {show.out_time || '—'}
                                 </TableCell>
+                                {demandData && demandData.length > 0 && (
+                                  <TableCell className="print:hidden">
+                                    {demand ? (
+                                      <div className="flex items-center gap-2">
+                                        <Progress
+                                          value={demand.fill_rate_pct}
+                                          className={cn("h-2 w-16",
+                                            demand.fill_rate_pct >= 75 ? "[&>div]:bg-red-500" :
+                                            demand.fill_rate_pct >= 50 ? "[&>div]:bg-yellow-500" :
+                                            "[&>div]:bg-green-500"
+                                          )}
+                                        />
+                                        <span className={cn("text-xs font-mono", getFillRateColor(demand.fill_rate_pct))}>
+                                          {demand.tickets_sold}/{demand.capacity}
+                                        </span>
+                                      </div>
+                                    ) : (
+                                      <span className="text-xs text-muted-foreground">—</span>
+                                    )}
+                                  </TableCell>
+                                )}
                               </TableRow>
                             );
                           })}
@@ -1155,6 +1275,124 @@ export function DailyLineupPage() {
             </>
           )}
         </div>
+      )}
+
+      {/* Box Office Board — separate section below lineup */}
+      {hasLineupData && step === 'results' && (
+        <Card className="mt-4">
+          <CardHeader>
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <Button
+                  variant={showBoard ? 'default' : 'outline'}
+                  size="sm"
+                  onClick={() => setShowBoard(!showBoard)}
+                >
+                  <Monitor className="mr-2 h-4 w-4" />
+                  {showBoard ? 'Hide Board' : 'Box Office Board'}
+                </Button>
+                {showBoard && (
+                  <CardDescription className="ml-1">
+                    Display-ready schedule for screens or printing
+                  </CardDescription>
+                )}
+              </div>
+              {showBoard && (
+                <div className="flex items-center gap-2">
+                  {/* Resolution selector */}
+                  <select
+                    value={boardResolution}
+                    onChange={(e) => setBoardResolution(e.target.value as BoardResolution)}
+                    className="text-xs border rounded-md px-2 py-1.5 bg-background"
+                  >
+                    {(Object.entries(RESOLUTION_LABELS) as [BoardResolution, string][]).map(([key, label]) => (
+                      <option key={key} value={key}>{label}</option>
+                    ))}
+                  </select>
+
+                  {/* Download buttons */}
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={boardDownloading || !boardHtml}
+                    onClick={async () => {
+                      setBoardDownloading(true);
+                      try {
+                        await downloadBoardHtml(queryTheater, queryDate, boardResolution);
+                      } finally {
+                        setBoardDownloading(false);
+                      }
+                    }}
+                  >
+                    <Download className="mr-1 h-3.5 w-3.5" />
+                    Screen Display
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={boardDownloading || !boardHtml}
+                    onClick={async () => {
+                      setBoardDownloading(true);
+                      try {
+                        await downloadBoardImage(queryTheater, queryDate, boardResolution);
+                      } finally {
+                        setBoardDownloading(false);
+                      }
+                    }}
+                  >
+                    <Download className="mr-1 h-3.5 w-3.5" />
+                    Generate Image
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={!boardHtml}
+                    onClick={() => {
+                      if (!boardHtml) return;
+                      const printWindow = window.open('', '_blank');
+                      if (printWindow) {
+                        printWindow.document.write(boardHtml);
+                        printWindow.document.close();
+                        printWindow.onload = () => {
+                          printWindow.print();
+                        };
+                      }
+                    }}
+                  >
+                    <Printer className="mr-1 h-3.5 w-3.5" />
+                    Printer Friendly
+                  </Button>
+                </div>
+              )}
+            </div>
+          </CardHeader>
+          {showBoard && (
+            <CardContent>
+              {boardLoading ? (
+                <div className="flex items-center justify-center py-12 text-muted-foreground">
+                  <RefreshCw className="h-5 w-5 animate-spin mr-2" />
+                  Generating board...
+                </div>
+              ) : boardHtml ? (
+                <div className="border rounded-lg overflow-hidden bg-muted/20">
+                  <iframe
+                    srcDoc={boardHtml}
+                    title="Box Office Board Preview"
+                    className="w-full border-0"
+                    style={{
+                      height: boardResolution === 'letter' ? '500px' :
+                             boardResolution === '720p' ? '450px' : '540px',
+                    }}
+                  />
+                </div>
+              ) : (
+                <div className="text-center py-8 text-muted-foreground">
+                  No schedule data available for the board.
+                </div>
+              )}
+            </CardContent>
+          )}
+        </Card>
       )}
 
       {/* Print Styles */}

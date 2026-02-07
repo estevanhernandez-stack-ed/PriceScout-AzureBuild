@@ -15,6 +15,8 @@ import os
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 from app import config
+from api.routers.auth import require_read_admin, require_operator
+from api.services import get_sqlite_connection
 
 router = APIRouter(prefix="/api/v1", tags=["Circuit Benchmarks"])
 
@@ -70,10 +72,23 @@ class SyncStatus(BaseModel):
 
 
 def get_db_connection():
-    """Get database connection based on environment."""
-    # Use the main pricescout.db database
-    db_path = config.DB_FILE or os.path.join(config.PROJECT_DIR, 'pricescout.db')
-    return sqlite3.connect(db_path)
+    """Get database connection with schema auto-migration."""
+    conn = get_sqlite_connection()
+    _ensure_schema(conn)
+    return conn
+
+
+def _ensure_schema(conn: sqlite3.Connection):
+    """Add missing columns to circuit_benchmarks if table exists (auto-migration)."""
+    cursor = conn.cursor()
+    try:
+        cursor.execute("PRAGMA table_info(circuit_benchmarks)")
+        existing_cols = {row[1] for row in cursor.fetchall()}
+        if existing_cols and 'period_start_date' not in existing_cols:
+            cursor.execute("ALTER TABLE circuit_benchmarks ADD COLUMN period_start_date DATE")
+            conn.commit()
+    except sqlite3.OperationalError:
+        pass  # Table doesn't exist yet — handled by endpoint-level error handling
 
 
 @router.get("/circuit-benchmarks", response_model=CircuitBenchmarkList)
@@ -81,7 +96,8 @@ async def list_circuit_benchmarks(
     week_ending_date: Optional[str] = Query(None, description="Filter by week ending date (YYYY-MM-DD)"),
     circuit_name: Optional[str] = Query(None, description="Filter by circuit name"),
     limit: int = Query(100, ge=1, le=500),
-    offset: int = Query(0, ge=0)
+    offset: int = Query(0, ge=0),
+    current_user: dict = Depends(require_read_admin),
 ):
     """
     List circuit benchmark data with optional filtering.
@@ -150,7 +166,7 @@ async def list_circuit_benchmarks(
 
 
 @router.get("/circuit-benchmarks/weeks", response_model=List[WeekSummary])
-async def list_available_weeks():
+async def list_available_weeks(current_user: dict = Depends(require_read_admin)):
     """
     Get list of available weeks with summary statistics.
     """
@@ -206,7 +222,7 @@ async def list_available_weeks():
 
 
 @router.get("/circuit-benchmarks/{week_ending_date}")
-async def get_week_benchmarks(week_ending_date: str):
+async def get_week_benchmarks(week_ending_date: str, current_user: dict = Depends(require_read_admin)):
     """
     Get all circuit benchmarks for a specific week.
 
@@ -252,7 +268,7 @@ async def get_week_benchmarks(week_ending_date: str):
 
 
 @router.post("/circuit-benchmarks/sync", response_model=SyncStatus)
-async def trigger_sync(background_tasks: BackgroundTasks):
+async def trigger_sync(background_tasks: BackgroundTasks, current_user: dict = Depends(require_operator)):
     """
     Trigger an EntTelligence sync for circuit benchmark data.
 
@@ -291,14 +307,149 @@ async def trigger_sync(background_tasks: BackgroundTasks):
 
 
 async def run_circuit_sync():
-    """Background task to sync circuit benchmarks from EntTelligence."""
+    """Background task to aggregate circuit benchmarks from enttelligence_price_cache.
+
+    Scoped to theaters defined in markets.json (204 theaters across 57 Marcus markets).
+    Uses market_scope_service to resolve market theater names against EntTelligence names.
+    Groups data into Fri-Thu weeks and calculates per-circuit metrics.
+    """
+    from api.services.market_scope_service import get_in_market_enttelligence_names
+
+    conn = get_db_connection()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
     try:
-        from sync_engine import run_nationwide_sync
-        run_nationwide_sync()
-    except ImportError:
-        print("Warning: sync_engine not available")
+        # Step 1: Resolve market theater names to EntTelligence names
+        in_market_ent_names = get_in_market_enttelligence_names(conn)
+        if not in_market_ent_names:
+            print("[CircuitSync] No market theaters matched in EntTelligence cache")
+            return
+
+        ent_names_list = sorted(in_market_ent_names)
+        placeholders = ",".join("?" * len(ent_names_list))
+        print(f"[CircuitSync] Resolved {len(ent_names_list)} market theaters in EntTelligence")
+
+        # Step 2: Discover circuits from matched theater names only
+        cursor.execute(f"""
+            SELECT DISTINCT circuit_name
+            FROM enttelligence_price_cache
+            WHERE theater_name IN ({placeholders})
+              AND circuit_name IS NOT NULL
+        """, ent_names_list)
+        our_circuits = [r[0] for r in cursor.fetchall()]
+
+        if not our_circuits:
+            print("[CircuitSync] No circuits found for matched market theaters")
+            return
+
+        print(f"[CircuitSync] Found {len(our_circuits)} circuits in our markets")
+
+        # Step 3: Get date range from matched theaters only
+        cursor.execute(f"""
+            SELECT MIN(play_date), MAX(play_date)
+            FROM enttelligence_price_cache
+            WHERE theater_name IN ({placeholders})
+        """, ent_names_list)
+        date_range = cursor.fetchone()
+        if not date_range or not date_range[0]:
+            print("[CircuitSync] No data in enttelligence_price_cache for market theaters")
+            return
+
+        min_date = datetime.strptime(date_range[0], "%Y-%m-%d").date()
+        max_date = datetime.strptime(date_range[1], "%Y-%m-%d").date()
+
+        # Generate Fri-Thu week boundaries
+        days_since_friday = (min_date.weekday() - 4) % 7
+        week_start = min_date - timedelta(days=days_since_friday)
+
+        records_synced = 0
+
+        while week_start <= max_date:
+            week_end = week_start + timedelta(days=6)  # Thursday
+            period_start = week_start.isoformat()
+            period_end = week_end.isoformat()
+
+            for circuit in our_circuits:
+                # Aggregate metrics for this circuit + week, limited to market theaters
+                cursor.execute(f"""
+                    SELECT
+                        COUNT(DISTINCT theater_name || '|' || play_date || '|' || showtime || '|' || film_title) as total_showtimes,
+                        COUNT(DISTINCT theater_name) as total_theaters,
+                        COUNT(DISTINCT film_title) as total_films,
+                        SUM(CASE WHEN capacity IS NOT NULL THEN capacity ELSE 0 END) as total_capacity,
+                        -- Format percentages
+                        ROUND(100.0 * SUM(CASE WHEN format = '2D' THEN 1 ELSE 0 END) / MAX(COUNT(*), 1), 1) as format_standard_pct,
+                        ROUND(100.0 * SUM(CASE WHEN format LIKE '%IMAX%' THEN 1 ELSE 0 END) / MAX(COUNT(*), 1), 1) as format_imax_pct,
+                        ROUND(100.0 * SUM(CASE WHEN format LIKE '%Dolby%' OR format LIKE '%ATMOS%' THEN 1 ELSE 0 END) / MAX(COUNT(*), 1), 1) as format_dolby_pct,
+                        ROUND(100.0 * SUM(CASE WHEN format = '3D' THEN 1 ELSE 0 END) / MAX(COUNT(*), 1), 1) as format_3d_pct,
+                        ROUND(100.0 * SUM(CASE WHEN format NOT IN ('2D', '3D') AND format NOT LIKE '%IMAX%' AND format NOT LIKE '%Dolby%' AND format NOT LIKE '%ATMOS%' THEN 1 ELSE 0 END) / MAX(COUNT(*), 1), 1) as format_other_premium_pct,
+                        -- Daypart percentages (matinee < 17:00, evening 17:00-21:00, late >= 21:00)
+                        ROUND(100.0 * SUM(CASE WHEN showtime < '17:00' THEN 1 ELSE 0 END) / MAX(COUNT(*), 1), 1) as daypart_matinee_pct,
+                        ROUND(100.0 * SUM(CASE WHEN showtime >= '17:00' AND showtime < '21:00' THEN 1 ELSE 0 END) / MAX(COUNT(*), 1), 1) as daypart_evening_pct,
+                        ROUND(100.0 * SUM(CASE WHEN showtime >= '21:00' THEN 1 ELSE 0 END) / MAX(COUNT(*), 1), 1) as daypart_late_pct,
+                        -- Pricing (only Adult ticket type, exclude $0)
+                        ROUND(AVG(CASE WHEN ticket_type = 'Adult' AND price > 0 THEN price END), 2) as avg_price_general,
+                        ROUND(AVG(CASE WHEN ticket_type = 'Child' AND price > 0 THEN price END), 2) as avg_price_child,
+                        ROUND(AVG(CASE WHEN ticket_type = 'Senior' AND price > 0 THEN price END), 2) as avg_price_senior
+                    FROM enttelligence_price_cache
+                    WHERE circuit_name = ?
+                      AND play_date >= ? AND play_date <= ?
+                      AND theater_name IN ({placeholders})
+                """, [circuit, period_start, period_end] + ent_names_list)
+
+                row = cursor.fetchone()
+                if not row or row['total_showtimes'] == 0:
+                    continue
+
+                total_theaters = row['total_theaters'] or 0
+                total_films = row['total_films'] or 0
+                total_showtimes = row['total_showtimes'] or 0
+
+                # PLF = IMAX + Dolby + 3D + other premium
+                plf_pct = round(
+                    (row['format_imax_pct'] or 0) +
+                    (row['format_dolby_pct'] or 0) +
+                    (row['format_3d_pct'] or 0) +
+                    (row['format_other_premium_pct'] or 0), 1
+                )
+
+                cursor.execute("""
+                    INSERT OR REPLACE INTO circuit_benchmarks (
+                        circuit_name, week_ending_date, period_start_date,
+                        total_showtimes, total_capacity, total_theaters, total_films,
+                        avg_screens_per_film, avg_showtimes_per_theater,
+                        format_standard_pct, format_imax_pct, format_dolby_pct,
+                        format_3d_pct, format_other_premium_pct, plf_total_pct,
+                        daypart_matinee_pct, daypart_evening_pct, daypart_late_pct,
+                        avg_price_general, avg_price_child, avg_price_senior,
+                        data_source, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'enttelligence', datetime('now'))
+                """, [
+                    circuit, period_end, period_start,
+                    total_showtimes, row['total_capacity'] or 0, total_theaters, total_films,
+                    round(total_showtimes / max(total_films, 1), 1),
+                    round(total_showtimes / max(total_theaters, 1), 1),
+                    row['format_standard_pct'] or 0, row['format_imax_pct'] or 0,
+                    row['format_dolby_pct'] or 0, row['format_3d_pct'] or 0,
+                    row['format_other_premium_pct'] or 0, plf_pct,
+                    row['daypart_matinee_pct'] or 0, row['daypart_evening_pct'] or 0,
+                    row['daypart_late_pct'] or 0,
+                    row['avg_price_general'], row['avg_price_child'], row['avg_price_senior'],
+                ])
+                records_synced += 1
+
+            week_start += timedelta(days=7)
+
+        conn.commit()
+        print(f"[CircuitSync] Done — {records_synced} benchmark records created")
+
     except Exception as e:
-        print(f"Sync error: {e}")
+        print(f"[CircuitSync] Error: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        conn.close()
 
 
 @router.get("/circuit-benchmarks/compare")

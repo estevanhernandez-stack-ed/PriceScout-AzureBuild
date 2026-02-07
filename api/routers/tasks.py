@@ -1,3 +1,12 @@
+"""
+Tasks API Router
+
+Endpoints for managing scheduled tasks (automated scrape schedules).
+
+Endpoints:
+    GET    /api/v1/tasks                         - List all scheduled tasks
+"""
+
 from fastapi import APIRouter, Security
 from api.routers.auth import get_current_user, User
 import glob

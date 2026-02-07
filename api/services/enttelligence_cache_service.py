@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 from enttelligence_client import EntTelligenceClient
 
 from app import config
+from api.services.tax_estimation import state_from_dma
 
 
 def normalize_film_title(title: str) -> str:
@@ -139,9 +140,11 @@ class EntTelligenceCacheService:
         return self._client
 
     def _get_db_connection(self) -> sqlite3.Connection:
-        """Get database connection"""
-        conn = sqlite3.connect(self.db_path)
+        """Get database connection with WAL mode for concurrent access"""
+        conn = sqlite3.connect(self.db_path, timeout=30.0)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
         return conn
 
     def _update_theater_metadata(
@@ -171,14 +174,17 @@ class EntTelligenceCacheService:
 
             # Insert or update theater metadata
             # - dma column: EntTelligence DMA (system-defined, always updated)
+            # - state column: derived from DMA, only set if currently NULL
             # - market column: Marcus-specific markets (admin-editable, preserved)
+            derived_state = state_from_dma(dma) or ''
             cursor.execute("""
-                INSERT INTO theater_metadata (company_id, theater_name, circuit_name, dma, created_at)
-                VALUES (?, ?, ?, ?, datetime('now'))
+                INSERT INTO theater_metadata (company_id, theater_name, circuit_name, dma, state, created_at)
+                VALUES (?, ?, ?, ?, ?, datetime('now'))
                 ON CONFLICT(company_id, theater_name) DO UPDATE SET
                     circuit_name = COALESCE(NULLIF(excluded.circuit_name, ''), theater_metadata.circuit_name),
-                    dma = excluded.dma
-            """, (company_id, theater_name, circuit_name, dma))
+                    dma = excluded.dma,
+                    state = COALESCE(NULLIF(theater_metadata.state, ''), excluded.state)
+            """, (company_id, theater_name, circuit_name, dma, derived_state))
 
             if cursor.rowcount > 0:
                 updated += 1
@@ -248,9 +254,22 @@ class EntTelligenceCacheService:
                     play_date = showtime.get('date_sh', showtime.get('show_date', ''))
                     show_time = showtime.get('show_time', showtime.get('time_sh', '')).strip()
                     circuit_name = showtime.get('circuit_name', '')
-                    price = showtime.get('price_per_general', 0)
+                    price_adult = showtime.get('price_per_general', 0)
+                    price_child = showtime.get('price_per_child', 0)
+                    price_senior = showtime.get('price_per_senior', 0)
                     film_format = showtime.get('film_format', None)
                     dma = showtime.get('dma', '')  # Extract DMA/market from EntTelligence
+
+                    # Capacity / sales data
+                    capacity = showtime.get('capacity', None)
+                    available_seats = showtime.get('available', None)
+                    blocked_seats = showtime.get('blocked', None)
+
+                    # Film & theater metadata
+                    release_date = showtime.get('release_date', None)
+                    imdb_id = showtime.get('imdb_id', None)
+                    ent_movie_id = showtime.get('movie_id', None)
+                    ent_theater_id = showtime.get('theater_id', None)
 
                     if not all([theater_name, film_title, play_date, show_time]):
                         continue
@@ -264,29 +283,48 @@ class EntTelligenceCacheService:
                             'dma': dma
                         }
 
-                    # Upsert into cache
-                    cursor.execute("""
-                        INSERT OR REPLACE INTO enttelligence_price_cache (
-                            company_id, play_date, theater_name, film_title, showtime,
-                            format, ticket_type, price, source, fetched_at, expires_at,
-                            circuit_name, created_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (
-                        company_id,
-                        play_date,
-                        theater_name,
-                        film_title,
-                        show_time,
-                        film_format,  # film_format from EntTelligence (2D, 3D, IMAX, etc.)
-                        'Adult',  # Default ticket type for general price
-                        price,
-                        'enttelligence',
-                        now.isoformat(),
-                        expires_at.isoformat(),
-                        circuit_name,
-                        now.isoformat()
-                    ))
-                    cached_count += 1
+                    # Build list of (ticket_type, price) pairs to cache
+                    # Cache Adult always (even if 0, for completeness)
+                    # Cache Child/Senior only if price > 0
+                    price_rows = [('Adult', price_adult)]
+                    if price_child and float(price_child) > 0:
+                        price_rows.append(('Child', float(price_child)))
+                    if price_senior and float(price_senior) > 0:
+                        price_rows.append(('Senior', float(price_senior)))
+
+                    # Upsert each ticket type into cache
+                    for ticket_type, ticket_price in price_rows:
+                        cursor.execute("""
+                            INSERT OR REPLACE INTO enttelligence_price_cache (
+                                company_id, play_date, theater_name, film_title, showtime,
+                                format, ticket_type, price, source, fetched_at, expires_at,
+                                circuit_name, created_at,
+                                capacity, available, blocked,
+                                release_date, imdb_id, movie_id, theater_id
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (
+                            company_id,
+                            play_date,
+                            theater_name,
+                            film_title,
+                            show_time,
+                            film_format,
+                            ticket_type,
+                            ticket_price,
+                            'enttelligence',
+                            now.isoformat(),
+                            expires_at.isoformat(),
+                            circuit_name,
+                            now.isoformat(),
+                            capacity,
+                            available_seats,
+                            blocked_seats,
+                            release_date,
+                            imdb_id,
+                            ent_movie_id,
+                            ent_theater_id,
+                        ))
+                        cached_count += 1
 
                 except Exception as e:
                     error_count += 1
@@ -426,6 +464,209 @@ class EntTelligenceCacheService:
             conn.close()
 
         return results
+
+    def lookup_cached_prices_all_types(
+        self,
+        showtime_keys: List[str],
+        company_id: int = 1,
+        max_age_hours: Optional[int] = None
+    ) -> Dict[str, List[CachedPrice]]:
+        """
+        Look up cached prices for showtime keys, returning ALL ticket types per key.
+
+        Unlike lookup_cached_prices() which returns one CachedPrice per key,
+        this returns a list of CachedPrice objects (one per ticket type: Adult, Child, Senior).
+
+        Args:
+            showtime_keys: List of "date|theater|film|time" keys
+            company_id: Company ID for filtering
+            max_age_hours: Override for cache max age (uses default if not provided)
+
+        Returns:
+            Dict mapping showtime_key -> List[CachedPrice] (empty list = cache miss)
+        """
+        if not showtime_keys:
+            return {}
+
+        max_age = max_age_hours or self.cache_max_age_hours
+        min_fetched_at = datetime.now(UTC) - timedelta(hours=max_age)
+
+        results: Dict[str, List[CachedPrice]] = {key: [] for key in showtime_keys}
+
+        conn = self._get_db_connection()
+        cursor = conn.cursor()
+
+        try:
+            for key in showtime_keys:
+                parts = key.split('|')
+                if len(parts) < 4:
+                    continue
+
+                play_date, theater_name, film_title, showtime = parts[:4]
+
+                # Normalize for matching
+                normalized_film = normalize_film_title(film_title)
+                normalized_time = normalize_showtime(showtime)
+
+                rows = []
+
+                # Strategy 1: Try exact match with normalized values (all ticket types)
+                cursor.execute("""
+                    SELECT theater_name, film_title, play_date, showtime, format,
+                           ticket_type, price, source, fetched_at, expires_at, circuit_name
+                    FROM enttelligence_price_cache
+                    WHERE company_id = ?
+                      AND play_date = ?
+                      AND theater_name = ?
+                      AND film_title = ?
+                      AND showtime = ?
+                      AND fetched_at > ?
+                    ORDER BY fetched_at DESC
+                """, (company_id, play_date, theater_name, normalized_film, normalized_time, min_fetched_at.isoformat()))
+                rows = cursor.fetchall()
+
+                # Strategy 2: If no exact match, find closest showtime for same film
+                if not rows:
+                    cursor.execute("""
+                        SELECT theater_name, film_title, play_date, showtime, format,
+                               ticket_type, price, source, fetched_at, expires_at, circuit_name
+                        FROM enttelligence_price_cache
+                        WHERE company_id = ?
+                          AND play_date = ?
+                          AND theater_name = ?
+                          AND film_title = ?
+                          AND fetched_at > ?
+                        ORDER BY fetched_at DESC
+                    """, (company_id, play_date, theater_name, normalized_film, min_fetched_at.isoformat()))
+
+                    candidates = cursor.fetchall()
+                    if candidates:
+                        target_minutes = _time_to_minutes(normalized_time)
+                        if target_minutes is not None:
+                            # Group candidates by showtime to find closest
+                            by_showtime: Dict[str, list] = {}
+                            for c in candidates:
+                                st = c['showtime']
+                                if st not in by_showtime:
+                                    by_showtime[st] = []
+                                by_showtime[st].append(c)
+
+                            # Find closest showtime
+                            best_showtime = None
+                            best_diff = float('inf')
+                            for st in by_showtime:
+                                st_minutes = _time_to_minutes(st)
+                                if st_minutes is not None:
+                                    diff = abs(st_minutes - target_minutes)
+                                    if diff < best_diff:
+                                        best_diff = diff
+                                        best_showtime = st
+
+                            if best_showtime is not None:
+                                rows = by_showtime[best_showtime]
+
+                # Deduplicate by ticket_type (take most recent per type)
+                seen_types = set()
+                for row in rows:
+                    tt = row['ticket_type']
+                    if tt in seen_types:
+                        continue
+                    seen_types.add(tt)
+                    results[key].append(CachedPrice(
+                        theater_name=row['theater_name'],
+                        film_title=row['film_title'],
+                        play_date=row['play_date'],
+                        showtime=row['showtime'],
+                        format=row['format'],
+                        ticket_type=row['ticket_type'],
+                        price=float(row['price']),
+                        source=row['source'],
+                        fetched_at=datetime.fromisoformat(row['fetched_at']),
+                        expires_at=datetime.fromisoformat(row['expires_at']),
+                        circuit_name=row['circuit_name']
+                    ))
+
+        finally:
+            conn.close()
+
+        return results
+
+    def get_cached_showtimes_for_theater_dates(
+        self,
+        theater_names: List[str],
+        play_dates: List[str],
+        company_id: int = 1,
+        max_age_hours: Optional[int] = None
+    ) -> Dict[str, Dict[str, List[Dict[str, Any]]]]:
+        """
+        Get all cached showtime entries for given theaters and dates.
+
+        Used by showtime verification to compare Fandango live showtimes
+        against what's in the EntTelligence cache.
+
+        Args:
+            theater_names: List of theater names to query
+            play_dates: List of play dates in YYYY-MM-DD format
+            company_id: Company ID for filtering
+            max_age_hours: Override for cache max age
+
+        Returns:
+            {date: {theater: [{film_title, showtime, format, adult_price, fetched_at}]}}
+        """
+        if not theater_names or not play_dates:
+            return {}
+
+        max_age = max_age_hours or self.cache_max_age_hours
+        min_fetched_at = datetime.now(UTC) - timedelta(hours=max_age)
+
+        conn = self._get_db_connection()
+        cursor = conn.cursor()
+
+        try:
+            # Build parameterized IN clauses
+            date_placeholders = ','.join('?' for _ in play_dates)
+            theater_placeholders = ','.join('?' for _ in theater_names)
+
+            cursor.execute(f"""
+                SELECT play_date, theater_name, film_title, showtime, format,
+                       MAX(fetched_at) as latest_fetch,
+                       COUNT(DISTINCT ticket_type) as ticket_type_count,
+                       MAX(CASE WHEN ticket_type = 'Adult' THEN price ELSE NULL END) as adult_price
+                FROM enttelligence_price_cache
+                WHERE company_id = ?
+                  AND play_date IN ({date_placeholders})
+                  AND theater_name IN ({theater_placeholders})
+                  AND fetched_at > ?
+                GROUP BY play_date, theater_name, film_title, showtime, format
+                ORDER BY play_date, theater_name, showtime
+            """, [company_id] + play_dates + theater_names + [min_fetched_at.isoformat()])
+
+            rows = cursor.fetchall()
+
+            # Build nested dict: {date: {theater: [entries]}}
+            results: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+            for row in rows:
+                date_str = str(row['play_date'])
+                theater = row['theater_name']
+
+                if date_str not in results:
+                    results[date_str] = {}
+                if theater not in results[date_str]:
+                    results[date_str][theater] = []
+
+                results[date_str][theater].append({
+                    'film_title': row['film_title'],
+                    'showtime': row['showtime'],
+                    'format': row['format'],
+                    'adult_price': float(row['adult_price']) if row['adult_price'] else None,
+                    'ticket_type_count': row['ticket_type_count'],
+                    'fetched_at': row['latest_fetch'],
+                })
+
+            return results
+
+        finally:
+            conn.close()
 
     def get_cache_stats(self, company_id: int = 1) -> Dict[str, Any]:
         """

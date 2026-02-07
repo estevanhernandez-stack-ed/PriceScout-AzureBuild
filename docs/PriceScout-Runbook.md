@@ -1,7 +1,7 @@
 # PriceScout Operations Runbook
 
-> **Document Version:** 1.0
-> **Last Updated:** November 28, 2025
+> **Document Version:** 1.1
+> **Last Updated:** February 5, 2026
 > **Owner:** Estevan Hernandez / 626labs LLC
 > **Status:** Production
 
@@ -17,7 +17,7 @@ This runbook provides operational procedures for PriceScout, including routine m
 
 | Resource | URL/Command |
 |----------|-------------|
-| **Production App** | https://www.marketpricescout.com |
+| **Streamlit App (Test)** | https://pricescout.marketpricescout.com *(legacy Streamlit UI)* |
 | **API Docs** | https://api.pricescout.io/api/v1/docs |
 | **Azure Portal** | https://portal.azure.com → `rg-pricescout-prod` |
 | **App Insights** | Azure Portal → `pricescout-appinsights` |
@@ -218,14 +218,73 @@ DELETE FROM audit_log WHERE timestamp < DATEADD(day, -90, GETUTCDATE());
 **Symptoms:** Users can't log in, 401 errors
 
 **Diagnosis:**
-1. Check Entra ID app status in Azure Portal
-2. Verify client secret hasn't expired
-3. Check Key Vault access
+
+1. **Check which auth method is failing:**
+   - Local (username/password): Check database connectivity
+   - Entra ID (SSO): Check Microsoft configuration
+   - API Key: Verify key in database
+
+2. **For Entra ID failures:**
+   ```kusto
+   # App Insights query
+   traces
+   | where timestamp > ago(1h)
+   | where message contains "Entra token validation failed"
+      or message contains "Invalid OAuth state"
+      or message contains "MSAL"
+   | project timestamp, message, severityLevel
+   | order by timestamp desc
+   ```
+
+3. **Check Entra client secret expiry:**
+   - Azure Portal → App Registrations → Your App → Certificates & secrets
+   - Secrets expire after 6-24 months depending on configuration
+
+4. **Check redirect URI configuration:**
+   - Production URI must match exactly: `https://api.pricescout.io/api/v1/auth/entra/callback`
+   - Check `ALLOWED_REDIRECT_DOMAINS` env var
 
 **Resolution:**
-- Rotate Entra ID client secret if expired
-- Verify redirect URIs match deployment URL
-- Check `ENTRA_ENABLED` environment variable
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| "Invalid or expired state parameter" | CSRF protection triggered or session timeout | User should restart login flow |
+| "Token has invalid audience" | Wrong ENTRA_CLIENT_ID | Verify client ID matches app registration |
+| "Token from unauthorized tenant" | Wrong ENTRA_TENANT_ID | Verify tenant ID matches Azure AD |
+| "Authentication failed" after redirect | Client secret expired | Rotate secret in Azure Portal, update Key Vault |
+| "Entra ID not enabled" | ENTRA_ENABLED=false | Set to true and ensure all config vars set |
+
+**Rotate Entra ID Client Secret:**
+```powershell
+# 1. Generate new secret in Azure Portal
+# Azure Portal → App Registrations → Your App → Certificates & secrets → New client secret
+
+# 2. Update in Key Vault
+az keyvault secret set --vault-name kv-pricescout-prod \
+  --name EntraClientSecret --value "<new-secret>"
+
+# 3. Restart app to pick up new secret
+az webapp restart --name app-pricescout-prod --resource-group rg-pricescout-prod
+```
+
+---
+
+### Issue: Trace ID Not Correlating
+
+**Symptoms:** Can't find related logs, distributed traces broken
+
+**Diagnosis:**
+1. Check `X-Request-ID` header in response
+2. Check `X-Trace-ID` header in response
+3. Query App Insights with trace ID
+
+**Resolution:**
+```kusto
+# Find all logs for a specific request
+traces
+| where customDimensions["request_id"] == "<your-request-id>"
+| order by timestamp asc
+```
 
 ---
 
@@ -362,16 +421,33 @@ az sql db restore --dest-name pricescout-restored \
 
 ## Appendix: Environment Variables
 
+### Core Configuration
+
 | Variable | Purpose | Source |
 |----------|---------|--------|
 | `DATABASE_URL` | SQL connection string | Key Vault |
 | `SECRET_KEY` | Session encryption | Key Vault |
 | `OMDB_API_KEY` | Film metadata API | Key Vault |
-| `ENTRA_CLIENT_ID` | SSO app ID | Key Vault |
-| `ENTRA_CLIENT_SECRET` | SSO secret | Key Vault |
-| `ENTRA_TENANT_ID` | Azure AD tenant | Key Vault |
 | `APPLICATIONINSIGHTS_CONNECTION_STRING` | Telemetry | App Settings |
+
+### Entra ID Authentication (February 2026)
+
+| Variable | Purpose | Source |
+|----------|---------|--------|
+| `ENTRA_ENABLED` | Enable/disable Entra SSO (`true`/`false`) | App Settings |
+| `ENTRA_CLIENT_ID` | Azure AD app registration client ID | Key Vault |
+| `ENTRA_CLIENT_SECRET` | Azure AD app client secret | Key Vault |
+| `ENTRA_TENANT_ID` | Azure AD tenant ID | Key Vault |
+| `ENTRA_REDIRECT_URI` | OAuth callback URL | App Settings |
+| `ALLOWED_REDIRECT_DOMAINS` | Comma-separated domain allowlist for redirects | App Settings |
+
+### Telemetry & Tracing
+
+| Variable | Purpose | Source |
+|----------|---------|--------|
+| `APP_NAME` | Service name for traces | App Settings |
+| `APP_VERSION` | Service version for traces | App Settings |
 
 ---
 
-*Last updated: November 28, 2025*
+*Last updated: February 5, 2026*

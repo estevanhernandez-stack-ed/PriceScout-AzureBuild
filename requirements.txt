@@ -39,14 +39,18 @@ alembic>=1.12.0,<2.0.0         # Database migrations
 # === SECURITY ===
 bcrypt>=4.0.0,<6.0.0           # Password hashing (industry standard)
 python-jose[cryptography]>=3.3.0 # JWT library for API authentication
+PyJWT>=2.8.0,<3.0.0            # JWT validation with JWKS support (Entra ID tokens)
 
 
 # === AZURE CLOUD ===
 azure-identity>=1.15.0,<2.0.0  # Azure authentication (Managed Identity)
 azure-keyvault-secrets>=4.7.0,<5.0.0  # Azure Key Vault integration
 opentelemetry-distro>=0.40b0    # OpenTelemetry distribution for Azure Monitor
+azure-monitor-opentelemetry-exporter>=1.0.0b21  # Azure Monitor trace exporter
 azure-servicebus>=7.11.0       # Azure Service Bus for messaging
 opentelemetry-instrumentation-fastapi>=0.40b0 # FastAPI instrumentation for OpenTelemetry
+opentelemetry-instrumentation-httpx>=0.40b0  # httpx instrumentation for trace propagation
+opentelemetry-instrumentation-requests>=0.40b0  # requests instrumentation for trace propagation
 msal>=1.24.0                     # Microsoft Authentication Library for Entra ID
 
 # === DATE/TIME ===
