@@ -24,6 +24,12 @@ htmlcov/
 *.swp
 *.swo
 
+# AI/IDE tooling
+.claude/
+.claudeignore
+.cursor/
+.copilot/
+
 # Environment
 .env
 .env.local
@@ -58,10 +64,13 @@ frontend/test-results/
 tmp/
 temp/
 *.tmp
+tmpclaude-*/
 openapi_temp.json
 openapi_new.json
 openapi8001.json
 *openapi_check*
+repair_queue.json
+profiles_check.json
 
 # Debug
 debug/
@@ -70,4 +79,27 @@ debug_snapshots/
 # Reports (generated)
 reports/*.html
 reports/*.pdf
+reports/*.csv
+reports/*.log
 test_reports/
+
+# Internal docs (remediation plans, gap analyses, code reviews)
+docs/*REMEDIATION*.md
+docs/ACCORDS_GAP_ANALYSIS.md
+docs/CODE_REVIEW_PROMPT.md
+docs/ENTTELLIGENCE_GAP_ANALYSIS.md
+docs/Remediation*
+docs/archive/
+frontend/ACCORDS_REMEDIATION_CHECKLIST.md
+
+# One-off scripts (debug, probe, test)
+scripts/probe_*.py
+scripts/debug_*.py
+scripts/auto_debug*.py
+
+# Local dev process management
+check_procs.ps1
+kill_port*.ps1
+restart_*.ps1
+stop_api.ps1
+start_dev.*
