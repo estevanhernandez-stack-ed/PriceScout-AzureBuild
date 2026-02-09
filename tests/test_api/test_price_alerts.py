@@ -286,11 +286,17 @@ class TestPriceBaselines:
             assert response.status_code == 200
 
     def test_create_baseline(self, test_client_as_admin, sample_price_baseline):
-        """Should create a new baseline."""
+        """Should create a new baseline (no existing match)."""
         with patch('api.routers.price_alerts.get_session') as mock_session:
             session_mock = MagicMock()
             mock_session.return_value.__enter__ = MagicMock(return_value=session_mock)
             mock_session.return_value.__exit__ = MagicMock(return_value=False)
+
+            # Mock query chain: no existing baseline found
+            query_mock = MagicMock()
+            session_mock.query.return_value = query_mock
+            query_mock.filter.return_value = query_mock
+            query_mock.first.return_value = None  # No existing baseline
 
             # Mock PriceBaseline to be added
             def mock_add(obj):

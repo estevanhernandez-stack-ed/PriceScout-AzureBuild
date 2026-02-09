@@ -862,33 +862,71 @@ async def create_price_baseline(
     current_user: dict = Depends(require_operator)
 ):
     """
-    Create a new price baseline for surge detection.
+    Create or update a price baseline for surge detection.
+
+    If an active baseline already exists for the same (theater, ticket_type, format, daypart),
+    it is updated in place instead of creating a duplicate.
     """
     try:
         from app.db_models import PriceBaseline
         from decimal import Decimal
+        from sqlalchemy import and_
 
         with get_session() as session:
             company_id = current_user.get("company_id") or current_user.get("default_company_id") or 1
 
-            baseline = PriceBaseline(
-                company_id=company_id,
-                theater_name=request.theater_name,
-                ticket_type=normalize_ticket_type(request.ticket_type) or request.ticket_type,
-                format=request.format,
-                daypart=normalize_daypart(request.daypart),
-                day_type=request.day_type,
-                baseline_price=Decimal(str(request.baseline_price)),
-                effective_from=request.effective_from,
-                effective_to=request.effective_to,
-                created_by=current_user.get("user_id")
-            )
-            session.add(baseline)
+            norm_ticket = normalize_ticket_type(request.ticket_type) or request.ticket_type
+            norm_daypart = normalize_daypart(request.daypart)
+
+            # Check for existing active baseline with same dimensions
+            filters = [
+                PriceBaseline.company_id == company_id,
+                PriceBaseline.theater_name == request.theater_name,
+                PriceBaseline.ticket_type == norm_ticket,
+                PriceBaseline.effective_to.is_(None),
+            ]
+            if request.format:
+                filters.append(PriceBaseline.format == request.format)
+            else:
+                filters.append(PriceBaseline.format.is_(None))
+            if norm_daypart:
+                filters.append(PriceBaseline.daypart == norm_daypart)
+            else:
+                filters.append(PriceBaseline.daypart.is_(None))
+
+            existing = session.query(PriceBaseline).filter(and_(*filters)).first()
+
+            if existing:
+                # Update existing baseline in place
+                existing.baseline_price = Decimal(str(request.baseline_price))
+                existing.effective_from = request.effective_from
+                existing.effective_to = request.effective_to
+                existing.day_type = request.day_type
+                baseline = existing
+                event_type = "update_price_baseline"
+            else:
+                baseline = PriceBaseline(
+                    company_id=company_id,
+                    theater_name=request.theater_name,
+                    ticket_type=norm_ticket,
+                    format=request.format,
+                    daypart=norm_daypart,
+                    day_type=request.day_type,
+                    baseline_price=Decimal(str(request.baseline_price)),
+                    effective_from=request.effective_from,
+                    effective_to=request.effective_to,
+                    source='manual',
+                    tax_status='inclusive',
+                    created_by=current_user.get("user_id")
+                )
+                session.add(baseline)
+                event_type = "create_price_baseline"
+
             session.flush()
 
-            # Audit baseline creation
+            # Audit baseline creation/update
             audit_service.data_event(
-                event_type="create_price_baseline",
+                event_type=event_type,
                 user_id=current_user.get("user_id"),
                 username=current_user.get("username"),
                 company_id=company_id,
@@ -900,7 +938,7 @@ async def create_price_baseline(
                 }
             )
 
-            logger.info(f"Price baseline created: {baseline.theater_name} {baseline.ticket_type} ({baseline.day_type or 'all'}) = ${baseline.baseline_price}")
+            logger.info(f"Price baseline {event_type.split('_')[0]}d: {baseline.theater_name} {baseline.ticket_type} ({baseline.day_type or 'all'}) = ${baseline.baseline_price}")
 
             return PriceBaselineResponse(
                 baseline_id=baseline.baseline_id,
@@ -1686,8 +1724,7 @@ async def discover_enttelligence_baselines(
         from datetime import timedelta
 
         company_id = current_user.get("company_id") or current_user.get("default_company_id") or 1
-        print(f"[DISCOVERY DEBUG] company_id={company_id}, user={current_user.get('username')}", flush=True)
-        logger.info(f"[DISCOVERY DEBUG] company_id={company_id}, user={current_user.get('username')}")
+        logger.debug(f"Discovery: company_id={company_id}, user={current_user.get('username')}")
 
         # Debug: Check cache data availability
         with get_session() as debug_session:
@@ -1697,8 +1734,7 @@ async def discover_enttelligence_baselines(
                 EntTelligencePriceCache.play_date >= cutoff,
                 EntTelligencePriceCache.price > 0
             ).scalar()
-            print(f"[DISCOVERY DEBUG] Cache records for company_id={company_id}, lookback={lookback_days}d: {cache_count}", flush=True)
-            logger.info(f"[DISCOVERY DEBUG] Cache records for company_id={company_id}, lookback={lookback_days}d: {cache_count}")
+            logger.debug(f"Cache records for company_id={company_id}, lookback={lookback_days}d: {cache_count}")
 
         # Parse circuit filter if provided
         circuit_filter = None
@@ -1726,8 +1762,7 @@ async def discover_enttelligence_baselines(
                 split_by_daypart=split_by_daypart,
                 split_by_day_of_week=split_by_day_of_week
             )
-        print(f"[DISCOVERY DEBUG] Found {len(baselines)} baselines", flush=True)
-        logger.info(f"[DISCOVERY DEBUG] Found {len(baselines)} baselines")
+        logger.debug(f"Found {len(baselines)} baselines")
 
         saved_count = None
         if save and baselines:
@@ -2850,44 +2885,11 @@ async def scan_advance_dates_for_surges(
     discount_day_compliance_items = []
     discount_day_violations = 0
 
-    # Daypart thresholds (same as enttelligence_baseline_discovery.py)
-    from datetime import time as dt_time
-    import re
-    MATINEE_CUTOFF = dt_time(17, 0)  # 5:00 PM
-    EVENING_CUTOFF = dt_time(21, 0)  # 9:00 PM
-
-    def normalize_time_string(time_str: str) -> str:
-        """Normalize time string for parsing."""
-        if not isinstance(time_str, str):
-            return ""
-        time_str = time_str.lower().strip().replace('.', '').replace(' ', '')
-        if time_str.endswith('p'):
-            time_str = time_str[:-1] + 'pm'
-        elif time_str.endswith('a'):
-            time_str = time_str[:-1] + 'am'
-        match = re.match(r'^(\d):(\d{2}(?:am|pm))$', time_str)
-        if match:
-            time_str = f"0{match.group(1)}:{match.group(2)}"
-        return time_str.upper()
-
-    def get_daypart(showtime: str) -> Optional[str]:
-        """Determine daypart from showtime string."""
-        if not showtime:
-            return None
-        try:
-            from datetime import datetime as dt
-            normalized = normalize_time_string(showtime)
-            if not normalized:
-                return None
-            time_obj = dt.strptime(normalized, "%I:%M%p").time()
-            if time_obj < MATINEE_CUTOFF:
-                return 'matinee'
-            elif time_obj < EVENING_CUTOFF:
-                return 'evening'
-            else:
-                return 'late'
-        except (ValueError, AttributeError):
-            return None
+    # Use shared daypart classifier (canonical: Matinee/Twilight/Prime/Late Night)
+    from app.simplified_baseline_service import (
+        classify_daypart, normalize_daypart as _normalize_daypart,
+        normalize_ticket_type as _normalize_ticket_type,
+    )
 
     with get_session() as session:
         # Load active baselines into a lookup dict
@@ -2901,34 +2903,37 @@ async def scan_advance_dates_for_surges(
             )
         ).all()
 
-        # Build baseline lookup with support for day_of_week:
-        # {theater_name: {ticket_type: {format: {day_key: {daypart: baseline}}}}}
-        # day_key can be:
-        #   - 'dow_0' to 'dow_6' for day_of_week baselines (0=Monday, 6=Sunday)
-        #   - 'weekday' or 'weekend' for day_type baselines
-        #   - '*' for wildcard (applies to all days)
-        baseline_lookup = {}
+        # Build flat baseline cache keyed by: "theater|ticket_type|format|daypart"
+        # Matches AlertService._find_baseline() pattern. day_of_week is deprecated
+        # (all baselines have day_of_week=NULL after dedup migration).
+        baseline_cache: dict[str, PriceBaseline] = {}
         for bl in baselines_query:
-            if bl.theater_name not in baseline_lookup:
-                baseline_lookup[bl.theater_name] = {}
-            if bl.ticket_type not in baseline_lookup[bl.theater_name]:
-                baseline_lookup[bl.theater_name][bl.ticket_type] = {}
-            format_key = bl.format or '*'
-            if format_key not in baseline_lookup[bl.theater_name][bl.ticket_type]:
-                baseline_lookup[bl.theater_name][bl.ticket_type][format_key] = {}
+            fmt = bl.format or '*'
+            # Normalize format: "Standard" → "2D"
+            if fmt.lower() == 'standard':
+                fmt = '2D'
+            dp = bl.daypart or '*'
+            key = f"{bl.theater_name}|{bl.ticket_type}|{fmt}|{dp}"
+            existing = baseline_cache.get(key)
+            if not existing or (bl.sample_count or 0) > (existing.sample_count or 0):
+                baseline_cache[key] = bl
 
-            # Determine day key: day_of_week takes precedence over day_type
-            if bl.day_of_week is not None:
-                day_key = f'dow_{bl.day_of_week}'  # e.g., 'dow_0' for Monday
-            elif bl.day_type:
-                day_key = bl.day_type  # 'weekday' or 'weekend'
-            else:
-                day_key = '*'
-
-            if day_key not in baseline_lookup[bl.theater_name][bl.ticket_type][format_key]:
-                baseline_lookup[bl.theater_name][bl.ticket_type][format_key][day_key] = {}
-            daypart_key = bl.daypart or '*'
-            baseline_lookup[bl.theater_name][bl.ticket_type][format_key][day_key][daypart_key] = bl
+        def find_baseline(theater: str, ticket_type: str, fmt: str, daypart: Optional[str]) -> Optional[PriceBaseline]:
+            """Find best matching baseline with wildcard fallback."""
+            fmt_norm = fmt or '*'
+            if fmt_norm.lower() == 'standard':
+                fmt_norm = '2D'
+            dp = daypart or '*'
+            # Try most specific → most general (same order as AlertService)
+            for key in [
+                f"{theater}|{ticket_type}|{fmt_norm}|{dp}",
+                f"{theater}|{ticket_type}|{fmt_norm}|*",
+                f"{theater}|{ticket_type}|*|{dp}",
+                f"{theater}|{ticket_type}|*|*",
+            ]:
+                if key in baseline_cache:
+                    return baseline_cache[key]
+            return None
 
         # Load company profiles for discount day awareness
         # Build a lookup: {circuit_name: {day_of_week: discount_price}}
@@ -3017,58 +3022,39 @@ async def scan_advance_dates_for_surges(
 
             circuits_scanned.add(circuit_name or "Unknown")
 
-            # Determine day_of_week (0=Monday, 6=Sunday), day type, and daypart
+            # Determine day_of_week and daypart using canonical classifier
             day_of_week_val = play_date_val.weekday()
             day_type = get_day_type(play_date_val)
-            daypart = get_daypart(showtime)
+            daypart = classify_daypart(showtime)
 
-            # Find matching baseline (try specific then general for all dimensions)
-            baseline = None
+            # Normalize ticket type before lookup (e.g., 'early bird' → 'Early Bird')
+            norm_ticket = _normalize_ticket_type(ticket_type) or ticket_type
 
-            if theater_name in baseline_lookup:
-                theater_baselines = baseline_lookup[theater_name]
-                # Try ticket type and its equivalents (e.g., Adult <-> General Admission)
-                ticket_types_to_try = get_equivalent_ticket_types(ticket_type)
-                for tt in ticket_types_to_try:
-                    if tt in theater_baselines:
-                        ticket_baselines = theater_baselines[tt]
-
-                        # Try format-specific first, equivalents, then wildcard
-                        fmt_key = format_type or '*'
-                        format_keys_to_try = get_equivalent_formats(fmt_key) + ['*'] if fmt_key != '*' else ['*']
-                        for fk in format_keys_to_try:
-                            if fk in ticket_baselines:
-                                # Try day keys in order of specificity:
-                                # 1. day_of_week specific (e.g., 'dow_1' for Tuesday)
-                                # 2. day_type (weekday/weekend)
-                                # 3. wildcard (*)
-                                day_keys_to_try = [f'dow_{day_of_week_val}', day_type, '*']
-                                for dk in day_keys_to_try:
-                                    if dk in ticket_baselines[fk]:
-                                        # Try daypart-specific first, then wildcard
-                                        daypart_keys_to_try = [daypart, '*'] if daypart else ['*']
-                                        for dpk in daypart_keys_to_try:
-                                            if dpk in ticket_baselines[fk][dk]:
-                                                baseline = ticket_baselines[fk][dk][dpk]
-                                                break
-                                        if baseline:
-                                            break
-                                if baseline:
-                                    break
+            # Find matching baseline using simplified flat cache with wildcard fallback.
+            # Try normalized ticket type first, then equivalent types (Adult ↔ General Admission).
+            baseline = find_baseline(theater_name, norm_ticket, format_type, daypart)
+            if not baseline:
+                for equiv_tt in get_equivalent_ticket_types(norm_ticket)[1:]:
+                    baseline = find_baseline(theater_name, equiv_tt, format_type, daypart)
                     if baseline:
                         break
 
             if not baseline:
                 continue  # No baseline to compare
 
-            # Calculate surge
-            # Baselines are tax-inclusive; EntTelligence cache prices are pre-tax
-            # Normalize to tax-inclusive for apples-to-apples comparison
+            # Tax-aware price comparison:
+            # - 'exclusive' baselines (Marcus/MT/Cinemark ENT) are pre-tax → compare directly
+            # - 'inclusive' baselines (AMC/Regal/Fandango) are tax-inclusive → add tax to ENT price
             baseline_price = float(baseline.baseline_price)
-            ent_tax_rate = get_tax_rate_for_theater(
-                tax_config, theater_states.get(theater_name), theater_name=theater_name
-            )
-            current_price = apply_estimated_tax(float(price), ent_tax_rate)
+            if hasattr(baseline, 'tax_status') and baseline.tax_status == 'exclusive':
+                # Both baseline and ENT cache are pre-tax — compare directly
+                current_price = float(price)
+            else:
+                # Baseline is tax-inclusive, ENT cache is pre-tax — add tax to ENT
+                ent_tax_rate = get_tax_rate_for_theater(
+                    tax_config, theater_states.get(theater_name), theater_name=theater_name
+                )
+                current_price = apply_estimated_tax(float(price), ent_tax_rate)
 
             if baseline_price <= 0:
                 continue
@@ -3260,15 +3246,37 @@ async def check_new_films_for_surges(
             )
         ).all()
 
-        baseline_lookup = {}
+        # Build flat baseline cache (same pattern as advance scanner)
+        from app.simplified_baseline_service import (
+            classify_daypart as _classify_daypart_nf,
+            normalize_ticket_type as _normalize_tt_nf,
+        )
+        baseline_cache_nf: dict[str, PriceBaseline] = {}
         for bl in baselines_query:
-            if bl.theater_name not in baseline_lookup:
-                baseline_lookup[bl.theater_name] = {}
-            if bl.ticket_type not in baseline_lookup[bl.theater_name]:
-                baseline_lookup[bl.theater_name][bl.ticket_type] = {}
-            format_key = bl.format or '*'
-            if format_key not in baseline_lookup[bl.theater_name][bl.ticket_type]:
-                baseline_lookup[bl.theater_name][bl.ticket_type][format_key] = bl
+            fmt = bl.format or '*'
+            if fmt.lower() == 'standard':
+                fmt = '2D'
+            dp = bl.daypart or '*'
+            key = f"{bl.theater_name}|{bl.ticket_type}|{fmt}|{dp}"
+            existing = baseline_cache_nf.get(key)
+            if not existing or (bl.sample_count or 0) > (existing.sample_count or 0):
+                baseline_cache_nf[key] = bl
+
+        def find_baseline_nf(theater: str, ticket_type: str, fmt: str, daypart: Optional[str] = None) -> Optional[PriceBaseline]:
+            """Find best matching baseline with wildcard fallback."""
+            fmt_norm = fmt or '*'
+            if fmt_norm.lower() == 'standard':
+                fmt_norm = '2D'
+            dp = daypart or '*'
+            for key in [
+                f"{theater}|{ticket_type}|{fmt_norm}|{dp}",
+                f"{theater}|{ticket_type}|{fmt_norm}|*",
+                f"{theater}|{ticket_type}|*|{dp}",
+                f"{theater}|{ticket_type}|*|*",
+            ]:
+                if key in baseline_cache_nf:
+                    return baseline_cache_nf[key]
+            return None
 
         # Load company profiles for discount day awareness
         profiles = session.query(CompanyProfile).filter(
@@ -3321,20 +3329,12 @@ async def check_new_films_for_surges(
             theater_name, circuit_name, film_title, play_date_val, ticket_type, format_type, price, created_at, is_presale = row
             films_checked.add(film_title)
 
-            # Find matching baseline (with ticket type equivalence mapping)
-            baseline = None
-            if theater_name in baseline_lookup:
-                theater_baselines = baseline_lookup[theater_name]
-                ticket_types_to_try = get_equivalent_ticket_types(ticket_type)
-                for tt in ticket_types_to_try:
-                    if tt in theater_baselines:
-                        ticket_baselines = theater_baselines[tt]
-                        fmt_key = format_type or '*'
-                        format_keys = get_equivalent_formats(fmt_key) + ['*'] if fmt_key != '*' else ['*']
-                        for fk in format_keys:
-                            if fk in ticket_baselines:
-                                baseline = ticket_baselines[fk]
-                                break
+            # Normalize ticket type and find matching baseline
+            norm_ticket = _normalize_tt_nf(ticket_type) or ticket_type
+            baseline = find_baseline_nf(theater_name, norm_ticket, format_type)
+            if not baseline:
+                for equiv_tt in get_equivalent_ticket_types(norm_ticket)[1:]:
+                    baseline = find_baseline_nf(theater_name, equiv_tt, format_type)
                     if baseline:
                         break
 
@@ -3349,14 +3349,15 @@ async def check_new_films_for_surges(
                     if float(price) <= discount_price * 1.05:
                         continue  # Skip discount day pricing
 
-            # Calculate surge
-            # Baselines are tax-inclusive; EntTelligence cache prices are pre-tax
-            # Normalize to tax-inclusive for apples-to-apples comparison
+            # Tax-aware price comparison (same logic as advance scanner)
             baseline_price = float(baseline.baseline_price)
-            ent_tax_rate = get_tax_rate_for_theater(
-                tax_config, theater_states.get(theater_name), theater_name=theater_name
-            )
-            current_price = apply_estimated_tax(float(price), ent_tax_rate)
+            if hasattr(baseline, 'tax_status') and baseline.tax_status == 'exclusive':
+                current_price = float(price)
+            else:
+                ent_tax_rate = get_tax_rate_for_theater(
+                    tax_config, theater_states.get(theater_name), theater_name=theater_name
+                )
+                current_price = apply_estimated_tax(float(price), ent_tax_rate)
 
             if baseline_price <= 0:
                 continue

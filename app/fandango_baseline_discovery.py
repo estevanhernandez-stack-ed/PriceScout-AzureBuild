@@ -96,7 +96,7 @@ class FandangoBaselineDiscoveryService:
         exclude_premium: bool = False,
         exclude_event_cinema: bool = True,
         theater_filter: Optional[List[str]] = None,
-        split_by_day_of_week: bool = True,
+        split_by_day_of_week: bool = False,
     ) -> List[Dict]:
         """
         Discover baselines from Fandango scraped price data.
@@ -519,11 +519,16 @@ class FandangoBaselineDiscoveryService:
 
                 if existing:
                     if overwrite:
-                        # End the existing baseline
-                        existing.effective_to = effective_from - timedelta(days=1)
-                    else:
-                        # Skip - baseline already exists
-                        continue
+                        # Update existing baseline in place (prevents row duplication)
+                        existing.baseline_price = Decimal(str(baseline_data['baseline_price']))
+                        existing.effective_from = effective_from
+                        existing.source = 'fandango'
+                        existing.tax_status = 'inclusive'
+                        existing.sample_count = baseline_data.get('sample_count')
+                        existing.last_discovery_at = datetime.now(UTC)
+                        saved_count += 1
+                    # Skip if not overwriting - baseline already exists
+                    continue
 
                 # Create new baseline
                 # Fandango prices are already tax-inclusive (customer-facing)
@@ -541,6 +546,7 @@ class FandangoBaselineDiscoveryService:
                     source='fandango',
                     tax_status='inclusive',
                     sample_count=baseline_data.get('sample_count'),
+                    last_discovery_at=datetime.now(UTC),
                 )
                 session.add(new_baseline)
                 saved_count += 1
@@ -557,7 +563,7 @@ def discover_fandango_baselines(
     company_id: int,
     min_samples: int = 3,
     lookback_days: int = 90,
-    split_by_day_of_week: bool = True,
+    split_by_day_of_week: bool = False,
     save: bool = False
 ) -> List[Dict]:
     """

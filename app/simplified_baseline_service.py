@@ -100,6 +100,60 @@ def normalize_daypart(raw: Optional[str]) -> Optional[str]:
     return DAYPART_NORMALIZE.get(raw.lower(), raw)
 
 
+def classify_daypart(time_str: str) -> Optional[str]:
+    """Classify a showtime string into a canonical daypart.
+
+    Parses time strings like '7:30PM', '2:00 PM', '19:30' and returns
+    one of: 'Matinee', 'Twilight', 'Prime', 'Late Night'.
+
+    Cutoffs (matching enttelligence_baseline_discovery.py):
+    - Matinee: before 4:00 PM
+    - Twilight: 4:00 PM - 6:00 PM
+    - Prime: 6:00 PM - 9:00 PM
+    - Late Night: 9:00 PM and after
+    """
+    if not time_str or not isinstance(time_str, str):
+        return None
+    try:
+        from datetime import time as dt_time
+        import re as _re
+
+        cleaned = time_str.lower().strip().replace('.', '').replace(' ', '')
+        # Fix truncated am/pm
+        if cleaned.endswith('p') and not cleaned.endswith('pm'):
+            cleaned = cleaned[:-1] + 'pm'
+        elif cleaned.endswith('a') and not cleaned.endswith('am'):
+            cleaned = cleaned[:-1] + 'am'
+        # Zero-pad single-digit hours: "7:30pm" → "07:30pm"
+        match = _re.match(r'^(\d):(\d{2}(?:am|pm))$', cleaned)
+        if match:
+            cleaned = f"0{match.group(1)}:{match.group(2)}"
+        cleaned = cleaned.upper()
+
+        # Try 12-hour format first, then 24-hour
+        time_obj = None
+        from datetime import datetime as _dt
+        for fmt in ("%I:%M%p", "%H:%M"):
+            try:
+                time_obj = _dt.strptime(cleaned, fmt).time()
+                break
+            except ValueError:
+                continue
+        if time_obj is None:
+            return None
+
+        if time_obj < dt_time(16, 0):
+            return 'Matinee'
+        elif time_obj < dt_time(18, 0):
+            return 'Twilight'
+        elif time_obj < dt_time(21, 0):
+            return 'Prime'
+        else:
+            return 'Late Night'
+    except (ValueError, AttributeError):
+        return None
+
+
 # Normalize ticket type typos and case inconsistencies.
 # Only normalizes clear-cut duplicates — does NOT merge Adult/General Admission
 # as those have different price points at the same theater.

@@ -940,11 +940,15 @@ class EntTelligenceBaselineDiscoveryService:
 
                 if existing:
                     if overwrite:
-                        # End the existing baseline
-                        existing.effective_to = effective_from - timedelta(days=1)
-                    else:
-                        # Skip - baseline already exists
-                        continue
+                        # Update existing baseline in place (prevents row duplication)
+                        existing.baseline_price = Decimal(str(final_price))
+                        existing.effective_from = effective_from
+                        existing.sample_count = baseline_data.get('sample_count')
+                        existing.last_discovery_at = datetime.now(UTC)
+                        existing.tax_status = 'inclusive' if tax_enabled else 'exclusive'
+                        saved_count += 1
+                    # Skip if not overwriting - baseline already exists
+                    continue
 
                 # Create new baseline with tax-inclusive price
                 new_baseline = PriceBaseline(
@@ -959,7 +963,7 @@ class EntTelligenceBaselineDiscoveryService:
                     effective_from=effective_from,
                     effective_to=None,  # Active
                     source='enttelligence',
-                    tax_status='inclusive',
+                    tax_status='inclusive' if tax_enabled else 'exclusive',
                     sample_count=baseline_data.get('sample_count'),
                     last_discovery_at=datetime.now(UTC),
                 )
