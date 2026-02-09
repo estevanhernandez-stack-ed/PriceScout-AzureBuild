@@ -180,13 +180,18 @@ async def list_price_alerts(
             # Get paginated results
             alerts_data = query.order_by(PriceAlertModel.triggered_at.desc()).offset(offset).limit(limit).all()
 
+            # Batch-fetch acknowledger usernames (avoid N+1 query)
+            user_ids = {r.acknowledged_by for r in alerts_data if r.acknowledged_by}
+            users_map = {}
+            if user_ids:
+                users_map = {
+                    u.user_id: u.username
+                    for u in session.query(UserModel).filter(UserModel.user_id.in_(user_ids)).all()
+                }
+
             alerts = []
             for row in alerts_data:
-                # Get acknowledger username if exists
-                acknowledged_by_name = None
-                if row.acknowledged_by:
-                    user = session.query(UserModel).filter(UserModel.user_id == row.acknowledged_by).first()
-                    acknowledged_by_name = user.username if user else None
+                acknowledged_by_name = users_map.get(row.acknowledged_by) if row.acknowledged_by else None
 
                 # Get showtime from related Showing if available
                 showtime = row.showing.showtime if row.showing else None

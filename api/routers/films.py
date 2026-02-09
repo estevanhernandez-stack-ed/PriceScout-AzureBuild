@@ -12,11 +12,16 @@ Endpoints:
 
 from fastapi import APIRouter, Security, HTTPException, Query, BackgroundTasks
 from api.routers.auth import get_current_user, User
-from app import db_adapter as database
 from app import config
+from app.db.films import get_all_films_for_enrichment, get_film_metadata
+from app.db.film_enrichment import backfill_film_details_from_fandango_single, enrich_new_films
+from app.db.utils import run_async_safe
 from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime
+import logging
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -50,8 +55,8 @@ async def get_films(
     Get all films in the database for the current company.
     """
     try:
-        # database.get_all_films_for_enrichment returns a list of dicts
-        films_data = database.get_all_films_for_enrichment()
+        # get_all_films_for_enrichment returns a list of dicts
+        films_data = get_all_films_for_enrichment()
         
         # Convert to Pydantic models
         films = []
@@ -61,6 +66,7 @@ async def get_films(
             films.append(FilmMetadata(**cleaned_f))
         return films
     except Exception as e:
+        logger.exception("Failed to list films: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/films/{film_title}", response_model=FilmMetadata, tags=["Films"])
@@ -71,10 +77,10 @@ async def get_film(
     """
     Get metadata for a specific film.
     """
-    metadata = database.get_film_metadata(film_title)
+    metadata = get_film_metadata(film_title)
     if not metadata:
         raise HTTPException(status_code=404, detail=f"Film '{film_title}' not found.")
-    
+
     # Handle possible N/A strings
     cleaned_m = {k: (None if v == 'N/A' else v) for k, v in metadata.items()}
     return FilmMetadata(**cleaned_m)
@@ -89,14 +95,12 @@ async def enrich_film(
     Trigger OMDb and Fandango enrichment for a specific film.
     """
     try:
-        from app.db_adapter import backfill_film_details_from_fandango_single
-        
         # We'll run it synchronously for now since it's a single film and quick
         # But for high volume, BackgroundTasks would be better.
         updated = backfill_film_details_from_fandango_single(film_title)
-        
+
         if updated:
-            metadata = database.get_film_metadata(film_title)
+            metadata = get_film_metadata(film_title)
             cleaned_m = {k: (None if v == 'N/A' else v) for k, v in metadata.items()}
             return EnrichResponse(
                 success=True,
@@ -109,6 +113,7 @@ async def enrich_film(
                 message=f"Could not find OMDb or Fandango details for '{film_title}'."
             )
     except Exception as e:
+        logger.exception("Failed to enrich film '%s': %s", film_title, e)
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/films/discover/fandango", tags=["Films"])
@@ -121,14 +126,10 @@ async def discover_fandango(
     Runs in the background.
     """
     try:
-        from app.modes.poster_mode import discover_and_enrich_films_from_fandango
-        # Note: discover_and_enrich_films_from_fandango is async-in-thread in Streamlit
-        # We need a non-Streamlit version or just wrap it.
-        # Actually, let's just use the logic directly or move it to db_adapter.
-        
         background_tasks.add_task(_run_fandango_discovery)
         return {"message": "Fandango discovery started in background."}
     except Exception as e:
+        logger.exception("Failed to start Fandango discovery: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 def _run_fandango_discovery():
@@ -144,10 +145,10 @@ def _run_fandango_discovery():
         titles = [f.get('film_title') for f in films if f.get('film_title')]
         
         if titles:
-            print(f"  [Discovery] Found {len(titles)} titles. Passing to enrichment pipeline...")
+            logger.info(f"Found {len(titles)} titles. Passing to enrichment pipeline...")
             # 3. Use the centralized enrichment logic (which now has Fandango fallback)
             # This is already running in a background thread, so we can call sync
-            database.enrich_new_films(titles, async_mode=False)
-                    
+            enrich_new_films(titles, async_mode=False)
+
     # Playwright needs its own loop
-    database.run_async_safe(run())
+    run_async_safe(run())

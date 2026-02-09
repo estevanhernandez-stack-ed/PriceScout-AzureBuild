@@ -10,8 +10,11 @@ This module manages application configuration with support for:
 - Automatic deployment detection
 """
 
+import logging
 import os
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 # ============================================================================
 # EARLY .ENV LOADING (must happen before any os.getenv() calls)
@@ -39,7 +42,7 @@ def _early_load_env():
                         if key and not os.getenv(key):  # Don't override existing
                             os.environ[key] = value
     except Exception as e:
-        print(f"Warning: Failed to load .env: {e}")
+        logger.warning(f"Failed to load .env: {e}")
 
 # Load .env FIRST before anything else
 _early_load_env()
@@ -128,6 +131,12 @@ POSTGRES_PORT = int(os.getenv('POSTGRES_PORT', '5432'))
 POSTGRES_DB = os.getenv('POSTGRES_DB', 'pricescout_db')
 POSTGRES_USER = os.getenv('POSTGRES_USER', 'pricescout_app')
 POSTGRES_PASSWORD = os.getenv('POSTGRES_PASSWORD', '')
+
+# Connection pool tuning (PostgreSQL / MSSQL only)
+DB_POOL_SIZE = int(os.getenv('DB_POOL_SIZE', '20'))
+DB_MAX_OVERFLOW = int(os.getenv('DB_MAX_OVERFLOW', '30'))
+DB_POOL_RECYCLE = int(os.getenv('DB_POOL_RECYCLE', '1800'))  # seconds
+DB_CONNECT_TIMEOUT = int(os.getenv('DB_CONNECT_TIMEOUT', '10'))  # seconds
 
 # Current company context (for multi-tenancy)
 CURRENT_COMPANY_ID = None  # Set by application after user login
@@ -222,7 +231,7 @@ AUTO_SYNC_DAYS_FORWARD = int(os.getenv('AUTO_SYNC_DAYS_FORWARD', '1'))
 # ============================================================================
 from fastapi.security import OAuth2PasswordBearer
 
-SECRET_KEY = os.getenv("SECRET_KEY", "a_very_secret_key_that_should_be_changed")
+SECRET_KEY = os.getenv("SECRET_KEY", "")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 OAUTH2_SCHEME = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/token")
@@ -242,7 +251,7 @@ HOST = os.getenv('HOST', '0.0.0.0')  # 0.0.0.0 for container, localhost for loca
 PORT = int(os.getenv('PORT', '8000'))  # Azure uses 8000, Streamlit default is 8501
 
 # Security settings
-SECRET_KEY = os.getenv('SECRET_KEY', 'dev-secret-key-change-in-production')
+SECRET_KEY = os.getenv('SECRET_KEY', '')
 JWT_SECRET_KEY = os.getenv('JWT_SECRET_KEY', SECRET_KEY)
 SESSION_TIMEOUT_MINUTES = int(os.getenv('SESSION_TIMEOUT_MINUTES', '60'))
 
@@ -300,6 +309,26 @@ if is_azure_deployment():
 # Scraper rate limiting
 SCRAPER_DELAY_SECONDS = float(os.getenv('SCRAPER_DELAY_SECONDS', '2.0'))
 SCRAPER_MAX_RETRIES = int(os.getenv('SCRAPER_MAX_RETRIES', '3'))
+SCRAPER_RETRY_WAIT_MIN = int(os.getenv('SCRAPER_RETRY_WAIT_MIN', '2'))    # min backoff (seconds)
+SCRAPER_RETRY_WAIT_MAX = int(os.getenv('SCRAPER_RETRY_WAIT_MAX', '10'))   # max backoff (seconds)
+
+# Playwright navigation timeouts (ms)
+SCRAPER_NAV_TIMEOUT = int(os.getenv('SCRAPER_NAV_TIMEOUT', str(PLAYWRIGHT_TIMEOUT)))
+SCRAPER_NAV_TIMEOUT_LONG = int(os.getenv('SCRAPER_NAV_TIMEOUT_LONG', '60000'))
+SCRAPER_NAV_TIMEOUT_MEDIUM = int(os.getenv('SCRAPER_NAV_TIMEOUT_MEDIUM', '45000'))
+
+# Element/JS wait timeouts (ms)
+SCRAPER_ELEMENT_WAIT = int(os.getenv('SCRAPER_ELEMENT_WAIT', '30000'))
+SCRAPER_ELEMENT_WAIT_SHORT = int(os.getenv('SCRAPER_ELEMENT_WAIT_SHORT', '15000'))
+SCRAPER_JS_WAIT = int(os.getenv('SCRAPER_JS_WAIT', '20000'))
+SCRAPER_SELECTOR_WAIT = int(os.getenv('SCRAPER_SELECTOR_WAIT', '10000'))
+
+# Delay durations (seconds — multiply by 1000 for Playwright wait_for_timeout)
+SCRAPER_RENDER_DELAY = float(os.getenv('SCRAPER_RENDER_DELAY', '2.0'))
+SCRAPER_RENDER_DELAY_SHORT = float(os.getenv('SCRAPER_RENDER_DELAY_SHORT', '1.5'))
+SCRAPER_RENDER_DELAY_LONG = float(os.getenv('SCRAPER_RENDER_DELAY_LONG', '5.0'))
+SCRAPER_SCROLL_DELAY = float(os.getenv('SCRAPER_SCROLL_DELAY', '1.0'))
+SCRAPER_RETRY_DELAY = float(os.getenv('SCRAPER_RETRY_DELAY', '3.0'))
 
 
 # ============================================================================
@@ -425,7 +454,7 @@ def load_env_file(env_file='.env'):
                         os.environ[key] = value
         return True
     except Exception as e:
-        print(f"Warning: Failed to load {env_file}: {e}")
+        logger.warning(f"Failed to load {env_file}: {e}")
         return False
 
 
@@ -451,7 +480,7 @@ def load_secrets_from_key_vault():
                     os.environ[env_var_name] = secret_value
             return True
         except Exception as e:
-            print(f"Warning: Failed to load secrets from Key Vault: {e}")
+            logger.warning(f"Failed to load secrets from Key Vault: {e}")
             return False
     return False
 
@@ -472,19 +501,23 @@ if is_azure_deployment():
 try:
     if is_production():
         validate_configuration()
+        if not SECRET_KEY:
+            raise ValueError("SECRET_KEY must be set in production")
 except ValueError as e:
-    print(f"[WARNING] Configuration Warning: {e}")
+    if is_production():
+        raise
+    logger.warning(f"Configuration Warning: {e}")
 
 
-# Print configuration summary on import (debug mode only)
+# Log configuration summary on import (debug mode only)
 if DEBUG:
-    print("\n" + "="*60)
-    print("PriceScout Configuration")
-    print("="*60)
+    logger.debug("\n" + "="*60)
+    logger.debug("PriceScout Configuration")
+    logger.debug("="*60)
     summary = get_config_summary()
     for key, value in summary.items():
-        print(f"  {key:20s}: {value}")
-    print("="*60 + "\n")
+        logger.debug(f"  {key:20s}: {value}")
+    logger.debug("="*60 + "\n")
 
 
 # ============================================================================

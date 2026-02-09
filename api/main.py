@@ -18,7 +18,11 @@ import logging
 from pathlib import Path
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, Request, HTTPException
+# Load .env before anything reads os.getenv (e.g., EntTelligence cache, DB config)
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+
+from fastapi import FastAPI, Request, HTTPException, Security
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
@@ -300,8 +304,8 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         if is_production():
             response.headers["Content-Security-Policy"] = (
                 "default-src 'self'; "
-                "script-src 'self' 'unsafe-inline' 'unsafe-eval'; "  # Needed for Swagger UI
-                "style-src 'self' 'unsafe-inline'; "
+                "script-src 'self'; "
+                "style-src 'self'; "
                 "img-src 'self' data: https:; "
                 "font-src 'self' data:; "
                 "connect-src 'self' https://*.applicationinsights.azure.com https://*.monitor.azure.com; "
@@ -344,8 +348,16 @@ _is_testing = _detect_testing()
 ALLOWED_ORIGINS_ENV = os.getenv("ALLOWED_ORIGINS", "")
 
 if _is_testing:
-    # Testing: allow all origins for test client
-    origins = ["*"]
+    # Testing: restrict to local dev origins (not wildcard)
+    origins = [
+        "http://localhost:3000",
+        "http://localhost:3001",
+        "http://localhost:8000",
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:3001",
+        "http://127.0.0.1:8000",
+        "http://testserver",
+    ]
 elif ALLOWED_ORIGINS_ENV:
     # Production: use explicit list from environment
     origins = [origin.strip() for origin in ALLOWED_ORIGINS_ENV.split(",")]
@@ -631,7 +643,7 @@ async def health_check():
 
 
 @app.get("/api/v1/health/full", tags=["Health"])
-async def full_health_check():
+async def full_health_check(current_user=Security(auth.get_current_user, scopes=["admin"])):
     """
     Comprehensive system health check with component-level details.
 
@@ -972,7 +984,12 @@ async def startup_event():
 
         sync_thread = threading.Thread(target=_background_sync, daemon=True, name="ent-auto-sync")
         sync_thread.start()
+        _background_threads.append(sync_thread)
         logger.info("PriceScout: EntTelligence auto-sync started in background thread (today + 7 days)")
+
+
+# Track background threads for graceful shutdown
+_background_threads: list = []
 
 
 @app.on_event("shutdown")
@@ -982,6 +999,14 @@ async def shutdown_event():
     """
     logger.info("Shutting down PriceScout API")
 
+    # Join background threads with timeout
+    for t in _background_threads:
+        if t.is_alive():
+            logger.info(f"Waiting for background thread '{t.name}' to finish...")
+            t.join(timeout=5)
+            if t.is_alive():
+                logger.warning(f"Background thread '{t.name}' did not finish within 5s timeout")
+
     # Close database connections
     try:
         from app.db_session import close_engine
@@ -989,5 +1014,3 @@ async def shutdown_event():
         logger.info("Database connections closed")
     except Exception as e:
         logger.warning(f"Error closing database: {e}")
-# force reload
-# force reload

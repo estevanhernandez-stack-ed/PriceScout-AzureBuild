@@ -17,19 +17,12 @@ import logging
 import io
 
 logger = logging.getLogger(__name__)
-import sys
 import pandas as pd
 from datetime import datetime
 import time
 from sqlalchemy import func
 from fastapi import APIRouter, HTTPException, Query, Depends, Request, BackgroundTasks
 from fastapi.responses import JSONResponse, StreamingResponse, Response
-
-# Ensure the app package is importable when running from repo root
-from pathlib import Path
-ROOT = Path(__file__).resolve().parents[2]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
 
 from api.schemas import SelectionAnalysisRequest, ShowtimeViewRequest
 from api.unified_auth import require_auth, AuthData
@@ -47,7 +40,9 @@ from app.utils import (
     generate_showtime_html_report,
     generate_showtime_pdf_report,
 )
-from app.db_adapter import get_session, Showing, Film, config
+from app.db_session import get_session
+from app.db_models import Showing, Film
+from app import config
 
 router = APIRouter(prefix="/api/v1/reports", tags=["reports"])
 
@@ -209,26 +204,26 @@ async def daily_lineup(
     # Auto-enrich films missing runtime data
     films_missing_runtime = df[df['runtime'].isna()]['film_title'].unique().tolist()
     if films_missing_runtime:
-        from app import db_adapter as database
-        
+        from app.db.film_enrichment import backfill_film_details_from_fandango_single, enrich_new_films
+
         # Split into sync (immediate) and async (background) groups
         SYNC_LIMIT = 10
         films_for_sync = films_missing_runtime[:SYNC_LIMIT]
         films_for_background = films_missing_runtime[SYNC_LIMIT:]
-        
+
         if films_for_sync:
             logger.info(f"[DailyLineup] Sync-enriching {len(films_for_sync)} films for immediate report...")
             for film_title in films_for_sync:
                 try:
                     # Individual calls ensure one failure doesn't stop the whole report
-                    database.backfill_film_details_from_fandango_single(film_title)
+                    backfill_film_details_from_fandango_single(film_title)
                 except Exception as e:
                     logger.warning(f"[DailyLineup] Failed sync-enrich for '{film_title}': {e}")
-        
+
         if films_for_background:
             logger.info(f"[DailyLineup] Queuing {len(films_for_background)} remaining films for background enrichment")
             # Run the batch enrichment in the background thread
-            background_tasks.add_task(database.enrich_new_films, films_for_background, async_mode=False)
+            background_tasks.add_task(enrich_new_films, films_for_background, async_mode=False)
         
         # Re-query only if we actually did some sync enrichment
         if films_for_sync:
@@ -627,7 +622,7 @@ _PREMIUM_FORMATS = frozenset([
 ])
 
 # Patterns that indicate premium when found as substring
-_PREMIUM_PATTERNS = ['imax', 'dolby', 'superscreen', 'ultrascreen', 'screenx', '4dx', 'rpx', 'dbox', 'plf', 'liemax']
+_PREMIUM_PATTERNS = ['imax', 'dolby', 'superscreen', 'ultrascreen', 'screenx', '4dx', 'rpx', 'dbox', 'plf', 'liemax', 'premium']
 
 
 def _is_premium_format(fmt: str) -> bool:
@@ -730,19 +725,24 @@ def _build_board_html(
     showtime_color = '#d0d0d0' if not is_print else '#333'
     border_color = '#333' if not is_print else '#ccc'
 
-    # Derive brand and short theater name
-    # e.g. "Movie Tavern Hulen Cinema" → brand="MOVIE TAVERN", theater="HULEN CINEMA"
+    # Derive brand and short theater name from the theater name itself.
+    # e.g. "Movie Tavern Hulen" → brand="MOVIE TAVERN", theater="HULEN"
+    #       "Marcus Addison Cinema" → brand="MARCUS", theater="ADDISON CINEMA"
+    _BRAND_PREFIXES = [
+        'movie tavern', 'marcus', 'amc', 'regal', 'cinemark',
+        'alamo drafthouse', 'harkins', 'landmark', 'showcase',
+        'bow tie', 'cinepolis', 'emagine',
+    ]
     brand_display = ''
     theater_display = theater_name.upper()
-    if circuit_name:
-        brand_display = circuit_name.upper()
-        # Try to extract just the location part after the brand
-        lower_theater = theater_name.lower()
-        lower_circuit = circuit_name.lower()
-        if lower_theater.startswith(lower_circuit):
-            location_part = theater_name[len(circuit_name):].strip()
+    lower_theater = theater_name.lower()
+    for prefix in sorted(_BRAND_PREFIXES, key=len, reverse=True):
+        if lower_theater.startswith(prefix):
+            brand_display = theater_name[:len(prefix)].upper()
+            location_part = theater_name[len(prefix):].strip()
             if location_part:
                 theater_display = location_part.upper()
+            break
 
     # Build premium section
     premium_html = ''

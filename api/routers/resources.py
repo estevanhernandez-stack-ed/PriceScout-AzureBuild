@@ -7,13 +7,8 @@ from fastapi import APIRouter, HTTPException, Query, Depends, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy import func, distinct
 
-import sys
-from pathlib import Path
-ROOT = Path(__file__).resolve().parents[2]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-from app.db_adapter import get_session, Showing, Film, ScrapeRun, Price
+from app.db_session import get_session
+from app.db_models import Showing, Film, ScrapeRun, Price
 from app import config
 from api.auth import verify_api_key, check_rate_limit
 from api.routers.auth import require_operator
@@ -177,8 +172,8 @@ async def enrich_films(
     """
     Enrich all films missing metadata from OMDB.
     """
-    from app import db_adapter as database
-    count = database.backfill_film_details_from_fandango()
+    from app.db.film_enrichment import backfill_film_details_from_fandango
+    count = backfill_film_details_from_fandango()
     return {"updated_count": count}
 
 
@@ -191,12 +186,12 @@ async def enrich_single_film(
     """
     Enrich a single film title from OMDB.
     """
-    from app import db_adapter as database
-    # Defensive: strip format tags for OMDb query if needed, 
+    from app.db.film_enrichment import backfill_film_details_from_fandango_single
+    # Defensive: strip format tags for OMDb query if needed,
     # but the backend backfill_film_details_from_fandango_single usually handles it.
     import re
     clean_title = re.sub(r"\s*\[.*?\]$", "", film_title).strip()
-    count = database.backfill_film_details_from_fandango_single(clean_title)
+    count = backfill_film_details_from_fandango_single(clean_title)
     return {"success": count > 0}
 
 

@@ -82,6 +82,7 @@ stages:
               cd $(workingDirectory)
               python -m pip install --upgrade pip
               pip install -r requirements.txt
+              pip install -r requirements-dev.txt
             displayName: 'Install Python dependencies'
 
           - script: |
@@ -90,12 +91,21 @@ stages:
               playwright install-deps chromium
             displayName: 'Install Playwright browsers'
 
-          # Security: Dependency audit
+          # Security: Dependency audit (fails build on critical/high vulns)
           - script: |
               pip install pip-audit
               cd $(workingDirectory)
-              pip-audit --requirement requirements.txt --desc on || true
+              pip-audit --requirement requirements.txt --desc on
             displayName: 'Run pip-audit (dependency security scan)'
+            continueOnError: false
+
+          # Security: Static code analysis (SAST)
+          - script: |
+              pip install bandit
+              cd $(workingDirectory)
+              bandit -r app api -ll -ii --skip B101
+            displayName: 'Run Bandit SAST scan'
+            continueOnError: false
 
           # Static Analysis: Mypy
           - script: |
@@ -166,11 +176,12 @@ stages:
               npm ci
             displayName: 'Install npm dependencies'
 
-          # Security: npm audit
+          # Security: npm audit (fails build on high/critical vulns)
           - script: |
               cd $(workingDirectory)/frontend
-              npm audit --audit-level=high || true
+              npm audit --audit-level=high
             displayName: 'Run npm audit (dependency security scan)'
+            continueOnError: false
 
           # TypeScript type checking
           - script: |
@@ -183,12 +194,12 @@ stages:
               cd $(workingDirectory)/frontend
               npm run lint
             displayName: 'Run ESLint'
-            continueOnError: true
+            continueOnError: false
 
           # Vitest unit tests
           - script: |
               cd $(workingDirectory)/frontend
-              npm run test:coverage || true
+              npm run test:coverage
             displayName: 'Run Vitest unit tests'
 
           # Build production bundle
@@ -198,6 +209,18 @@ stages:
             displayName: 'Build React app'
             env:
               VITE_API_BASE_URL: '/api/v1'
+
+          # Bundle size check (warn if JS exceeds 512KB gzipped)
+          - script: |
+              cd $(workingDirectory)/frontend/dist/assets
+              JS_SIZE=$(find . -name '*.js' -exec gzip -c {} \; | wc -c)
+              JS_SIZE_KB=$((JS_SIZE / 1024))
+              echo "Total JS bundle size (gzipped): ${JS_SIZE_KB}KB"
+              if [ "$JS_SIZE_KB" -gt 512 ]; then
+                echo "##vso[task.logissue type=warning]Bundle size ${JS_SIZE_KB}KB exceeds 512KB threshold"
+              fi
+              echo "##vso[task.setvariable variable=bundleSizeKB]$JS_SIZE_KB"
+            displayName: 'Check bundle size'
 
           # Publish frontend build artifact
           - publish: '$(workingDirectory)/frontend/dist'
@@ -449,3 +472,15 @@ stages:
                       curl -f "https://$APP_URL/api/v1/health" || exit 1
                       echo "Production deployment verified"
                   displayName: 'Verify production deployment'
+
+                # Automatic rollback if production health check fails
+                - task: AzureAppServiceManage@0
+                  condition: failed()
+                  inputs:
+                    azureSubscription: '$(azureSubscription)'
+                    action: 'Swap Slots'
+                    webAppName: '$(appServiceNameProd)'
+                    resourceGroupName: '$(resourceGroupProd)'
+                    sourceSlot: 'production'
+                    targetSlot: 'staging'
+                  displayName: 'Rollback: swap back to staging'

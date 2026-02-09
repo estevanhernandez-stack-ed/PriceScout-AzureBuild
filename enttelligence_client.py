@@ -7,6 +7,14 @@ import requests
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 import json
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
+_ent_retry = retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(min=1, max=10),
+    retry=retry_if_exception_type((TimeoutError, ConnectionError, requests.exceptions.ConnectionError, requests.exceptions.Timeout)),
+    reraise=True,
+)
 
 
 class EntTelligenceClient:
@@ -18,6 +26,7 @@ class EntTelligenceClient:
         self.user_id = None
         self.token_expiry = None
         
+    @_ent_retry
     def login(self, token_name: str, token_secret: str, site: str = "enttelligence") -> bool:
         """
         Authenticate to API using Personal Access Token
@@ -41,7 +50,7 @@ class EntTelligenceClient:
         }
         
         try:
-            response = requests.post(url, json=payload, headers={"Content-Type": "application/json"})
+            response = requests.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=15)
             response.raise_for_status()
             
             data = response.json()
@@ -79,6 +88,7 @@ class EntTelligenceClient:
             "user_id": self.user_id
         }
     
+    @_ent_retry
     def get_showtimes_by_title(self, title: str, date: str, dbr: Optional[int] = None) -> List[Dict]:
         """
         Get all showtimes for a specific title and date
@@ -96,16 +106,17 @@ class EntTelligenceClient:
             url += f"/{dbr}"
         
         try:
-            response = requests.get(url, headers=self._get_headers())
+            response = requests.get(url, headers=self._get_headers(), timeout=15)
             response.raise_for_status()
-            
+
             data = response.json()
             return data.get("message", []) if data.get("success") else []
-            
+
         except requests.exceptions.RequestException as e:
             print(f"[ERR] Error fetching showtimes: {e}")
             return []
     
+    @_ent_retry
     def get_theater_analysis(self, title: str) -> List[Dict]:
         """
         Get theater-level analysis for a title (aggregated per theater)
@@ -119,16 +130,17 @@ class EntTelligenceClient:
         url = f"{self.base_url}/enttelligence/title-analysis-theater/{title}"
         
         try:
-            response = requests.get(url, headers=self._get_headers())
+            response = requests.get(url, headers=self._get_headers(), timeout=15)
             response.raise_for_status()
-            
+
             data = response.json()
             return data.get("message", []) if data.get("success") else []
-            
+
         except requests.exceptions.RequestException as e:
             print(f"[ERR] Error fetching theater analysis: {e}")
             return []
     
+    @_ent_retry
     def get_circuit_analysis(self, title: str) -> List[Dict]:
         """
         Get circuit-level analysis for a title
@@ -142,16 +154,17 @@ class EntTelligenceClient:
         url = f"{self.base_url}/enttelligence/title-analysis-circuit/{title}"
         
         try:
-            response = requests.get(url, headers=self._get_headers())
+            response = requests.get(url, headers=self._get_headers(), timeout=15)
             response.raise_for_status()
-            
+
             data = response.json()
             return data.get("message", []) if data.get("success") else []
-            
+
         except requests.exceptions.RequestException as e:
             print(f"[ERR] Error fetching circuit analysis: {e}")
             return []
     
+    @_ent_retry
     def get_market_analysis(self, title: str) -> List[Dict]:
         """
         Get market-level (DMA) analysis for a title
@@ -165,17 +178,18 @@ class EntTelligenceClient:
         url = f"{self.base_url}/enttelligence/title-analysis-market/{title}"
         
         try:
-            response = requests.get(url, headers=self._get_headers())
+            response = requests.get(url, headers=self._get_headers(), timeout=15)
             response.raise_for_status()
-            
+
             data = response.json()
             return data.get("message", []) if data.get("success") else []
-            
+
         except requests.exceptions.RequestException as e:
             print(f"[ERR] Error fetching market analysis: {e}")
             return []
     
-    def get_programming_audit(self, start_date: str, end_date: Optional[str] = None, 
+    @_ent_retry
+    def get_programming_audit(self, start_date: str, end_date: Optional[str] = None,
                              title: Optional[str] = None, movie_id: Optional[int] = None) -> List[Dict]:
         """
         Get programming audit (all showtimes) for a date range
@@ -203,17 +217,18 @@ class EntTelligenceClient:
             payload["movie_id"] = movie_id
         
         try:
-            response = requests.post(url, json=payload, headers=self._get_headers())
+            response = requests.post(url, json=payload, headers=self._get_headers(), timeout=15)
             response.raise_for_status()
-            
+
             data = response.json()
             return data.get("message", []) if data.get("success") else []
-            
+
         except requests.exceptions.RequestException as e:
             print(f"[ERR] Error fetching programming audit: {e}")
             return []
     
-    def get_movies(self, titles: Optional[List[str]] = None, 
+    @_ent_retry
+    def get_movies(self, titles: Optional[List[str]] = None,
                    imdb_ids: Optional[List[str]] = None,
                    movie_ids: Optional[List[int]] = None) -> List[Dict]:
         """
@@ -236,16 +251,17 @@ class EntTelligenceClient:
         }
         
         try:
-            response = requests.post(url, json=payload, headers=self._get_headers())
+            response = requests.post(url, json=payload, headers=self._get_headers(), timeout=15)
             response.raise_for_status()
-            
+
             data = response.json()
             return data.get("message", []) if data.get("success") else []
-            
+
         except requests.exceptions.RequestException as e:
             print(f"[ERR] Error fetching movies: {e}")
             return []
     
+    @_ent_retry
     def get_theaters(self, theater_names: Optional[List[str]] = None,
                     theater_ids: Optional[List[int]] = None) -> List[Dict]:
         """
@@ -266,12 +282,12 @@ class EntTelligenceClient:
         }
         
         try:
-            response = requests.post(url, json=payload, headers=self._get_headers())
+            response = requests.post(url, json=payload, headers=self._get_headers(), timeout=15)
             response.raise_for_status()
-            
+
             data = response.json()
             return data.get("message", []) if data.get("success") else []
-            
+
         except requests.exceptions.RequestException as e:
             print(f"[ERR] Error fetching theaters: {e}")
             return []

@@ -61,6 +61,12 @@ python-dateutil>=2.8.0,<3.0.0  # Date parsing utilities
 openpyxl>=3.1.0,<4.0.0         # Excel read support (.xlsx)
 xlsxwriter>=3.1.0,<4.0.0       # Excel write support (better formatting)
 
+# === CACHING / RATE LIMITING ===
+redis>=5.0.0,<6.0.0             # Redis client for rate limiting and caching (optional)
+
+# === RESILIENCE ===
+tenacity>=8.2.0,<10.0.0         # Retry logic for transient network failures
+
 # === ENVIRONMENT ===
 python-dotenv>=1.0.0,<2.0.0    # Environment variable management
 
@@ -71,12 +77,9 @@ pydantic>=2.0.0,<3.0.0         # Data validation for API schemas
 python-multipart>=0.0.9        # Form data parsing for FastAPI
 
 # ==============================================================================
-# TESTING (Dev/CI only - can be moved to requirements-dev.txt)
+# TESTING — moved to requirements-dev.txt
 # ==============================================================================
-pytest>=8.0.0,<9.0.0           # Test framework
-pytest-asyncio>=0.23.0,<2.0.0  # Async test support
-pytest-cov>=4.0.0,<8.0.0       # Coverage reporting
-pytest-mock>=3.12.0,<4.0.0     # Mocking utilities
+# pip install -r requirements-dev.txt
 
 # ==============================================================================
 # POST-INSTALLATION STEPS

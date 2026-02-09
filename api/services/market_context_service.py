@@ -2,21 +2,18 @@
 Market Context Service
 Manages theater metadata (geospatial) and market events.
 """
+import logging
 import os
-import sys
-from pathlib import Path
 from datetime import datetime, UTC
 from typing import List, Dict, Any, Optional
 
-# Add project root to path
-ROOT = Path(__file__).resolve().parents[2]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+logger = logging.getLogger(__name__)
 
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, or_
 
-from app.db_adapter import get_session, TheaterMetadata, MarketEvent, Company, TheaterOperatingHours
+from app.db_session import get_session
+from app.db_models import TheaterMetadata, MarketEvent, Company, TheaterOperatingHours
 from enttelligence_client import EntTelligenceClient
 from app import config
 
@@ -37,7 +34,7 @@ class MarketContextService:
             if token_secret and self._ent_client.login(token_name, token_secret):
                 pass
             else:
-                print("[WARN] Could not authenticate with EntTelligence for Market Context")
+                logger.warning("Could not authenticate with EntTelligence for Market Context")
         return self._ent_client
 
     def get_theaters_metadata(self, company_id: int) -> List[TheaterMetadata]:
@@ -106,7 +103,7 @@ class MarketContextService:
         try:
             url = f"https://nominatim.openstreetmap.org/search?q={quote(address)}&format=json&limit=1"
             headers = {"User-Agent": self._user_agent}
-            response = requests.get(url, headers=headers)
+            response = requests.get(url, headers=headers, timeout=10)
             response.raise_for_status()
             
             data = response.json()
@@ -116,7 +113,7 @@ class MarketContextService:
                     "lon": float(data[0]["lon"])
                 }
         except Exception as e:
-            print(f"[ERR] Geocoding failed for {address}: {e}")
+            logger.error(f"Geocoding failed for {address}: {e}")
             
         return None
 
@@ -135,7 +132,7 @@ class MarketContextService:
         errors = 0
         
         try:
-            print(f"[INFO] Synchronizing context for {len(theater_names)} theaters...")
+            logger.info(f"Synchronizing context for {len(theater_names)} theaters...")
             
             with get_session() as session:
                 for name in theater_names:
@@ -143,7 +140,7 @@ class MarketContextService:
                     try:
                         ent_results = client.get_theaters(theater_names=[name])
                         if not ent_results:
-                            # print(f"[WARN] No EntTelligence data for '{name}'")
+                            # logger.warning(f"No EntTelligence data for '{name}'")
                             continue
                         
                         ent_t = ent_results[0]
@@ -188,7 +185,7 @@ class MarketContextService:
                         
                         updated += 1
                     except Exception as e:
-                        print(f"[ERR] Failed to sync '{name}': {e}")
+                        logger.error(f"Failed to sync '{name}': {e}")
                         errors += 1
                 
                 session.commit()

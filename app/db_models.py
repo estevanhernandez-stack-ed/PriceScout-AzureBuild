@@ -25,7 +25,10 @@ from sqlalchemy.dialects.postgresql import JSONB, INET
 from datetime import datetime, UTC
 from decimal import Decimal
 import json
+import logging
 import os
+
+_logger = logging.getLogger(__name__)
 
 # Schema prefix for unified database (default 'pricescout' per Accords convention)
 # SQLite doesn't support schemas, so we set it to None for SQLite
@@ -161,7 +164,8 @@ class Company(Base):
         """Parse settings JSON string to dict"""
         try:
             return json.loads(self.settings) if isinstance(self.settings, str) else self.settings
-        except Exception:
+        except (json.JSONDecodeError, TypeError, ValueError) as e:
+            _logger.warning("JSON parse failed in settings_dict: %s", e)
             return {}
     
     @settings_dict.setter
@@ -219,7 +223,8 @@ class User(Base):
         """Parse allowed_modes JSON to list"""
         try:
             return json.loads(self.allowed_modes) if isinstance(self.allowed_modes, str) else self.allowed_modes
-        except Exception:
+        except (json.JSONDecodeError, TypeError, ValueError) as e:
+            _logger.warning("JSON parse failed in allowed_modes_list: %s", e)
             return []
     
     @allowed_modes_list.setter
@@ -335,10 +340,7 @@ class ScrapeCheckpoint(Base):
 class Showing(Base):
     """Theater screening schedules with pricing"""
     __tablename__ = 'showings'
-    __table_args__ = (
-        {'schema': DB_SCHEMA},
-    )
-    
+
     showing_id = Column(Integer, primary_key=True, autoincrement=True)
     company_id = Column(Integer, ForeignKey('companies.company_id', ondelete='CASCADE'), nullable=False)
     play_date = Column(Date, nullable=False, index=True)
@@ -350,11 +352,11 @@ class Showing(Base):
     is_plf = Column(Boolean, default=False)  # Premium Large Format
     ticket_url = Column(Text)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
-    
+
     # Relationships
     company = relationship("Company", back_populates="showings")
     prices = relationship("Price", back_populates="showing", cascade="all, delete-orphan")
-    
+
     __table_args__ = (
         UniqueConstraint('company_id', 'play_date', 'theater_name', 'film_title', 'showtime', 'format',
                         name='unique_showing'),
@@ -362,6 +364,8 @@ class Showing(Base):
         Index('idx_showings_theater_date', 'company_id', 'theater_name', 'play_date'),
         Index('idx_showings_film', 'company_id', 'film_title'),
         Index('idx_showings_date', 'play_date'),
+        Index('idx_showings_format', 'company_id', 'format'),
+        {'schema': DB_SCHEMA},
     )
     
     def __repr__(self):
@@ -371,10 +375,7 @@ class Showing(Base):
 class Price(Base):
     """Ticket pricing data by type (Adult/Senior/Child/etc)"""
     __tablename__ = 'prices'
-    __table_args__ = (
-        {'schema': DB_SCHEMA},
-    )
-    
+
     price_id = Column(Integer, primary_key=True, autoincrement=True)
     company_id = Column(Integer, ForeignKey('companies.company_id', ondelete='CASCADE'), nullable=False)
     run_id = Column(Integer, ForeignKey('scrape_runs.run_id', ondelete='NO ACTION'))
@@ -384,18 +385,20 @@ class Price(Base):
     capacity = Column(String(50))  # Optional theater capacity info
     play_date = Column(Date)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
-    
+
     # Relationships
     company = relationship("Company", back_populates="prices")
     scrape_run = relationship("ScrapeRun", back_populates="prices")
     showing = relationship("Showing", back_populates="prices")
-    
+
     __table_args__ = (
         CheckConstraint('price >= 0', name='price_positive'),
         Index('idx_prices_company', 'company_id'),
         Index('idx_prices_run', 'run_id'),
         Index('idx_prices_showing', 'showing_id'),
         Index('idx_prices_date', 'play_date'),
+        Index('idx_prices_ticket_type', 'company_id', 'ticket_type'),
+        {'schema': DB_SCHEMA},
     )
     
     def __repr__(self):
@@ -679,7 +682,8 @@ class AlertConfiguration(Base):
         """Parse theaters_filter JSON to list"""
         try:
             return json.loads(self.theaters_filter) if isinstance(self.theaters_filter, str) else self.theaters_filter or []
-        except Exception:
+        except (json.JSONDecodeError, TypeError, ValueError) as e:
+            _logger.warning("JSON parse failed in theaters_filter_list: %s", e)
             return []
 
     @property
@@ -687,7 +691,8 @@ class AlertConfiguration(Base):
         """Parse ticket_types_filter JSON to list"""
         try:
             return json.loads(self.ticket_types_filter) if isinstance(self.ticket_types_filter, str) else self.ticket_types_filter or []
-        except Exception:
+        except (json.JSONDecodeError, TypeError, ValueError) as e:
+            _logger.warning("JSON parse failed in ticket_types_filter_list: %s", e)
             return []
 
     @property
@@ -695,7 +700,8 @@ class AlertConfiguration(Base):
         """Parse formats_filter JSON to list"""
         try:
             return json.loads(self.formats_filter) if isinstance(self.formats_filter, str) else self.formats_filter or []
-        except Exception:
+        except (json.JSONDecodeError, TypeError, ValueError) as e:
+            _logger.warning("JSON parse failed in formats_filter_list: %s", e)
             return []
 
 
@@ -1077,7 +1083,8 @@ class ScheduleBaseline(Base):
         """Parse showtimes JSON string to list"""
         try:
             return json.loads(self.showtimes) if isinstance(self.showtimes, str) else self.showtimes or []
-        except Exception:
+        except (json.JSONDecodeError, TypeError, ValueError) as e:
+            _logger.warning("JSON parse failed in showtimes_list: %s", e)
             return []
 
     @showtimes_list.setter
@@ -1147,7 +1154,8 @@ class ScheduleAlert(Base):
         """Parse old_value JSON string to dict"""
         try:
             return json.loads(self.old_value) if isinstance(self.old_value, str) and self.old_value else None
-        except Exception:
+        except (json.JSONDecodeError, TypeError, ValueError) as e:
+            _logger.warning("JSON parse failed in old_value_dict: %s", e)
             return None
 
     @property
@@ -1155,7 +1163,8 @@ class ScheduleAlert(Base):
         """Parse new_value JSON string to dict"""
         try:
             return json.loads(self.new_value) if isinstance(self.new_value, str) and self.new_value else None
-        except Exception:
+        except (json.JSONDecodeError, TypeError, ValueError) as e:
+            _logger.warning("JSON parse failed in new_value_dict: %s", e)
             return None
 
 
@@ -1217,7 +1226,8 @@ class ScheduleMonitorConfig(Base):
         """Parse theaters_filter JSON to list"""
         try:
             return json.loads(self.theaters_filter) if isinstance(self.theaters_filter, str) else self.theaters_filter or []
-        except Exception:
+        except (json.JSONDecodeError, TypeError, ValueError) as e:
+            _logger.warning("JSON parse failed in theaters_filter_list: %s", e)
             return []
 
     @property
@@ -1225,7 +1235,8 @@ class ScheduleMonitorConfig(Base):
         """Parse films_filter JSON to list"""
         try:
             return json.loads(self.films_filter) if isinstance(self.films_filter, str) else self.films_filter or []
-        except Exception:
+        except (json.JSONDecodeError, TypeError, ValueError) as e:
+            _logger.warning("JSON parse failed in films_filter_list: %s", e)
             return []
 
     @property
@@ -1233,7 +1244,8 @@ class ScheduleMonitorConfig(Base):
         """Parse circuits_filter JSON to list"""
         try:
             return json.loads(self.circuits_filter) if isinstance(self.circuits_filter, str) else self.circuits_filter or []
-        except Exception:
+        except (json.JSONDecodeError, TypeError, ValueError) as e:
+            _logger.warning("JSON parse failed in circuits_filter_list: %s", e)
             return []
 
 
@@ -1319,7 +1331,8 @@ class CompanyProfile(Base):
         """Parse ticket_types JSON to list"""
         try:
             return json.loads(self.ticket_types) if isinstance(self.ticket_types, str) else self.ticket_types or []
-        except Exception:
+        except (json.JSONDecodeError, TypeError, ValueError) as e:
+            _logger.warning("JSON parse failed in ticket_types_list: %s", e)
             return []
 
     @ticket_types_list.setter
@@ -1332,7 +1345,8 @@ class CompanyProfile(Base):
         """Parse discount_days JSON to list"""
         try:
             return json.loads(self.discount_days) if isinstance(self.discount_days, str) else self.discount_days or []
-        except Exception:
+        except (json.JSONDecodeError, TypeError, ValueError) as e:
+            _logger.warning("JSON parse failed in discount_days_list: %s", e)
             return []
 
     @discount_days_list.setter
@@ -1345,7 +1359,8 @@ class CompanyProfile(Base):
         """Parse premium_formats JSON to list"""
         try:
             return json.loads(self.premium_formats) if isinstance(self.premium_formats, str) else self.premium_formats or []
-        except Exception:
+        except (json.JSONDecodeError, TypeError, ValueError) as e:
+            _logger.warning("JSON parse failed in premium_formats_list: %s", e)
             return []
 
     @premium_formats_list.setter
@@ -1358,7 +1373,8 @@ class CompanyProfile(Base):
         """Parse premium_surcharges JSON to dict"""
         try:
             return json.loads(self.premium_surcharges) if isinstance(self.premium_surcharges, str) else self.premium_surcharges or {}
-        except Exception:
+        except (json.JSONDecodeError, TypeError, ValueError) as e:
+            _logger.warning("JSON parse failed in premium_surcharges_dict: %s", e)
             return {}
 
     @premium_surcharges_dict.setter
@@ -1371,7 +1387,8 @@ class CompanyProfile(Base):
         """Parse daypart_boundaries JSON to dict"""
         try:
             return json.loads(self.daypart_boundaries) if isinstance(self.daypart_boundaries, str) else self.daypart_boundaries or {}
-        except Exception:
+        except (json.JSONDecodeError, TypeError, ValueError) as e:
+            _logger.warning("JSON parse failed in daypart_boundaries_dict: %s", e)
             return {}
 
     @daypart_boundaries_dict.setter
@@ -1466,7 +1483,8 @@ class DiscountDayProgram(Base):
             if not self.applicable_ticket_types:
                 return None  # NULL = applies to all
             return json.loads(self.applicable_ticket_types) if isinstance(self.applicable_ticket_types, str) else self.applicable_ticket_types
-        except Exception:
+        except (json.JSONDecodeError, TypeError, ValueError) as e:
+            _logger.warning("JSON parse failed in applicable_ticket_types_list: %s", e)
             return None
 
     @applicable_ticket_types_list.setter
@@ -1481,7 +1499,8 @@ class DiscountDayProgram(Base):
             if not self.applicable_formats:
                 return None  # NULL = applies to all
             return json.loads(self.applicable_formats) if isinstance(self.applicable_formats, str) else self.applicable_formats
-        except Exception:
+        except (json.JSONDecodeError, TypeError, ValueError) as e:
+            _logger.warning("JSON parse failed in applicable_formats_list: %s", e)
             return None
 
     @applicable_formats_list.setter
@@ -1496,7 +1515,8 @@ class DiscountDayProgram(Base):
             if not self.applicable_dayparts:
                 return None  # NULL = applies to all
             return json.loads(self.applicable_dayparts) if isinstance(self.applicable_dayparts, str) else self.applicable_dayparts
-        except Exception:
+        except (json.JSONDecodeError, TypeError, ValueError) as e:
+            _logger.warning("JSON parse failed in applicable_dayparts_list: %s", e)
             return None
 
     @applicable_dayparts_list.setter
@@ -1660,7 +1680,8 @@ class TheaterOnboardingStatus(Base):
         """Parse formats_discovered JSON to list"""
         try:
             return json.loads(self.formats_discovered) if isinstance(self.formats_discovered, str) else self.formats_discovered or []
-        except Exception:
+        except (json.JSONDecodeError, TypeError, ValueError) as e:
+            _logger.warning("JSON parse failed in formats_discovered_list: %s", e)
             return []
 
     @formats_discovered_list.setter
@@ -1673,7 +1694,8 @@ class TheaterOnboardingStatus(Base):
         """Parse ticket_types_discovered JSON to list"""
         try:
             return json.loads(self.ticket_types_discovered) if isinstance(self.ticket_types_discovered, str) else self.ticket_types_discovered or []
-        except Exception:
+        except (json.JSONDecodeError, TypeError, ValueError) as e:
+            _logger.warning("JSON parse failed in ticket_types_discovered_list: %s", e)
             return []
 
     @ticket_types_discovered_list.setter
@@ -1686,7 +1708,8 @@ class TheaterOnboardingStatus(Base):
         """Parse dayparts_discovered JSON to list"""
         try:
             return json.loads(self.dayparts_discovered) if isinstance(self.dayparts_discovered, str) else self.dayparts_discovered or []
-        except Exception:
+        except (json.JSONDecodeError, TypeError, ValueError) as e:
+            _logger.warning("JSON parse failed in dayparts_discovered_list: %s", e)
             return []
 
     @dayparts_discovered_list.setter

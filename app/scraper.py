@@ -3,10 +3,14 @@ import json
 import datetime
 import os
 import asyncio
+import logging
 from playwright.async_api import async_playwright
 from bs4 import BeautifulSoup
 import random
 from opentelemetry import trace
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
+logger = logging.getLogger(__name__)
 
 # Optional Streamlit import for when running in Streamlit context
 try:
@@ -17,9 +21,20 @@ except ImportError:
     st = None
 
 from app.config import DEBUG_DIR, CACHE_FILE
+from app import config
 
 # Get tracer for custom spans
 tracer = trace.get_tracer(__name__)
+
+# Retry decorator for methods that create their own browser context.
+# Only retries on TimeoutError (transient network/page-load issues).
+_scraper_retry = retry(
+    stop=stop_after_attempt(config.SCRAPER_MAX_RETRIES),
+    wait=wait_exponential(min=config.SCRAPER_RETRY_WAIT_MIN, max=config.SCRAPER_RETRY_WAIT_MAX),
+    retry=retry_if_exception_type(TimeoutError),
+    reraise=True,
+    before_sleep=lambda rs: logger.info(f"Retrying {rs.fn.__name__} (attempt {rs.attempt_number}) after timeout"),
+)
 
 class Scraper:
     def __init__(self, headless=True, devtools=False):
@@ -74,31 +89,10 @@ class Scraper:
         return {"base_type": found_base_type, "amenities": sorted(list(set(found_amenities)))}
 
     def _classify_daypart(self, showtime_str: str) -> str:
-        try:
-            s = showtime_str.strip().lower().replace('.', '')
-            if s.endswith('p'): s = s[:-1] + 'pm'
-            if s.endswith('a'): s = s[:-1] + 'am'
-            s = s.replace('p.m.', 'pm').replace('a.m.', 'am').replace('p ', 'pm').replace('a ', 'am')
-            if not any(x in s for x in ('am','pm')):
-                hour_match = re.match(r'(\d{1,2})', s)
-                if hour_match:
-                    hour = int(hour_match.group(1))
-                    s += 'am' if hour < 8 or hour == 12 else 'pm'
-            t = datetime.datetime.strptime(s, "%I:%M%p").time()
+        from app.simplified_baseline_service import classify_daypart
+        result = classify_daypart(showtime_str)
+        return result if result else "Unknown"
 
-            if t < datetime.time(4, 0): # Before 4:00am is late night
-                return "Late Night"
-            if t < datetime.time(16, 0): # Before 4:00pm is matinee
-                return "Matinee"
-            if t < datetime.time(18, 0): # Before 6:00pm is twilight
-                return "Twilight"
-            if t <= datetime.time(21, 0): # Before 9:00pm is prime
-                return "Prime"
-            
-            return "Late Night" # After 9:00pm is late night
-        except Exception as e:
-            print(f"        [WARNING] Could not classify daypart for '{showtime_str}'. Error: {e}")
-            return "Unknown"
     def _strip_common_terms(self, name: str) -> str:
         # A set of common, low-value terms to remove for better matching
         common_terms = {
@@ -138,50 +132,56 @@ class Scraper:
         except Exception:
             return False
             
-    async def _get_theaters_from_zip_page(self, page, zip_code, date_str):
+    _JS_THEATERS_CONDITION = (
+        "() => window.Fandango && window.Fandango.pageDetails "
+        "&& window.Fandango.pageDetails.localTheaters "
+        "&& window.Fandango.pageDetails.localTheaters.length > 0"
+    )
+
+    async def _extract_theaters_from_page(self, page, zip_code, date_str):
+        """Load a Fandango ZIP page and extract the theater list."""
         url = f"https://www.fandango.com/{zip_code}_movietimes?date={date_str}"
-        print(f"  - Checking ZIP: {zip_code} for date {date_str}")
+        await page.goto(url, timeout=config.SCRAPER_NAV_TIMEOUT)
+        await page.mouse.wheel(0, 2000)
+        await page.wait_for_timeout(int(config.SCRAPER_RENDER_DELAY_SHORT * 1000))
+        await page.wait_for_function(self._JS_THEATERS_CONDITION, timeout=config.SCRAPER_JS_WAIT)
+        theaters_data = await page.evaluate('() => window.Fandango.pageDetails.localTheaters')
+        return {
+            t.get('name'): {"name": t.get('name'), "url": "https://www.fandango.com" + t.get('theaterPageUrl')}
+            for t in theaters_data if t.get('name') and t.get('theaterPageUrl')
+        }
+
+    async def _get_theaters_from_zip_page(self, page, zip_code, date_str):
+        logger.info(f"Checking ZIP: {zip_code} for date {date_str}")
         try:
-            await page.goto(url, timeout=30000)
-            await page.mouse.wheel(0, 2000)
-            await page.wait_for_timeout(1500)
-            js_condition = "() => window.Fandango && window.Fandango.pageDetails && window.Fandango.pageDetails.localTheaters && window.Fandango.pageDetails.localTheaters.length > 0"
-            await page.wait_for_function(js_condition, timeout=20000)
-            theaters_data = await page.evaluate('() => window.Fandango.pageDetails.localTheaters')
-            return {t.get('name'): {"name": t.get('name'), "url": "https://www.fandango.com" + t.get('theaterPageUrl')} for t in theaters_data if t.get('name') and t.get('theaterPageUrl')}
+            return await self._extract_theaters_from_page(page, zip_code, date_str)
         except Exception as e:
-            print(f"    [WARNING] Could not process ZIP {zip_code}. Error: {e}")
+            logger.warning(f"Could not process ZIP {zip_code}. Error: {e}")
             return {}
-            
+
+    @_scraper_retry
     async def live_search_by_zip(self, zip_code, date_str):
-        """
-        FIX: This function now correctly accepts the date_str argument.
-        """
+        """Search for theaters by ZIP code on Fandango."""
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
-            page = await browser.new_page()
-            url = f"https://www.fandango.com/{zip_code}_movietimes?date={date_str}"
-            await page.goto(url, timeout=30000)
-            await page.mouse.wheel(0, 2000)
-            await page.wait_for_timeout(1500)
-            js_condition = "() => window.Fandango && window.Fandango.pageDetails && window.Fandango.pageDetails.localTheaters && window.Fandango.pageDetails.localTheaters.length > 0"
-            await page.wait_for_function(js_condition, timeout=20000)
-            theaters_data = await page.evaluate('() => window.Fandango.pageDetails.localTheaters')
-            results = {t.get('name'): {"name": t.get('name'), "url": "https://www.fandango.com" + t.get('theaterPageUrl')} for t in theaters_data if t.get('name') and t.get('theaterPageUrl')}
-            await browser.close()
-            return results
+            try:
+                page = await browser.new_page()
+                return await self._extract_theaters_from_page(page, zip_code, date_str)
+            finally:
+                await browser.close()
 
+    @_scraper_retry
     async def live_search_by_name(self, search_term):
-        print(f"  - Live searching for: {search_term}")
+        logger.info(f"Live searching for: {search_term}")
         results = {}
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             page = await browser.new_page()
             try:
-                await page.goto("https://www.fandango.com", timeout=60000)
+                await page.goto("https://www.fandango.com", timeout=config.SCRAPER_NAV_TIMEOUT_LONG)
                 await page.locator('[data-qa="search-input"]').fill(search_term)
                 await page.locator('[data-qa="search-input"]').press('Enter')
-                await page.wait_for_selector('[data-qa="search-results-item"]', timeout=15000)
+                await page.wait_for_selector('[data-qa="search-results-item"]', timeout=config.SCRAPER_ELEMENT_WAIT_SHORT)
                 soup = BeautifulSoup(await page.content(), 'html.parser')
                 search_results_items = soup.select('[data-qa="search-results-item"]')
                 for item in search_results_items:
@@ -193,10 +193,11 @@ class Scraper:
                             url = "https://www.fandango.com" + href
                             results[name] = {"name": name, "url": url}
             except Exception as e:
-                print(f"    [WARNING] Could not complete live name search. Error: {e}")
+                logger.warning(f"Could not complete live name search. Error: {e}")
             await browser.close()
             return results
 
+    @_scraper_retry
     async def discover_theater_url(self, theater_name: str) -> dict:
         """
         Discover a theater's Fandango URL using the search page.
@@ -231,14 +232,14 @@ class Scraper:
             # Build search URL
             encoded_name = urllib.parse.quote(theater_name)
             search_url = f"https://www.fandango.com/search?q={encoded_name}"
-            print(f"  [DISCOVER] Searching: {search_url}")
+            logger.info(f"Searching: {search_url}")
 
             async with async_playwright() as p:
                 browser = await p.chromium.launch(headless=True)
                 page = await browser.new_page()
 
-                await page.goto(search_url, timeout=30000)
-                await page.wait_for_timeout(2000)  # Wait for dynamic content
+                await page.goto(search_url, timeout=config.SCRAPER_NAV_TIMEOUT)
+                await page.wait_for_timeout(int(config.SCRAPER_RENDER_DELAY * 1000))  # Wait for dynamic content
 
                 html_content = await page.content()
                 await browser.close()
@@ -324,32 +325,33 @@ class Scraper:
                     result["theater_name"] = best_match['name']
                     result["url"] = best_match['url']
                     result["theater_code"] = best_match['code']
-                    print(f"  [DISCOVER] Found: {best_match['name']} ({best_match['code']})")
-                    print(f"  [DISCOVER] URL: {best_match['url']}")
+                    logger.info(f"Found: {best_match['name']} ({best_match['code']})")
+                    logger.info(f"URL: {best_match['url']}")
             else:
-                print(f"  [DISCOVER] No theater results found for '{theater_name}'")
+                logger.info(f"No theater results found for '{theater_name}'")
                 result["error"] = "No theater results found"
 
         except Exception as e:
-            print(f"  [DISCOVER] Error: {e}")
+            logger.error(f"Error discovering theater URL: {e}")
             result["error"] = str(e)
 
         return result
 
+    @_scraper_retry
     async def search_fandango_for_film_url(self, search_term: str) -> list[dict]:
         """
         Discover a movie's Fandango URL using the search page.
         """
         results = []
         search_url = f"https://www.fandango.com/search?q={search_term.replace(' ', '+')}"
-        print(f"  [Fandango Search] Searching for: {search_term}")
+        logger.info(f"Searching for: {search_term}")
         
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             page = await browser.new_page()
             try:
-                await page.goto(search_url, timeout=30000)
-                await page.wait_for_selector('.search__movie-title', timeout=10000)
+                await page.goto(search_url, timeout=config.SCRAPER_NAV_TIMEOUT)
+                await page.wait_for_selector('.search__movie-title', timeout=config.SCRAPER_SELECTOR_WAIT)
                 
                 content = await page.content()
                 soup = BeautifulSoup(content, 'html.parser')
@@ -363,13 +365,14 @@ class Scraper:
                             url = "https://www.fandango.com" + url
                         results.append({"title": title, "url": url})
                         
-                print(f"  [Fandango Search] Found {len(results)} potential movie matches.")
+                logger.info(f"Found {len(results)} potential movie matches.")
             except Exception as e:
-                print(f"  [Fandango Search] [WARNING] Could not complete search for '{search_term}'. Error: {e}")
+                logger.warning(f"Could not complete search for '{search_term}'. Error: {e}")
             finally:
                 await browser.close()
         return results
 
+    @_scraper_retry
     async def get_film_details_from_fandango_url(self, url: str) -> dict:
         """
         Scrape detailed film information from a Fandango movie overview page.
@@ -378,22 +381,22 @@ class Scraper:
         if '/movie-overview' not in url:
             url = url.rstrip('/') + '/movie-overview'
             
-        print(f"  [Fandango Scrape] Fetching details from: {url}")
+        logger.info(f"Fetching details from: {url}")
         
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             page = await browser.new_page()
             try:
-                await page.goto(url, timeout=45000, wait_until="domcontentloaded")
+                await page.goto(url, timeout=config.SCRAPER_NAV_TIMEOUT_MEDIUM, wait_until="domcontentloaded")
                 # Wait for any common movie page element
                 try:
-                    await page.wait_for_selector('.details-header__title, .movie-details__movie-title, .mop__title, h1', timeout=20000)
+                    await page.wait_for_selector('.details-header__title, .movie-details__movie-title, .mop__title, h1', timeout=config.SCRAPER_JS_WAIT)
                 except Exception:
-                    print("  [Fandango Scrape] [WARNING] Specific title selector not found, attempting to proceed with page content.")
+                    logger.warning("Specific title selector not found, attempting to proceed with page content.")
                 
                 # Scroll a bit to trigger any lazy-loaded info
                 await page.mouse.wheel(0, 1000)
-                await asyncio.sleep(2)
+                await asyncio.sleep(config.SCRAPER_RENDER_DELAY)
                 
                 content = await page.content()
                 soup = BeautifulSoup(content, 'html.parser')
@@ -463,28 +466,29 @@ class Scraper:
 
                 return details
             except Exception as e:
-                print(f"  [Fandango Scrape] [ERROR] Failed to scrape details from {url}. Error: {e}")
+                logger.error(f"Failed to scrape details from {url}. Error: {e}")
                 return None
             finally:
                 await browser.close()
 
+    @_scraper_retry
     async def get_coming_soon_films(self) -> list[dict]:
         """
         Discover films from Fandango's 'Coming Soon' page.
         """
         results = []
         url = "https://www.fandango.com/movies-coming-soon"
-        print(f"  [Coming Soon] Discovering upcoming films from Fandango...")
+        logger.info(f"Discovering upcoming films from Fandango...")
         
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             page = await browser.new_page()
             try:
-                await page.goto(url, timeout=45000)
+                await page.goto(url, timeout=config.SCRAPER_NAV_TIMEOUT_MEDIUM)
                 # Scroll to trigger lazy loading of the full list
                 for _ in range(5):
                     await page.mouse.wheel(0, 2000)
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(config.SCRAPER_SCROLL_DELAY)
                 
                 content = await page.content()
                 soup = BeautifulSoup(content, 'html.parser')
@@ -521,28 +525,29 @@ class Scraper:
                             "url": href
                         })
                 
-                print(f"  [Coming Soon] Discovered {len(results)} upcoming films.")
+                logger.info(f"Discovered {len(results)} upcoming films.")
             except Exception as e:
-                print(f"  [Coming Soon] [ERROR] Failed to discover films. Error: {e}")
+                logger.error(f"Failed to discover films. Error: {e}")
             finally:
                 await browser.close()
         return results
 
+    @_scraper_retry
     async def discover_films_from_main_page(self) -> list[dict]:
         """
         Discover 'Now Playing' films from Fandango's main page.
         """
         results = []
         url = "https://www.fandango.com/"
-        print(f"  [Discover] Scraping films from Fandango main page...")
+        logger.info(f"Scraping films from Fandango main page...")
         
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             page = await browser.new_page()
             try:
-                await page.goto(url, timeout=30000)
+                await page.goto(url, timeout=config.SCRAPER_NAV_TIMEOUT)
                 await page.mouse.wheel(0, 1500)
-                await asyncio.sleep(2)
+                await asyncio.sleep(config.SCRAPER_RENDER_DELAY)
                 
                 content = await page.content()
                 soup = BeautifulSoup(content, 'html.parser')
@@ -564,9 +569,9 @@ class Scraper:
                                 "url": href
                             })
                             
-                print(f"  [Discover] Found {len(results)} films on the main page.")
+                logger.info(f"Found {len(results)} films on the main page.")
             except Exception as e:
-                print(f"  [Discover] [ERROR] Failed to scrape main page. Error: {e}")
+                logger.error(f"Failed to scrape main page. Error: {e}")
             finally:
                 await browser.close()
         return results
@@ -589,14 +594,14 @@ class Scraper:
             for parent_company, regions in markets_data.items():
                 for region_name, markets in regions.items():
                     for market_name, market_info in markets.items():
-                        print(f"\n--- Processing Market: {market_name} ---")
+                        logger.info(f"Processing Market: {market_name}")
                         theaters_in_market = market_info.get('theaters', [])
                         total_theaters_to_find += len(theaters_in_market)
 
                         found_theaters_for_market = []
                         theaters_to_find_in_fallback = []
 
-                        print("  [Phase 1] Starting fast ZIP code scrape...")
+                        logger.info("Phase 1: Starting fast ZIP code scrape...")
                         zip_pool = {t.get('zip') for t in theaters_in_market if t.get('zip')}
                         market_zip_cache = {}
                         for zip_code in zip_pool:
@@ -616,34 +621,34 @@ class Scraper:
                             if not found:
                                 theaters_to_find_in_fallback.append(name_to_find)
 
-                        print(f"  [Phase 1] Found {len(found_theaters_for_market)} theaters via ZIP scrape.")
+                        logger.info(f"Phase 1: Found {len(found_theaters_for_market)} theaters via ZIP scrape.")
 
                         if theaters_to_find_in_fallback:
-                            print(f"  [Phase 2] Starting targeted fallback search for {len(theaters_to_find_in_fallback)} theater(s)...")
+                            logger.info(f"Phase 2: Starting targeted fallback search for {len(theaters_to_find_in_fallback)} theater(s)...")
                             for theater_name in theaters_to_find_in_fallback:
                                 search_results = await self.live_search_by_name(theater_name)
                                 if search_results:
                                     found_name, found_data = next(iter(search_results.items()))
-                                    print(f"    [SUCCESS] Fallback found '{theater_name}' as '{found_name}'")
+                                    logger.info(f"Fallback found '{theater_name}' as '{found_name}'")
                                     found_theaters_for_market.append({'name': found_name, 'url': found_data['url']})
                                 else:
-                                    print(f"    [WARNING] Fallback could not find '{theater_name}'.")
+                                    logger.warning(f"Fallback could not find '{theater_name}'.")
 
                         temp_cache["markets"][market_name] = {"theaters": found_theaters_for_market}
                         total_theaters_found += len(found_theaters_for_market)
 
             await browser.close()
 
-        print("\n--- Sanity Check ---")
-        print(f"Found {total_theaters_found} out of {total_theaters_to_find} total theaters.")
+        logger.info("Sanity Check")
+        logger.info(f"Found {total_theaters_found} out of {total_theaters_to_find} total theaters.")
 
         if total_theaters_to_find > 0 and (total_theaters_found / total_theaters_to_find) >= 0.75:
-            print("[SUCCESS] Sanity check passed. Overwriting old cache.")
+            logger.info("Sanity check passed. Overwriting old cache.")
             with open(CACHE_FILE, 'w') as f:
                 json.dump(temp_cache, f, indent=2)
             return temp_cache
         else:
-            print("[FAILURE] Sanity check failed. Preserving existing cache to prevent errors.")
+            logger.error("Sanity check failed. Preserving existing cache to prevent errors.")
             return False
 
     async def test_single_market(self, market_name, markets_data):
@@ -661,13 +666,13 @@ class Scraper:
                 for region_name, markets in regions.items():
                     if market_name in markets:
                         market_info = markets[market_name]
-                        print(f"--- Processing Market: {market_name} ---")
+                        logger.info(f"Processing Market: {market_name}")
                         theaters_in_market = market_info.get('theaters', [])
                         
                         found_theaters_for_market = []
                         theaters_to_find_in_fallback = []
 
-                        print("  [Phase 1] Starting fast ZIP code scrape...")
+                        logger.info("Phase 1: Starting fast ZIP code scrape...")
                         zip_pool = {t.get('zip') for t in theaters_in_market if t.get('zip')}
                         market_zip_cache = {}
                         for zip_code in zip_pool:
@@ -687,18 +692,18 @@ class Scraper:
                             if not found:
                                 theaters_to_find_in_fallback.append(name_to_find)
 
-                        print(f"  [Phase 1] Found {len(found_theaters_for_market)} theaters via ZIP scrape.")
+                        logger.info(f"Phase 1: Found {len(found_theaters_for_market)} theaters via ZIP scrape.")
 
                         if theaters_to_find_in_fallback:
-                            print(f"  [Phase 2] Starting targeted fallback search for {len(theaters_to_find_in_fallback)} theater(s)...")
+                            logger.info(f"Phase 2: Starting targeted fallback search for {len(theaters_to_find_in_fallback)} theater(s)...")
                             for theater_name in theaters_to_find_in_fallback:
                                 search_results = await self.live_search_by_name(theater_name)
                                 if search_results:
                                     found_name, found_data = next(iter(search_results.items()))
-                                    print(f"    [SUCCESS] Fallback found '{theater_name}' as '{found_name}'")
+                                    logger.info(f"Fallback found '{theater_name}' as '{found_name}'")
                                     found_theaters_for_market.append({'name': found_name, 'url': found_data['url']})
                                 else:
-                                    print(f"    [WARNING] Fallback could not find '{theater_name}'.")
+                                    logger.warning(f"Fallback could not find '{theater_name}'.")
 
                         temp_cache["markets"][market_name] = {"theaters": found_theaters_for_market}
                         total_theaters_found += len(found_theaters_for_market)
@@ -712,18 +717,19 @@ class Scraper:
         html_content = ""
         try:
             # Use domcontentloaded instead of load - Fandango's ads/tracking prevent networkidle
-            await page.goto(full_url, timeout=60000, wait_until="domcontentloaded")
+            await page.goto(full_url, timeout=config.SCRAPER_NAV_TIMEOUT_LONG, wait_until="domcontentloaded")
             # Wait for the showtime structure to render (JS needs time to hydrate)
             try:
-                await page.locator('li.shared-movie-showtimes, a.showtime-btn').first.wait_for(timeout=30000)
+                await page.locator('li.shared-movie-showtimes, a.showtime-btn').first.wait_for(timeout=config.SCRAPER_ELEMENT_WAIT)
             except Exception:
                 # If showtime elements not found, wait a bit for JS to render and try again
                 import asyncio
-                await asyncio.sleep(3)
+                await asyncio.sleep(config.SCRAPER_RETRY_DELAY)
                 # Check if we have any content at all
                 showtime_count = await page.locator('li.shared-movie-showtimes').count()
                 if showtime_count == 0:
-                    print(f"  [WARNING] No showtime elements found for {theater['name']} after waiting")
+                    logger.warning(f"No showtime elements found for {theater['name']} after waiting")
+
             html_content = await page.content()
             soup = BeautifulSoup(html_content, 'html.parser')
             showings = []
@@ -740,9 +746,9 @@ class Scraper:
                     filepath = os.path.join(DEBUG_DIR, filename)
                     with open(filepath, 'w', encoding='utf-8') as f:
                         f.write(html_content)
-                    print(f"  [DEBUG] No films found for {theater['name']}. Saved HTML snapshot to {filepath}")
+                    logger.debug(f"No films found for {theater['name']}. Saved HTML snapshot to {filepath}")
                 except Exception as e:
-                    print(f"  [DEBUG] Failed to save HTML snapshot for {theater['name']}: {e}")
+                    logger.debug(f"Failed to save HTML snapshot for {theater['name']}: {e}")
             
             for movie_block in movie_blocks:
                 # Get film title from new structure
@@ -797,22 +803,22 @@ class Scraper:
 
                 # DEBUG: Log amenity group count and detect combined formats for first movie
                 if len(showings) == 0:
-                    print(f"\n[DEBUG] Movie '{film_title}' has {len(amenity_groups)} amenity groups")
-                    print(f"[DEBUG] Showtimes section found: {showtimes_section is not movie_block}")
+                    logger.debug(f"Movie '{film_title}' has {len(amenity_groups)} amenity groups")
+                    logger.debug(f"Showtimes section found: {showtimes_section is not movie_block}")
                     for idx, ag in enumerate(amenity_groups):
                         fmt_elem = ag.select_one('h4.shared-showtimes__title')
                         fmt_text = fmt_elem.get_text(strip=True) if fmt_elem else "NO TITLE"
                         btn_count = len(ag.select('a.showtime-btn'))
-                        print(f"[DEBUG]   Group {idx+1}: '{fmt_text}' with {btn_count} buttons")
+                        logger.debug(f"Group {idx+1}: '{fmt_text}' with {btn_count} buttons")
 
                     # Check for combined formats (same time in multiple groups)
                     combined = {time: fmts for time, fmts in time_to_formats.items() if len(fmts) > 1}
                     if combined:
-                        print(f"[DEBUG] Found {len(combined)} showtimes with combined formats:")
+                        logger.debug(f"Found {len(combined)} showtimes with combined formats:")
                         for time, fmts in sorted(combined.items()):
-                            print(f"[DEBUG]   {time}: {fmts}")
+                            logger.debug(f"{time}: {fmts}")
                     else:
-                        print(f"[DEBUG] No combined formats detected (each showtime in only one group)")
+                        logger.debug(f"No combined formats detected (each showtime in only one group)")
 
                 # Second pass: process amenity groups and combine formats when needed
                 for amenity_group in amenity_groups:
@@ -865,24 +871,22 @@ class Scraper:
                                         "ticket_url": ticket_url
                                     })
             
-            print(f"  [SCRAPER] Found {len(showings)} showings for {theater['name']}")
+            logger.info(f"Found {len(showings)} showings for {theater['name']}")
             return showings
         except Exception as e:
-            print(f"    [ERROR] Failed to get movies for {theater['name']}. Error: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.exception(f"Failed to get movies for {theater['name']}")
             return []
 
     async def _get_prices_and_capacity(self, page, showing_details):
         showtime_url = showing_details['ticket_url']
         results = {"tickets": [], "capacity": "N/A", "error": None}
         try:
-            print(f"  [SCRAPER] Loading ticket URL: {showtime_url[:80]}...")
-            await page.goto(showtime_url, timeout=60000)
-            print(f"  [SCRAPER] Page loaded, waiting 5 seconds for dynamic content...")
-            await page.wait_for_timeout(5000)  # Increased from 1.5-2.5s to 5s
+            logger.info(f"Loading ticket URL: {showtime_url[:80]}...")
+            await page.goto(showtime_url, timeout=config.SCRAPER_NAV_TIMEOUT_LONG)
+            logger.debug(f"Page loaded, waiting for dynamic content...")
+            await page.wait_for_timeout(int(config.SCRAPER_RENDER_DELAY_LONG * 1000))
 
-            print(f"  [SCRAPER] Searching for pricing data...")
+            logger.debug(f"Searching for pricing data...")
             scripts = await page.query_selector_all('script')
             found_commerce = False
 
@@ -890,7 +894,7 @@ class Scraper:
                 content = await script.inner_html()
                 if content and 'window.Commerce.models' in content:
                     found_commerce = True
-                    print(f"  [SCRAPER] Found window.Commerce.models")
+                    logger.debug(f"Found window.Commerce.models")
 
                     start_text = 'window.Commerce.models = '
                     start_index = content.find(start_text)
@@ -904,10 +908,10 @@ class Scraper:
                                 json_end = i + 1; break
                         if json_end != -1:
                             data = json.loads(content[json_start:json_end])
-                            print(f"  [SCRAPER] Parsed JSON successfully")
+                            logger.debug(f"Parsed JSON successfully")
 
                             ticket_types = data.get('tickets', {}).get('seatingAreas', [{}])[0].get('ticketTypes', [])
-                            print(f"  [SCRAPER] Found {len(ticket_types)} ticket types")
+                            logger.debug(f"Found {len(ticket_types)} ticket types")
 
                             for tt in ticket_types:
                                 description, price = tt.get('description'), tt.get('price')
@@ -926,15 +930,15 @@ class Scraper:
                                 results["capacity"] = f"{available_seats} / {total_seats}"
 
                             if results["tickets"]:
-                                print(f"  [SCRAPER] Successfully extracted {len(results['tickets'])} prices")
+                                logger.info(f"Successfully extracted {len(results['tickets'])} prices")
                                 return results
 
             if not found_commerce:
-                print(f"  [SCRAPER] WARNING: window.Commerce.models not found on page!")
+                logger.warning(f"window.Commerce.models not found on page!")
                 results["error"] = "window.Commerce.models not found"
 
         except Exception as e:
-            print(f"  [SCRAPER] ERROR: {e}")
+            logger.error(f"Scraping error: {e}")
             import traceback
             traceback.print_exc()
             results["error"] = f'Scraping failed: {e}'
@@ -996,30 +1000,30 @@ class Scraper:
                 all_price_data = []
                 showings_to_scrape = []
 
-                print(f"  [SCRAPER] Building showings list...")
-                print(f"  [SCRAPER] selected_showtimes structure: {list(selected_showtimes.keys())}")
+                logger.info(f"Building showings list...")
+                logger.debug(f"selected_showtimes structure: {list(selected_showtimes.keys())}")
 
                 # selected_showtimes has structure: {date: {theater_name: {film_title: {showtime: [showing_info_list]}}}}
                 # We need to iterate through dates first to find the theater data
                 for date_str, daily_selections in selected_showtimes.items():
-                    print(f"  [SCRAPER] Processing date: {date_str}")
+                    logger.debug(f"Processing date: {date_str}")
                     for theater in theaters:
                         theater_name = theater['name']
                         if theater_name in daily_selections:
-                            print(f"  [SCRAPER] Found theater '{theater_name}' in selections for {date_str}")
+                            logger.debug(f"Found theater '{theater_name}' in selections for {date_str}")
                             for film, times in daily_selections[theater_name].items():
                                 for time_str, showing_info_list in times.items():
                                     for showing_info in showing_info_list:
                                         showings_to_scrape.append({**showing_info, "theater_name": theater_name})
 
-                print(f"  [SCRAPER] Starting price scrape for {len(showings_to_scrape)} showings")
+                logger.info(f"Starting price scrape for {len(showings_to_scrape)} showings")
                 span.set_attribute("scraper.showings_to_scrape", len(showings_to_scrape))
 
                 async with async_playwright() as p:
                     browser = await p.chromium.launch(headless=True)  # Back to headless for production
                     total_showings = len(showings_to_scrape)
                     for idx, showing in enumerate(showings_to_scrape, 1):
-                        print(f"\n  [SCRAPER] Processing showing {idx}/{total_showings}: {showing['film_title']} at {showing.get('theater_name', 'Unknown')}")
+                        logger.info(f"Processing showing {idx}/{total_showings}: {showing['film_title']} at {showing.get('theater_name', 'Unknown')}")
                         context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36")
                         page = await context.new_page()
                         scrape_results = await self._get_prices_and_capacity(page, showing)
@@ -1030,12 +1034,12 @@ class Scraper:
                             try:
                                 progress_callback(idx, total_showings)
                             except Exception as cb_err:
-                                print(f"  [SCRAPER] Progress callback error: {cb_err}")
+                                logger.warning(f"Progress callback error: {cb_err}")
                         else:
-                            print(f"  [SCRAPER] No progress callback provided")
+                            logger.debug(f"No progress callback provided")
 
                         if scrape_results["error"]:
-                            print(f"  [SCRAPER] [ERROR] Scraping {showing['film_title']} at {showing.get('theater_name', 'Unknown')}: {scrape_results['error']}")
+                            logger.error(f"Scraping {showing['film_title']} at {showing.get('theater_name', 'Unknown')}: {scrape_results['error']}")
                             continue
                         
                         for ticket in scrape_results['tickets']:
@@ -1088,7 +1092,7 @@ class Scraper:
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             for i, theater in enumerate(theaters_to_test):
-                print(f"Testing {i+1}/{len(theaters_to_test)}: {theater['name']}")
+                logger.info(f"Testing {i+1}/{len(theaters_to_test)}: {theater['name']}")
                 context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36")
                 page = await context.new_page()
                 result_row = {"Market": theater['market'], "Theater Name": theater['name'], "Status": "Failed", "Details": "No showtimes found", "Sample Price": "N/A"}
